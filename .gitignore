@@ -1,0 +1,78 @@
+# Node
+node_modules/
+# Build outputs
+dist/
+build/
+.cache/
+.esbuild/
+
+# TypeScript
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Diagnostic reports
+report.*
+
+# Env files
+.env
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.vscode/
+.idea/
+*.sublime-workspace
+
+# Test output
+coverage/
+.nyc_output/
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Local database and storage
+pgdata/
+neo4j/
+neo4j/data/
+neo4j/logs/
+
+# Embeddings / models
+models/
+embeddings/
+
+# Lockfiles (keep pnpm-lock.yaml checked in if desired)
+# pnpm-lock.yaml
+
+# Misc
+*.local
+*.swp
+*.swo
+
+# Ignore generated grammar or parser artifacts
+parser/generated/
+
+# IDE-specific
+.vscode-test/
+
+# Windows image file cache
+ehthumbs.db
+
+# Optional: VS Code extensions recommended configuration
+.vscode/extensions.json

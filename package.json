@@ -1,0 +1,19 @@
+{
+  "name": "repo-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "dev": "pnpm --filter @repo-memory/app dev",
+    "start": "pnpm --filter @repo-memory/app start",
+    "lint": "pnpm -r run lint",
+    "typecheck": "pnpm -r run typecheck",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && docker compose up -d"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,33 @@
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: repo-memory-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/repo-memory-password
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_initial__size: "512m"
+      NEO4J_server_memory_heap_max__size: "1G"
+      NEO4J_server_memory_pagecache_size: "512m"
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: repo-memory-postgres
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: repo_memory
+      POSTGRES_USER: repo_memory
+      POSTGRES_PASSWORD: repo-memory-password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  neo4j-data:
+  neo4j-logs:
+  postgres-data:

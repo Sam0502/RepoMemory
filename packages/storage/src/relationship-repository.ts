@@ -1,0 +1,127 @@
+import { Pool } from 'pg';
+import { Relationship, RelationshipType } from '@repo-memory/shared';
+
+export class RelationshipRepository {
+  constructor(private pool: Pool) {}
+
+  async create(relationship: Omit<Relationship, 'id' | 'createdAt' | 'updatedAt'>): Promise<Relationship> {
+    const query = `
+      INSERT INTO relationships (source_id, target_id, type, file_path, line, confidence, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING *
+    `;
+    
+    const values = [
+      relationship.sourceId, relationship.targetId, relationship.type,
+      relationship.filePath, relationship.line, relationship.confidence,
+      JSON.stringify(relationship.metadata)
+    ];
+    
+    const result = await this.pool.query(query, values);
+    return this.mapRowToRelationship(result.rows[0]);
+  }
+
+  async upsert(relationship: Omit<Relationship, 'id' | 'createdAt' | 'updatedAt'>): Promise<Relationship> {
+    const query = `
+      INSERT INTO relationships (source_id, target_id, type, file_path, line, confidence, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (source_id, target_id, type, file_path) DO UPDATE SET
+        line = EXCLUDED.line,
+        confidence = EXCLUDED.confidence,
+        metadata = EXCLUDED.metadata,
+        updated_at = NOW()
+      RETURNING *
+    `;
+    
+    const values = [
+      relationship.sourceId, relationship.targetId, relationship.type,
+      relationship.filePath, relationship.line, relationship.confidence,
+      JSON.stringify(relationship.metadata)
+    ];
+    
+    const result = await this.pool.query(query, values);
+    return this.mapRowToRelationship(result.rows[0]);
+  }
+
+  async findById(id: string): Promise<Relationship | null> {
+    const query = 'SELECT * FROM relationships WHERE id = $1';
+    const result = await this.pool.query(query, [id]);
+    return result.rows[0] ? this.mapRowToRelationship(result.rows[0]) : null;
+  }
+
+  async findBySourceId(sourceId: string): Promise<Relationship[]> {
+    const query = 'SELECT * FROM relationships WHERE source_id = $1 ORDER BY type';
+    const result = await this.pool.query(query, [sourceId]);
+    return result.rows.map(this.mapRowToRelationship);
+  }
+
+  async findByTargetId(targetId: string): Promise<Relationship[]> {
+    const query = 'SELECT * FROM relationships WHERE target_id = $1 ORDER BY type';
+    const result = await this.pool.query(query, [targetId]);
+    return result.rows.map(this.mapRowToRelationship);
+  }
+
+  async findByEntityId(entityId: string): Promise<Relationship[]> {
+    const query = 'SELECT * FROM relationships WHERE source_id = $1 OR target_id = $1 ORDER BY type';
+    const result = await this.pool.query(query, [entityId]);
+    return result.rows.map(this.mapRowToRelationship);
+  }
+
+  async findByType(type: RelationshipType): Promise<Relationship[]> {
+    const query = 'SELECT * FROM relationships WHERE type = $1 ORDER BY created_at';
+    const result = await this.pool.query(query, [type]);
+    return result.rows.map(this.mapRowToRelationship);
+  }
+
+  async findByFilePath(filePath: string): Promise<Relationship[]> {
+    const query = 'SELECT * FROM relationships WHERE file_path = $1 ORDER BY type';
+    const result = await this.pool.query(query, [filePath]);
+    return result.rows.map(this.mapRowToRelationship);
+  }
+
+  async findDependencies(entityId: string): Promise<Relationship[]> {
+    const query = `
+      SELECT * FROM relationships 
+      WHERE source_id = $1 AND type IN ('IMPORTS', 'DEPENDS_ON', 'CALLS', 'REFERENCES')
+      ORDER BY type
+    `;
+    const result = await this.pool.query(query, [entityId]);
+    return result.rows.map(this.mapRowToRelationship);
+  }
+
+  async findDependents(entityId: string): Promise<Relationship[]> {
+    const query = `
+      SELECT * FROM relationships 
+      WHERE target_id = $1 AND type IN ('IMPORTS', 'DEPENDS_ON', 'CALLS', 'REFERENCES')
+      ORDER BY type
+    `;
+    const result = await this.pool.query(query, [entityId]);
+    return result.rows.map(this.mapRowToRelationship);
+  }
+
+  async deleteByFilePath(filePath: string): Promise<void> {
+    const query = 'DELETE FROM relationships WHERE file_path = $1';
+    await this.pool.query(query, [filePath]);
+  }
+
+  async count(): Promise<number> {
+    const query = 'SELECT COUNT(*) as count FROM relationships';
+    const result = await this.pool.query(query);
+    return parseInt(result.rows[0].count);
+  }
+
+  private mapRowToRelationship(row: any): Relationship {
+    return {
+      id: row.id,
+      sourceId: row.source_id,
+      targetId: row.target_id,
+      type: row.type as RelationshipType,
+      filePath: row.file_path,
+      line: row.line,
+      confidence: row.confidence,
+      metadata: row.metadata,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "@repo-memory/storage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "db:migrate": "node --loader ts-node/esm src/migrate.ts"
+  },
+  "dependencies": {
+    "@repo-memory/shared": "workspace:*",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.5.0",
+    "tsup": "^8.0.0",
+    "ts-node": "^10.9.0"
+  }
+}

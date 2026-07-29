@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Repository Memory Explorer</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Repository Memory Explorer</h1>
+    <div class="search-bar">
+      <input type="text" id="searchInput" placeholder="Search entities..." />
+      <button id="searchBtn">Search</button>
+    </div>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <main>
+    <aside id="entityList" class="panel">
+      <h2>Entities <span id="entityCount"></span></h2>
+      <div id="entityListContent"></div>
+    </aside>
+
+    <section id="graphContainer" class="panel">
+      <div class="graph-controls">
+        <button id="backToArch" class="arch-btn" title="Back to architecture view">Architecture</button>
+        <button id="zoomIn">+</button>
+        <button id="zoomOut">-</button>
+        <button id="zoomReset">Reset</button>
+        <select id="depthSelect">
+          <option value="1">Depth 1</option>
+          <option value="2" selected>Depth 2</option>
+          <option value="3">Depth 3</option>
+        </select>
+      </div>
+      <svg id="graph"></svg>
+    </section>
+
+    <aside id="detailPanel" class="panel hidden">
+      <div class="detail-header">
+        <h2 id="detailTitle">Entity Details</h2>
+        <button id="closeDetail">&times;</button>
+      </div>
+      <div id="detailContent"></div>
+    </aside>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

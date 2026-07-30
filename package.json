@@ -11,7 +11,8 @@
     "typecheck": "pnpm -r run typecheck",
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
-    "db:reset": "docker compose down -v && docker compose up -d"
+    "db:reset": "docker compose down -v && docker compose up -d",
+    "download-model": "pnpm --filter @repo-memory/analysis download-model"
   },
   "engines": {
     "node": ">=20"

@@ -143,3 +143,17 @@ export interface ImpactAnalysis {
   affectedFiles: string[];
   riskScore: number;
 }
+
+export interface ContextPack {
+  entity: Entity;
+  dependencies: Entity[];
+  dependents: Entity[];
+  recentChanges: Commit[];
+  similarEntities: Entity[];
+  metadata: {
+    packageName: string;
+    entityCount: number;
+    dependencyDepth: number;
+  };
+  tokenCount: number;
+}

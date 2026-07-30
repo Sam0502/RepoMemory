@@ -4,6 +4,9 @@ const SCHEMA_SQL = `
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
+-- Enable pgvector extension
+CREATE EXTENSION IF NOT EXISTS vector;
+
 -- Entities table
 CREATE TABLE IF NOT EXISTS entities (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -83,6 +86,13 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Repo state table for tracking incremental scans
+CREATE TABLE IF NOT EXISTS repo_state (
+  repo_path VARCHAR(1000) PRIMARY KEY,
+  last_commit_hash VARCHAR(40),
+  last_scan_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_entities_stable_id ON entities(stable_id);
 CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
@@ -92,8 +102,24 @@ CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_id);
 CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_id);
 CREATE INDEX IF NOT EXISTS idx_relationships_type ON relationships(type);
 CREATE INDEX IF NOT EXISTS idx_file_changes_commit ON file_changes(commit_hash);
+CREATE INDEX IF NOT EXISTS idx_file_changes_file ON file_changes(file_path);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_changes_unique ON file_changes(commit_hash, file_path);
+
+-- Add embedding column to existing entities table (safe for new installs)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'entities' AND column_name = 'embedding'
+  ) THEN
+    ALTER TABLE entities ADD COLUMN embedding vector(768);
+  END IF;
+END $$;
+
+-- Embedding index (cosine similarity) - using hnsw for better performance
+CREATE INDEX IF NOT EXISTS idx_entities_embedding ON entities USING hnsw (embedding vector_cosine_ops);
 `;
 
 export async function migrate(pool: Pool): Promise<void> {

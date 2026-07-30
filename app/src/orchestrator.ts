@@ -1,8 +1,12 @@
 import { Pool } from 'pg';
 import { GraphClient } from '@repo-memory/graph';
-import { EntityRepository, RelationshipRepository, migrate, createPool } from '@repo-memory/storage';
+import { EntityRepository, RelationshipRepository, CommitRepository, migrate, createPool } from '@repo-memory/storage';
 import { GitOperations } from '@repo-memory/ingestion';
-import { TreeSitterParser, getLanguageFromFilePath, shouldParseFile } from '@repo-memory/analysis';
+import {
+  TreeSitterParser, getLanguageFromFilePath, shouldParseFile,
+  configureEmbeddings, generateEntityEmbedding, getProviderName
+} from '@repo-memory/analysis';
+import type { EmbeddingConfig } from '@repo-memory/analysis';
 import { Entity, Relationship, FileChange } from '@repo-memory/shared';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
@@ -17,6 +21,7 @@ export interface OrchestratorConfig {
   pgDatabase?: string;
   pgUser?: string;
   pgPassword?: string;
+  embeddings?: EmbeddingConfig;
 }
 
 export class Orchestrator {
@@ -24,6 +29,7 @@ export class Orchestrator {
   private pgPool!: Pool;
   private entityRepo!: EntityRepository;
   private relationshipRepo!: RelationshipRepository;
+  private commitRepo!: CommitRepository;
   private gitOps: GitOperations;
   private config: OrchestratorConfig;
 
@@ -47,6 +53,7 @@ export class Orchestrator {
     });
     this.entityRepo = new EntityRepository(this.pgPool);
     this.relationshipRepo = new RelationshipRepository(this.pgPool);
+    this.commitRepo = new CommitRepository(this.pgPool);
     console.log('Initializing Repository Memory Engine...');
     
     // Verify database connections
@@ -58,6 +65,15 @@ export class Orchestrator {
     // Create Neo4j schema
     await this.graphClient.createSchema();
     
+    // Initialize embeddings
+    if (this.config.embeddings) {
+      const fallback = process.env.GEMINI_API_KEY
+        ? { provider: 'gemini' as const, gemini: { apiKey: process.env.GEMINI_API_KEY } }
+        : undefined;
+      configureEmbeddings(this.config.embeddings, fallback);
+      console.log(`Embeddings initialized with ${getProviderName()} provider.`);
+    }
+
     console.log('Initialization complete.');
   }
 
@@ -79,7 +95,42 @@ export class Orchestrator {
       }
     }
     
+    // Record the latest commit after full scan
+    await this.recordCurrentCommit();
+    
     console.log('Full repository scan complete.');
+  }
+
+  private async recordCurrentCommit(): Promise<void> {
+    try {
+      const commit = await this.gitOps.getLatestCommit();
+      if (commit) {
+        const diff = await this.gitOps.getWorkingTreeDiff();
+        await this.commitRepo.upsert({
+          ...commit,
+          filesChanged: diff.map(d => d.filePath),
+          fileChanges: diff,
+        });
+        await this.updateRepoState(commit.hash);
+      }
+    } catch (error) {
+      console.error('Failed to record commit:', error);
+    }
+  }
+
+  private async updateRepoState(commitHash: string): Promise<void> {
+    try {
+      await this.pgPool.query(
+        `INSERT INTO repo_state (repo_path, last_commit_hash, last_scan_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (repo_path) DO UPDATE SET
+           last_commit_hash = EXCLUDED.last_commit_hash,
+           last_scan_at = NOW()`,
+        [this.config.repoPath, commitHash]
+      );
+    } catch (error) {
+      console.error('Failed to update repo state:', error);
+    }
   }
 
   async scanFromCommit(commitHash?: string): Promise<void> {
@@ -111,7 +162,49 @@ export class Orchestrator {
       }
     }
     
+    await this.recordCurrentCommit();
     console.log('Incremental scan complete.');
+  }
+
+  async scanIncremental(): Promise<void> {
+    console.log('Starting incremental scan...');
+
+    const lastCommitHash = await this.getLastScannedCommit();
+    if (!lastCommitHash) {
+      console.log('No previous scan state found. Running full scan.');
+      await this.scanFullRepository();
+      return;
+    }
+
+    const changes = await this.gitOps.getDiffBetweenCommits(lastCommitHash, 'HEAD');
+    console.log(`Found ${changes.length} changed files since ${lastCommitHash}.`);
+
+    for (const change of changes) {
+      try {
+        if (change.status !== 'deleted') {
+          await this.processFile(join(this.config.repoPath, change.filePath));
+        } else {
+          await this.handleFileDeletion(change.filePath);
+        }
+      } catch (error) {
+        console.error(`Error processing ${change.filePath}:`, error);
+      }
+    }
+
+    await this.recordCurrentCommit();
+    console.log('Incremental scan complete.');
+  }
+
+  private async getLastScannedCommit(): Promise<string | null> {
+    try {
+      const result = await this.pgPool.query(
+        'SELECT last_commit_hash FROM repo_state WHERE repo_path = $1',
+        [this.config.repoPath]
+      );
+      return result.rows[0]?.last_commit_hash || null;
+    } catch {
+      return null;
+    }
   }
 
   async scanWorkingTree(): Promise<void> {
@@ -138,6 +231,7 @@ export class Orchestrator {
       }
     }
     
+    await this.recordCurrentCommit();
     console.log('Working tree scan complete.');
   }
 
@@ -171,6 +265,8 @@ export class Orchestrator {
       try {
         await this.entityRepo.upsert(entity);
         await this.graphClient.upsertEntity(entity);
+        const embedding = await generateEntityEmbedding(entity.name, entity.type, entity.filePath);
+        await this.entityRepo.updateEmbedding(entity.stableId, embedding);
       } catch (error) {
         console.error(`Failed to store entity ${entity.name}:`, error);
       }

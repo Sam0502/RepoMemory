@@ -2,8 +2,9 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { GraphClient } from '@repo-memory/graph';
-import { EntityRepository, RelationshipRepository } from '@repo-memory/storage';
+import { EntityRepository, RelationshipRepository, CommitRepository } from '@repo-memory/storage';
 import { Pool } from 'pg';
+import { ContextPackBuilder } from './context-pack.js';
 
 export interface ApiConfig {
   port: number;
@@ -16,6 +17,8 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   const app = new Hono();
   const entityRepo = new EntityRepository(config.pgPool);
   const relationshipRepo = new RelationshipRepository(config.pgPool);
+  const commitRepo = new CommitRepository(config.pgPool);
+  const contextBuilder = new ContextPackBuilder(entityRepo, commitRepo, config.graphClient);
 
   // CORS for frontend
   app.use('*', async (c, next) => {
@@ -154,6 +157,35 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     return c.json({ entities });
   });
 
+  // Similar entities endpoint (semantic search)
+  app.get('/api/entities/similar/:stableId', async (c) => {
+    const stableId = c.req.param('stableId');
+    const limit = parseInt(c.req.query('limit') || '10');
+    const entity = await entityRepo.findByStableId(stableId);
+    if (!entity) {
+      return c.json({ error: 'Entity not found' }, 404);
+    }
+    const similar = await entityRepo.findSimilar(stableId, limit);
+    return c.json({ entity, similar });
+  });
+
+  // Commit endpoints
+  app.get('/api/commits', async (c) => {
+    const limit = parseInt(c.req.query('limit') || '20');
+    const commits = await commitRepo.findRecent(limit);
+    return c.json({ commits });
+  });
+
+  app.get('/api/commits/:hash', async (c) => {
+    const hash = c.req.param('hash');
+    const commit = await commitRepo.findByHash(hash);
+    if (!commit) {
+      return c.json({ error: 'Commit not found' }, 404);
+    }
+    const fileChanges = await commitRepo.getFileChanges(hash);
+    return c.json({ commit, fileChanges });
+  });
+
   // Architecture graph - file-level view
   app.get('/api/graph/architecture', async (c) => {
     // Get all unique files with entity counts
@@ -228,6 +260,17 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     }
     
     return c.json({ files, links });
+  });
+
+  // Context pack endpoint
+  app.get('/api/context-pack/:stableId', async (c) => {
+    const stableId = c.req.param('stableId');
+    const tokenBudget = parseInt(c.req.query('tokenBudget') || '4000');
+    const pack = await contextBuilder.build(stableId, tokenBudget);
+    if (!pack) {
+      return c.json({ error: 'Entity not found' }, 404);
+    }
+    return c.json(pack);
   });
 
   // Impact analysis

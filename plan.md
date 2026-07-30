@@ -1,5 +1,7 @@
 # Repository Memory Engine Plan
 
+# Phase 2 session: opencode -s ses_051b766b4ffePsBsCVmp6HYZsF
+
 ## Objective
 Build a repository-scale memory engine that continuously scans a source code repository, extracts structural and semantic knowledge, tracks change over time, and exposes that knowledge to developers and AI agents as a persistent, queryable source of truth.
 
@@ -251,18 +253,65 @@ Use a three-store split:
 - Expose a minimal query API for structural lookup, direct traversal, and basic impact analysis ✅
 - Add web visualization frontend ✅ (bonus)
 
-**Status:** Phase 1 completed 2026-07-29. All core functionality working:
-- 155+ entities extracted from self-scan
-- Relationships stored (imports, exports, extends, implements)
-- HTTP API with entity search, graph traversal
-- Web frontend with architecture view and entity exploration
-- CLI for scanning and querying
+**Status:** Phase 1 completed 2026-07-29. Phase 2 completed 2026-07-30.
 
-### Phase 2: Incremental Intelligence
-- Add diff-driven reanalysis
-- Track commit-level history and graph evolution
-- Add semantic embeddings and search
-- Build basic context pack generation
+**Phase 2 additions:**
+- Tree-sitter WASM parser (pinned to v0.22.6 for ABI compatibility)
+- Commit history tracking with file change details
+- Incremental diff-driven reanalysis as default scan mode
+- Multi-provider embeddings (ONNX local + Gemini API + fallback)
+- Context pack generation with token budget support
+- HTTP API with commits, similarity search, and context pack endpoints
+- Frontend redesign with commits panel, impact analysis, context packs, type filter
+- High-contrast graph visualization with loading states
+
+### Phase 2: Incremental Intelligence ✅ COMPLETE
+
+**Start Date:** 2026-07-29
+**Completed:** 2026-07-30 (v0.2.0 + v0.3.0)
+
+#### 2.1 Commit History Tracking ✅
+- Created `CommitRepository` (`packages/storage/src/commit-repository.ts`) for storing/querying commits
+- Populate commits table during scan operations
+- Added API endpoints: `GET /api/commits`, `GET /api/commits/:hash`
+
+#### 2.2 Incremental Diff-Driven Reanalysis ✅
+- Added `repo_state` table to track last scanned commit per repository
+- Implemented `scanIncremental()` in orchestrator
+- Added `--incremental` flag to CLI (default behavior)
+
+#### 2.3 Tree-sitter WASM Parser ✅
+- Replaced regex-based parser with actual `web-tree-sitter` WASM parsing
+- Loads TypeScript/JavaScript grammars from `tree-sitter-wasms@0.1.13`
+- **Pinned `web-tree-sitter` to v0.22.6** for WASM ABI compatibility (0.26.x incompatible)
+- WASM grammar bytes loaded via `readFile` + `Uint8Array` (not file path strings)
+- Extracts proper AST entities: functions, classes, interfaces, types, enums, methods, properties
+- Accurate line/column tracking from AST node positions
+
+#### 2.4 Multi-Provider Embeddings ✅
+- Pluggable provider system: `OnnxEmbeddingProvider`, `GeminiEmbeddingProvider`, `PlaceholderEmbeddingProvider`
+- ONNX via `@xenova/transformers` (supports all-MiniLM-L6-v2)
+- Gemini API via native fetch (free tier support)
+- Fallback chain: primary provider → fallback provider → placeholder
+- 768-dim normalized vectors for cross-provider compatibility
+- Added similarity search endpoint: `GET /api/entities/similar/:stableId`
+
+#### 2.5 Context Pack Generation ✅
+- Created `ContextPackBuilder` in `packages/api/src/context-pack.ts`
+- Generated agent-ready context bundles with relevance ranking
+- Added endpoint: `GET /api/context-pack/:stableId?tokenBudget=4000`
+
+#### 2.6 Frontend Redesign ✅ (v0.3.0)
+- **Commit History Panel**: New "Commits" tab with inline file change expansion
+- **Impact Analysis**: Risk score bar (green/yellow/red) + dependent counts + affected files
+- **Similar Entities**: Semantic similarity section in entity detail
+- **Context Pack Display**: Token-budget context shown in monospace block
+- **Type Filter**: Dropdown to filter entities by type
+- **Loading States**: Spinner overlay during graph fetches
+- **High-Contrast Graph**: Bright arrows (#c9d1d9) with 80% opacity
+- **Generic `.hidden` class**: Fixed CSS for overlay/panel visibility
+
+**Execution Order:** 2.1 → 2.2 → 2.3 → 2.4 → 2.5
 
 ### Phase 3: Multi-Language Coverage
 - Add parser adapters for more languages

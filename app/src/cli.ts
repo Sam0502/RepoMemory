@@ -6,6 +6,23 @@ import { startServer } from '@repo-memory/api';
 import { GraphClient } from '@repo-memory/graph';
 import { createPool } from '@repo-memory/storage';
 import { resolve } from 'path';
+import type { EmbeddingConfig } from '@repo-memory/analysis';
+
+function getEmbeddingConfig(): EmbeddingConfig {
+  const provider = process.env.EMBEDDING_PROVIDER || 'onnx';
+  const modelCacheDir = process.env.EMBEDDING_CACHE_DIR || resolve(process.cwd(), 'models');
+
+  return {
+    provider: provider as EmbeddingConfig['provider'],
+    onnx: {
+      modelId: process.env.EMBEDDING_MODEL || 'Xenova/all-MiniLM-L6-v2',
+      cacheDir: modelCacheDir,
+    },
+    gemini: process.env.GEMINI_API_KEY
+      ? { apiKey: process.env.GEMINI_API_KEY, model: process.env.EMBEDDING_MODEL }
+      : undefined,
+  };
+}
 
 const program = new Command();
 
@@ -18,12 +35,14 @@ program
   .command('scan')
   .description('Scan the repository and extract entities and relationships')
   .option('-r, --repo <path>', 'Repository path', process.cwd())
-  .option('-f, --full', 'Perform a full repository scan', false)
+  .option('-f, --full', 'Perform a full repository scan (rescan everything)', false)
+  .option('-i, --incremental', 'Perform an incremental scan from last state', false)
   .option('-c, --commit <hash>', 'Scan from a specific commit')
   .option('-w, --working-tree', 'Scan only working tree changes', false)
   .action(async (options) => {
     const orchestrator = new Orchestrator({
       repoPath: resolve(options.repo),
+      embeddings: getEmbeddingConfig(),
     });
 
     try {
@@ -31,13 +50,14 @@ program
 
       if (options.full) {
         await orchestrator.scanFullRepository();
+      } else if (options.incremental) {
+        await orchestrator.scanIncremental();
       } else if (options.commit) {
         await orchestrator.scanFromCommit(options.commit);
       } else if (options.workingTree) {
         await orchestrator.scanWorkingTree();
       } else {
-        // Default: scan from last known state or full scan
-        await orchestrator.scanFullRepository();
+        await orchestrator.scanIncremental();
       }
     } catch (error) {
       console.error('Scan failed:', error);
@@ -56,6 +76,7 @@ program
   .action(async (type, args, options) => {
     const orchestrator = new Orchestrator({
       repoPath: resolve(options.repo),
+      embeddings: getEmbeddingConfig(),
     });
 
     try {
@@ -123,7 +144,7 @@ program
     console.log(`Starting API server for repository: ${repoPath}`);
 
     // Initialize orchestrator for database connections
-    const orchestrator = new Orchestrator({ repoPath });
+    const orchestrator = new Orchestrator({ repoPath, embeddings: getEmbeddingConfig() });
     await orchestrator.initialize();
 
     // Start API server
@@ -151,6 +172,7 @@ program
   .action(async (options) => {
     const orchestrator = new Orchestrator({
       repoPath: resolve(options.repo),
+      embeddings: getEmbeddingConfig(),
     });
 
     try {

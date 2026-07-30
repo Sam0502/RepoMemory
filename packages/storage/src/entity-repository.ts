@@ -115,6 +115,38 @@ export class EntityRepository {
     return result.rows.map(this.mapRowToEntity);
   }
 
+  async updateEmbedding(stableId: string, embedding: number[]): Promise<void> {
+    const query = 'UPDATE entities SET embedding = $1 WHERE stable_id = $2';
+    await this.pool.query(query, [JSON.stringify(embedding), stableId]);
+  }
+
+  async findSimilar(stableId: string, limit: number = 10, threshold: number = 0.5): Promise<Entity[]> {
+    const query = `
+      SELECT e.*, 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) AS similarity
+      FROM entities e
+      WHERE e.stable_id != $1
+        AND e.embedding IS NOT NULL
+        AND 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) > $3
+      ORDER BY similarity DESC
+      LIMIT $2
+    `;
+    const result = await this.pool.query(query, [stableId, limit, threshold]);
+    return result.rows.map(this.mapRowToEntity);
+  }
+
+  async findByEmbedding(vector: number[], limit: number = 10, threshold: number = 0.5): Promise<Entity[]> {
+    const query = `
+      SELECT *, 1 - (embedding <=> $1::vector) AS similarity
+      FROM entities
+      WHERE embedding IS NOT NULL
+        AND 1 - (embedding <=> $1::vector) > $3
+      ORDER BY similarity DESC
+      LIMIT $2
+    `;
+    const result = await this.pool.query(query, [JSON.stringify(vector), limit, threshold]);
+    return result.rows.map(this.mapRowToEntity);
+  }
+
   async count(): Promise<number> {
     const query = 'SELECT COUNT(*) as count FROM entities';
     const result = await this.pool.query(query);

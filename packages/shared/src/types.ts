@@ -49,6 +49,7 @@ export type RelationshipType = (typeof RelationshipType)[keyof typeof Relationsh
 export const Language = {
   TYPESCRIPT: 'typescript',
   JAVASCRIPT: 'javascript',
+  PYTHON: 'python',
   UNKNOWN: 'unknown',
 } as const;
 

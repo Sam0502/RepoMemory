@@ -7,6 +7,7 @@ import {
   configureEmbeddings, generateEntityEmbedding, getProviderName
 } from '@repo-memory/analysis';
 import type { EmbeddingConfig } from '@repo-memory/analysis';
+import { Language } from '@repo-memory/shared';
 import { Entity, Relationship, FileChange } from '@repo-memory/shared';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
@@ -32,6 +33,7 @@ export class Orchestrator {
   private commitRepo!: CommitRepository;
   private gitOps: GitOperations;
   private config: OrchestratorConfig;
+  private parserCache: Map<Language, TreeSitterParser> = new Map();
 
   constructor(config: OrchestratorConfig) {
     this.config = config;
@@ -74,7 +76,31 @@ export class Orchestrator {
       console.log(`Embeddings initialized with ${getProviderName()} provider.`);
     }
 
+    // Pre-initialize parsers for supported languages
+    await this.initializeParsers();
+
     console.log('Initialization complete.');
+  }
+
+  private async initializeParsers(): Promise<void> {
+    const supportedLanguages = [Language.TYPESCRIPT, Language.JAVASCRIPT, Language.PYTHON];
+    
+    for (const lang of supportedLanguages) {
+      const parser = new TreeSitterParser(lang);
+      await parser.initialize();
+      this.parserCache.set(lang, parser);
+      console.log(`Initialized parser for ${lang}`);
+    }
+  }
+
+  private async getParser(language: Language): Promise<TreeSitterParser> {
+    let parser = this.parserCache.get(language);
+    if (!parser) {
+      parser = new TreeSitterParser(language);
+      await parser.initialize();
+      this.parserCache.set(language, parser);
+    }
+    return parser;
   }
 
   async scanFullRepository(): Promise<void> {
@@ -251,10 +277,9 @@ export class Orchestrator {
       return;
     }
     
-    // Parse file
+    // Parse file using cached parser
     const language = getLanguageFromFilePath(filePath);
-    const parser = new TreeSitterParser(language);
-    await parser.initialize();
+    const parser = await this.getParser(language);
     
     const result = await parser.parse(relativePath, content);
     
@@ -287,8 +312,11 @@ export class Orchestrator {
     console.log(`Handling deletion of ${filePath}`);
     
     // Remove entities from both databases
-    await this.entityRepo.findByFilePath(filePath);
-    await this.graphClient.deleteEntitiesByFilePath(filePath);
+    const entities = await this.entityRepo.findByFilePath(filePath);
+    for (const entity of entities) {
+      await this.graphClient.deleteEntity(entity.stableId);
+    }
+    await this.entityRepo.deleteByFilePath(filePath);
     
     // Remove relationships
     await this.relationshipRepo.deleteByFilePath(filePath);

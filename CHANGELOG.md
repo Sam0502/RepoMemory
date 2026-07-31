@@ -2,6 +2,36 @@
 
 All notable changes to RepoMemory will be documented in this file.
 
+## [0.4.0] - 2026-07-31
+
+### Added
+- **Python Language Support**: New Python parser using Tree-sitter WASM grammar. Extracts functions, classes, methods, constructors (`__init__`), decorators, imports, variables, and docstrings
+- **Strategy Pattern Parser Architecture**: Refactored `TreeSitterParser` into a pluggable `LanguageExtractor` interface with per-language implementations (`TypeScriptExtractor`, `JavaScriptExtractor`, `PythonExtractor`)
+- **Constructor Detection**: Extracts `constructor` methods from TypeScript/JavaScript classes and `__init__` methods from Python classes as `CONSTRUCTOR` entities
+- **Test Entity Detection**: Detects test functions (`test_*`, `it()`, `test()`) and test suites (`describe()`, `context()`) as `TEST` and `TEST_SUITE` entities
+- **API Endpoint Detection**: Detects Express/Koa/Fastify routes (`app.get()`, `router.post()`) and Flask/FastAPI routes (`@app.route()`) as `API_ENDPOINT` entities
+- **Config File Detection**: Detects configuration files (`package.json`, `tsconfig.json`, `.eslintrc.*`, `pyproject.toml`, etc.) as `CONFIG` entities
+- **CALLS Relationship Detection**: Detects function calls and creates `CALLS` relationships between entities
+- **REFERENCES Relationship Detection**: Detects symbol references and creates `REFERENCES` relationships
+- **CONTAINS Relationship Detection**: Creates `CONTAINS` relationships for structural containment (class contains method, file contains function)
+- **Parser Caching**: Orchestrator now caches parser instances per language for better performance
+
+### Changed
+- Refactored `TreeSitterParser` to use `LanguageExtractor` strategy pattern
+- Updated `EntityRepository` with `deleteByFilePath` method for proper file deletion handling
+- Improved `isTestFile()` to detect test files by path patterns (`/test/`, `/tests/`, `/__tests__/`)
+- Added `getGrammarKeyFromFilePath()` for proper grammar resolution (fixed TSX grammar bug)
+
+### Fixed
+- Fixed TSX grammar loading bug (grammar key was hardcoded to `'typescript'`)
+- Fixed file deletion handling in orchestrator (now properly deletes entities from Neo4j)
+- Fixed parser-per-file issue (parsers are now cached per language)
+- Fixed "value too long for type character varying(255)" error by increasing relationship ID column sizes to VARCHAR(1000)
+- Added ID truncation for long call chains, references, and import paths
+- Fixed architecture graph not showing links by adding relative import path resolution
+- Fixed `getGroup()` to support external repositories with generic directory patterns
+- Fixed frontend scrolling for entity list, commit list, and detail panel
+
 ## [0.3.0] - 2026-07-30
 
 ### Added

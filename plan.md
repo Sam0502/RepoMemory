@@ -313,8 +313,48 @@ Use a three-store split:
 
 **Execution Order:** 2.1 → 2.2 → 2.3 → 2.4 → 2.5
 
-### Phase 3: Multi-Language Coverage
-- Add parser adapters for more languages
+### Phase 3: Multi-Language Coverage + Detection Improvements ✅ COMPLETE
+
+**Start Date:** 2026-07-31
+**Completed:** 2026-07-31 (v0.4.0)
+
+#### 3.1 Refactor Parser to Strategy Pattern ✅
+- Created `LanguageExtractor` interface in `packages/analysis/src/extractors/interface.ts`
+- Created `BaseExtractor` with shared utilities in `packages/analysis/src/extractors/base.ts`
+- Moved TypeScript extraction to `TypeScriptExtractor` in `packages/analysis/src/extractors/typescript.ts`
+- Created `JavaScriptExtractor` in `packages/analysis/src/extractors/javascript.ts`
+- Updated `TreeSitterParser` to use strategy pattern
+- Added parser caching per language in orchestrator
+
+#### 3.2 Python Language Support ✅
+- Added `Language.PYTHON` to shared types
+- Added Python grammar to `tree-sitter-init.ts`
+- Created `PythonExtractor` in `packages/analysis/src/extractors/python.ts`
+- Extracts: functions, classes, methods, constructors (`__init__`), decorators, imports, variables, docstrings
+- Updated `getLanguageFromFilePath()` and `shouldParseFile()` for Python
+
+#### 3.3 Entity Detection Improvements ✅
+- **Constructor Detection**: Extracts `constructor` methods (TypeScript/JavaScript) and `__init__` (Python) as `CONSTRUCTOR` entities
+- **Test Entity Detection**: Detects test functions (`test_*`, `it()`, `test()`) and test suites (`describe()`, `context()`) as `TEST`/`TEST_SUITE` entities
+- **API Endpoint Detection**: Detects Express/Koa/Fastify routes and Flask/FastAPI routes as `API_ENDPOINT` entities
+- **Config File Detection**: Detects configuration files as `CONFIG` entities
+
+#### 3.4 Relationship Detection Improvements ✅
+- **CALLS Relationship**: Detects function calls and creates `CALLS` relationships
+- **REFERENCES Relationship**: Detects symbol references and creates `REFERENCES` relationships
+- **CONTAINS Relationship**: Creates `CONTAINS` relationships for structural containment
+
+**Execution Order:** 3.1 → 3.2 → 3.3 → 3.4
+
+#### 3.5 Bugfixes ✅
+- Fixed "value too long for type character varying(255)" by increasing relationship ID columns to VARCHAR(1000)
+- Added ID truncation for long call chains, references, and import paths
+- Fixed architecture graph not showing links by adding relative import path resolution (`resolveRelativeImport()`)
+- Fixed `getGroup()` to support external repositories with generic directory patterns (tests, source, lib, cmd, etc.)
+- Fixed frontend scrolling for entity list, commit list, and detail panel (added `min-height: 0` and flex layout)
+
+### Phase 4: Multi-Language Coverage
+- Add parser adapters for more languages (Go, Rust, Java, etc.)
 - Improve API, test, config, and model detection
 - Strengthen ownership and domain inference
 - Add architecture boundary validation

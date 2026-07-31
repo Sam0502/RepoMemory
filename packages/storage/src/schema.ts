@@ -37,8 +37,8 @@ CREATE TABLE IF NOT EXISTS entities (
 -- Relationships table
 CREATE TABLE IF NOT EXISTS relationships (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  source_id VARCHAR(255) NOT NULL,
-  target_id VARCHAR(255) NOT NULL,
+  source_id VARCHAR(1000) NOT NULL,
+  target_id VARCHAR(1000) NOT NULL,
   type VARCHAR(50) NOT NULL,
   file_path VARCHAR(1000) NOT NULL,
   line INTEGER,
@@ -115,6 +115,27 @@ BEGIN
     WHERE table_name = 'entities' AND column_name = 'embedding'
   ) THEN
     ALTER TABLE entities ADD COLUMN embedding vector(768);
+  END IF;
+END $$;
+
+-- Increase relationship ID column sizes for existing installs (safe migration)
+DO $$
+BEGIN
+  -- Increase source_id and target_id to VARCHAR(1000) if currently smaller
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'relationships' AND column_name = 'source_id'
+    AND character_maximum_length < 1000
+  ) THEN
+    ALTER TABLE relationships ALTER COLUMN source_id TYPE VARCHAR(1000);
+  END IF;
+  
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'relationships' AND column_name = 'target_id'
+    AND character_maximum_length < 1000
+  ) THEN
+    ALTER TABLE relationships ALTER COLUMN target_id TYPE VARCHAR(1000);
   END IF;
 END $$;
 

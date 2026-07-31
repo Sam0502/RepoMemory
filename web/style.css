@@ -160,9 +160,18 @@ main {
   border-right: 1px solid #30363d;
 }
 
+#entityPanel, #commitPanel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .scroll-area {
   overflow-y: auto;
   flex: 1;
+  min-height: 0;
 }
 
 .scroll-area::-webkit-scrollbar { width: 6px; }
@@ -394,6 +403,7 @@ main {
   padding: 0;
   overflow-y: auto;
   flex: 1;
+  min-height: 0;
   font-size: 12px;
 }
 

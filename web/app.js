@@ -11,6 +11,10 @@ const TYPE_COLORS = {
   TypeAlias: '#bc8cff',
   Property: '#8b949e',
   File: '#484f58',
+  Test: '#3fb950',
+  TestSuite: '#3fb950',
+  ApiEndpoint: '#f778ba',
+  Config: '#d29922',
 };
 
 const GROUP_COLORS = {
@@ -22,6 +26,15 @@ const GROUP_COLORS = {
   storage: '#d29922',
   api: '#f778ba',
   web: '#79c0ff',
+  tests: '#3fb950',
+  source: '#58a6ff',
+  lib: '#d2a8ff',
+  cmd: '#f0883e',
+  internal: '#8b949e',
+  pkg: '#d29922',
+  config: '#f778ba',
+  docs: '#79c0ff',
+  scripts: '#ffa657',
   other: '#484f58',
 };
 
@@ -365,6 +378,12 @@ async function loadArchitectureGraph() {
 
     graphNodes = (data.files || []).map(f => ({ ...f, type: 'File' }));
     graphLinks = data.links || [];
+    
+    // Update stats
+    if (statsEl) {
+      statsEl.textContent = `${graphNodes.length} files, ${graphLinks.length} dependencies`;
+    }
+    
     renderArchitectureGraph();
   } catch (err) {
     console.error('Architecture load failed:', err);

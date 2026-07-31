@@ -218,9 +218,27 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     
     // Build links - resolve import paths to file paths
     const fileIds = new Set(files.map(f => f.id));
-    const packageNameToFiles = new Map<string, string[]>();
     
-    // Index files by their package name
+    // Build a lookup map: normalized basename -> file paths (for resolving imports)
+    const basenameToFiles = new Map<string, string[]>();
+    for (const file of files) {
+      const normalized = file.fullPath.replace(/\\/g, '/');
+      // Index by full path for exact match
+      if (!basenameToFiles.has(normalized)) {
+        basenameToFiles.set(normalized, []);
+      }
+      basenameToFiles.get(normalized)!.push(file.id);
+      
+      // Also index by basename for fuzzy resolution
+      const base = normalized.split('/').pop()!;
+      if (!basenameToFiles.has(base)) {
+        basenameToFiles.set(base, []);
+      }
+      basenameToFiles.get(base)!.push(file.id);
+    }
+    
+    // Build package name -> index file mapping
+    const packageNameToFiles = new Map<string, string[]>();
     for (const file of files) {
       const pkgMatch = file.fullPath.match(/packages\/([^/]+)\//);
       if (pkgMatch) {
@@ -239,13 +257,32 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
       const source = row.source;
       let target = row.target;
       
-      // Resolve package imports to actual files
+      // Skip external/builtin imports (no path separators, not relative)
+      if (!target.startsWith('.') && !target.startsWith('@repo-memory/') && !target.includes('/')) {
+        continue;
+      }
+      
+      // Resolve @repo-memory/* package imports to index files
       if (target.startsWith('@repo-memory/')) {
         const targetFiles = packageNameToFiles.get(target) || [];
-        // Connect to the main index file or first file in package
         const indexFile = targetFiles.find(f => f.includes('index.ts')) || targetFiles[0];
         if (indexFile) {
           target = indexFile;
+        }
+      }
+      // Resolve relative imports (./foo, ../foo)
+      else if (target.startsWith('.')) {
+        const resolved = resolveRelativeImport(source, target, fileIds);
+        if (resolved) {
+          target = resolved;
+        }
+      }
+      // Resolve bare module imports by basename matching
+      else {
+        const candidates = basenameToFiles.get(target.split('/').pop()!) || [];
+        // Pick the first candidate that's in a similar directory depth
+        if (candidates.length > 0) {
+          target = candidates[0];
         }
       }
       
@@ -295,8 +332,41 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   return app;
 }
 
+function resolveRelativeImport(sourceFile: string, importPath: string, fileIds: Set<string>): string | null {
+  const normalizedSource = sourceFile.replace(/\\/g, '/');
+  const sourceDir = normalizedSource.split('/').slice(0, -1).join('/');
+  
+  // Strip file extensions from import path for resolution
+  const stripped = importPath.replace(/\.(ts|tsx|js|jsx|mjs|cjs)$/, '');
+  
+  // Resolve relative path
+  const parts = (sourceDir + '/' + stripped).split('/');
+  const resolved: string[] = [];
+  for (const part of parts) {
+    if (part === '..') {
+      resolved.pop();
+    } else if (part !== '.' && part !== '') {
+      resolved.push(part);
+    }
+  }
+  
+  const base = resolved.join('/');
+  
+  // Try exact match first
+  for (const ext of ['', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '/index.ts', '/index.tsx', '/index.js', '/index.jsx']) {
+    const candidate = base + ext;
+    if (fileIds.has(candidate)) {
+      return candidate;
+    }
+  }
+  
+  return null;
+}
+
 function getGroup(filePath: string): string {
   const normalizedPath = filePath.replace(/\\/g, '/');
+  
+  // RepoMemory internal packages
   if (normalizedPath.startsWith('app/')) return 'app';
   if (normalizedPath.startsWith('packages/shared/')) return 'shared';
   if (normalizedPath.startsWith('packages/ingestion/')) return 'ingestion';
@@ -305,6 +375,22 @@ function getGroup(filePath: string): string {
   if (normalizedPath.startsWith('packages/storage/')) return 'storage';
   if (normalizedPath.startsWith('packages/api/')) return 'api';
   if (normalizedPath.startsWith('web/')) return 'web';
+  
+  // Generic groupings for external repos
+  if (normalizedPath.includes('/test/') || normalizedPath.includes('/tests/') || normalizedPath.includes('/__tests__/') || normalizedPath.includes('.test.') || normalizedPath.includes('.spec.')) return 'tests';
+  if (normalizedPath.includes('/src/')) return 'source';
+  if (normalizedPath.includes('/lib/')) return 'lib';
+  if (normalizedPath.includes('/cmd/')) return 'cmd';
+  if (normalizedPath.includes('/internal/')) return 'internal';
+  if (normalizedPath.includes('/pkg/')) return 'pkg';
+  if (normalizedPath.includes('/config/') || normalizedPath.includes('/configs/')) return 'config';
+  if (normalizedPath.includes('/docs/') || normalizedPath.includes('/doc/')) return 'docs';
+  if (normalizedPath.includes('/scripts/')) return 'scripts';
+  
+  // Group by top-level directory
+  const topLevel = normalizedPath.split('/')[0];
+  if (topLevel) return topLevel;
+  
   return 'other';
 }
 

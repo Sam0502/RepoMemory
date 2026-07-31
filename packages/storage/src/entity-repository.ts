@@ -153,6 +153,11 @@ export class EntityRepository {
     return parseInt(result.rows[0].count);
   }
 
+  async deleteByFilePath(filePath: string): Promise<void> {
+    const query = 'DELETE FROM entities WHERE file_path = $1';
+    await this.pool.query(query, [filePath]);
+  }
+
   private mapRowToEntity(row: any): Entity {
     return {
       id: row.id,

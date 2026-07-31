@@ -55,6 +55,12 @@ RepoMemory/
 │   ├── shared/                 # Types, interfaces, enums
 │   ├── ingestion/              # Git operations, file watcher
 │   ├── analysis/               # Tree-sitter parser + embeddings
+│   │   └── extractors/         # Language-specific extractors
+│   │       ├── interface.ts    # LanguageExtractor interface
+│   │       ├── base.ts         # BaseExtractor with shared utilities
+│   │       ├── typescript.ts   # TypeScript/TSX extractor
+│   │       ├── javascript.ts   # JavaScript extractor
+│   │       └── python.ts       # Python extractor
 │   ├── graph/                  # Neo4j client
 │   ├── storage/                # PostgreSQL client
 │   └── api/                    # Hono HTTP API server + context packs
@@ -209,8 +215,15 @@ pnpm db:down
 - Tree-sitter WASM initialization fixes
 - High-contrast graph visualization
 
-**Next (Phase 3):**
-- Multi-language parser support
+**Phase 3 Complete** (v0.4.0):
+- Multi-language support (TypeScript, JavaScript, Python)
+- Strategy pattern parser architecture
+- Constructor, test, API endpoint, and config entity detection
+- CALLS, REFERENCES, and CONTAINS relationship detection
+- Parser caching for better performance
+
+**Next (Phase 4):**
+- Multi-language parser support (Go, Rust, Java, etc.)
 - Cross-file symbol resolution
 - Architecture boundary validation
 - Dead code detection

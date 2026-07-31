@@ -8,6 +8,7 @@ const GRAMMAR_FILES: Record<string, string> = {
   typescript: 'tree-sitter-typescript.wasm',
   javascript: 'tree-sitter-javascript.wasm',
   tsx: 'tree-sitter-tsx.wasm',
+  python: 'tree-sitter-python.wasm',
 };
 
 async function loadParser(): Promise<any> {

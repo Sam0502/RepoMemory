@@ -1,7 +1,7 @@
 import { EntityRepository, RelationshipRepository, CommitRepository } from '@repo-memory/storage';
 import { GraphClient } from '@repo-memory/graph';
 import { Entity, Relationship, RelationshipType } from '@repo-memory/shared';
-import { detectDeadCode } from '@repo-memory/analysis';
+import { detectDeadCode, ChangeAnalyzer } from '@repo-memory/analysis';
 import { Pool } from 'pg';
 
 export interface QaAnswer {
@@ -28,16 +28,24 @@ const STOP_WORDS = new Set([
 
 export class QaService {
   private deadCodeCache: { dead: Set<string>; exportedButUnused: Set<string> } | null = null;
+  private changeAnalyzer: ChangeAnalyzer | null = null;
 
   constructor(
     private entityRepo: EntityRepository,
     private relationshipRepo: RelationshipRepository,
     private commitRepo: CommitRepository,
     private graphClient: GraphClient,
-    private pool: Pool
+    private pool: Pool,
+    private workspace: boolean = false,
+    private repoPath: string = ''
   ) {}
 
   async ask(question: string): Promise<QaAnswer> {
+    if (this.workspace) {
+      const ambiguous = await this.workspaceAmbiguityAnswer(question);
+      if (ambiguous) return ambiguous;
+    }
+
     const fragments = this.splitFragments(question);
 
     if (fragments.length > 1) {
@@ -62,6 +70,13 @@ export class QaService {
 
     for (const fragment of fragments) {
       const intent = this.classifyIntent(fragment);
+      if (this.workspace) {
+        const ambiguous = await this.workspaceAmbiguityAnswer(fragment);
+        if (ambiguous) {
+          parts.push(ambiguous.answer);
+          continue;
+        }
+      }
       let entity = await this.resolveEntity(fragment);
       if (!entity) entity = lastEntity; // inherit from previous fragment ("and who calls it")
 
@@ -91,6 +106,10 @@ export class QaService {
     entity: Entity | null,
     evidence: Array<{ type: string; description: string }>
   ): Promise<QaAnswer> {
+    if (intent === 'churn' || intent === 'drift') {
+      return this.answerRepoLevel(question, intent, evidence);
+    }
+
     if (!entity) {
       const results = await this.entityRepo.search(this.stripQuestion(question));
       const answer = results.length
@@ -125,7 +144,7 @@ export class QaService {
           if (symbols.length) answer += `\nSymbols: ${symbols.slice(0, 10).map(d => d.entity.name).join(', ')}`;
         } else {
           answer = depEntities.length
-            ? `${entity.name} depends on: ${depEntities.map(d => d.name).join(', ')}`
+            ? `${entity.name} depends on: ${depEntities.map(d => this.workspace ? `${d.name} (${this.entityPath(d)})` : d.name).join(', ')}`
             : `${entity.name} has no known dependencies.`;
         }
         evidence.push({
@@ -138,7 +157,7 @@ export class QaService {
         const deps = await this.graphClient.findDependents(entity.stableId);
         const depEntities = deps.map(d => d.entity);
         answer = depEntities.length
-          ? `${entity.name} is used by: ${depEntities.map(d => `${d.name} (${d.filePath})`).join(', ')}`
+          ? `${entity.name} is used by: ${depEntities.map(d => `${d.name} (${this.entityPath(d)})`).join(', ')}`
           : `${entity.name} has no dependents.`;
         evidence.push({
           type: 'relationships',
@@ -147,16 +166,17 @@ export class QaService {
         break;
       }
       case 'location': {
-        answer = `${entity.name} is defined in ${entity.filePath} at lines ${entity.startLine}-${entity.endLine}.`;
+        answer = `${entity.name} is defined in ${this.entityPath(entity)} at lines ${entity.startLine}-${entity.endLine}.`;
         break;
       }
       case 'ownership': {
         // Prefer the exact file named in the question over the generic entity match
         const fileFromQuestion = await this.findFileFromQuestion(question);
         const filePath = fileFromQuestion?.filePath ?? entity.filePath;
+        const displayPath = this.workspace && entity.repoPath ? `${entity.repoPath}:${filePath}` : filePath;
         const ownership = await this.queryOwnership(filePath);
         answer = ownership
-          ? `${fileFromQuestion?.name ?? entity.name} (${filePath}) is primarily owned by ${ownership.owner} (${ownership.commits} commits).`
+          ? `${fileFromQuestion?.name ?? entity.name} (${displayPath}) is primarily owned by ${ownership.owner} (${ownership.commits} commits).`
           : `${fileFromQuestion?.name ?? entity.name} has no commit ownership data yet.`;
         evidence.push({
           type: 'ownership',
@@ -226,7 +246,7 @@ export class QaService {
       case 'changelog': {
         const commits = await this.commitRepo.findCommitsForFile(entity.filePath);
         answer = commits.length
-          ? `Recent changes to ${entity.name} (${entity.filePath}):\n` +
+          ? `Recent changes to ${entity.name} (${this.entityPath(entity)}):\n` +
             commits
               .slice(0, 10)
               .map(c => `  ${c.hash.slice(0, 7)} ${c.date.toISOString().slice(0, 10)} ${c.author}: ${c.message}`)
@@ -247,7 +267,7 @@ export class QaService {
       case 'info':
       default: {
         const parts = [
-          `${entity.name} is a ${entity.type} in ${entity.filePath} (lines ${entity.startLine}-${entity.endLine}).`,
+          `${entity.name} is a ${entity.type} in ${this.entityPath(entity)} (lines ${entity.startLine}-${entity.endLine}).`,
         ];
         if (entity.purpose) parts.push(`Purpose: ${entity.purpose}`);
         if (entity.responsibility) parts.push(`Responsibility: ${entity.responsibility}`);
@@ -312,6 +332,12 @@ export class QaService {
     if (/impact|affected by|what breaks|what would break|breaking change|downstream/.test(q)) {
       return 'impact';
     }
+    if (/which files? (change|churn)|most (changed|unstable|churned)|what files? change|churn\b|changing the most/.test(q)) {
+      return 'churn';
+    }
+    if (/drift|drifting|diverge|out of sync|decay/.test(q)) {
+      return 'drift';
+    }
     if (/who (calls|uses|references|invokes|imports)|dependents of|what uses|who depends on|what.*(files|modules).*imports/.test(q)) {
       return 'dependents';
     }
@@ -353,17 +379,100 @@ export class QaService {
     return this.findEntity(question);
   }
 
-  private async findEndpointFromQuestion(question: string): Promise<Entity | null> {
+  // --- Workspace resolution -------------------------------------------------
+
+  private async resolveCandidates(question: string): Promise<Entity[]> {
+    const endpoints = await this.findEndpointCandidates(question);
+    if (endpoints.length) return endpoints;
+    const files = await this.findFileCandidates(question);
+    if (files.length) return files;
+    return this.findEntityCandidates(question);
+  }
+
+  private async workspaceAmbiguityAnswer(question: string): Promise<QaAnswer | null> {
+    const candidates = await this.resolveCandidates(question);
+    if (!candidates.length) return null;
+
+    const repos = new Set(candidates.map(c => c.repoPath || ''));
+    if (repos.size <= 1) return null;
+
+    const byRepo = new Map<string, Set<string>>();
+    for (const c of candidates) {
+      const key = c.repoPath || '(unknown)';
+      if (!byRepo.has(key)) byRepo.set(key, new Set());
+      byRepo.get(key)!.add(c.name);
+    }
+
+    return {
+      question,
+      intent: 'workspace-ambiguous',
+      answer:
+        `Found matches across ${repos.size} repositories. Please specify which repository you mean:\n` +
+        [...byRepo.entries()].map(([repo, names]) => `  - ${repo}: ${[...names].join(', ')}`).join('\n'),
+      evidence: [{ type: 'workspace', description: `Candidates across ${repos.size} repos` }],
+    };
+  }
+
+  private async findEndpointCandidates(question: string): Promise<Entity[]> {
     const match = question.match(/\b(?:POST|GET|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+\/[\w\/:.\-_{}<>]*/i);
-    if (!match) return null;
+    if (!match) return [];
     const target = match[0].replace(/\s+/g, ' ').trim();
     const pathToken = target.split(/\s+/)[1].replace(/[\/:{}<>]/g, ' ').trim().split(/\s+/)[0];
     const candidates = await this.entityRepo.search(pathToken || 'route');
     const verb = target.split(/\s+/)[0].toUpperCase();
-    return (
-      candidates.find(c => c.type === 'ApiEndpoint' && c.name.toLowerCase() === target.toLowerCase()) ??
-      candidates.find(c => c.type === 'ApiEndpoint' && c.name.toUpperCase().startsWith(verb) && c.name.includes(target.split(/\s+/)[1].split(':')[0]))
-    ) || null;
+    const exact = candidates.filter(c => c.type === 'ApiEndpoint' && c.name.toLowerCase() === target.toLowerCase());
+    if (exact.length) return exact;
+    return candidates.filter(
+      c => c.type === 'ApiEndpoint' && c.name.toUpperCase().startsWith(verb) && c.name.includes(target.split(/\s+/)[1].split(':')[0])
+    );
+  }
+
+  private async findFileCandidates(question: string): Promise<Entity[]> {
+    const tokens = question.match(/[A-Za-z0-9_][\w.\/\\-]*\.(ts|tsx|js|jsx|py|json|css|html|md|go|rs|java|sql)/gi) || [];
+    const results: Entity[] = [];
+    const seen = new Set<string>();
+    for (const token of tokens) {
+      const normalized = token.replace(/\\/g, '/');
+      const candidates = await this.entityRepo.search(token.replace(/[\\/.]/g, ' ').trim().split(/\s+/)[0]);
+      for (const c of candidates) {
+        if (
+          c.type === 'File' && c.filePath.replace(/\\/g, '/').toLowerCase().endsWith(normalized.toLowerCase()) &&
+          !seen.has(c.stableId)
+        ) {
+          seen.add(c.stableId);
+          results.push(c);
+        }
+      }
+    }
+    return results;
+  }
+
+  private async findEntityCandidates(question: string): Promise<Entity[]> {
+    const words = this.questionWords(question);
+    const results: Entity[] = [];
+    const seen = new Set<string>();
+    for (const word of words.slice(0, 6)) {
+      const matches = await this.entityRepo.search(word);
+      for (const m of matches) {
+        if (!seen.has(m.stableId)) {
+          seen.add(m.stableId);
+          results.push(m);
+        }
+      }
+    }
+    return results;
+  }
+
+  private entityPath(entity: Entity): string {
+    return this.workspace && entity.repoPath ? `${entity.repoPath}:${entity.filePath}` : entity.filePath;
+  }
+
+  private async findEndpointFromQuestion(question: string): Promise<Entity | null> {
+    return (await this.findEndpointCandidates(question))[0] || null;
+  }
+
+  private async findFileFromQuestion(question: string): Promise<Entity | null> {
+    return (await this.findFileCandidates(question))[0] || null;
   }
 
   private async findEntity(question: string): Promise<Entity | null> {
@@ -416,19 +525,6 @@ export class QaService {
       .filter(w => w.length >= 2 && !STOP_WORDS.has(w.toLowerCase()));
   }
 
-  private async findFileFromQuestion(question: string): Promise<Entity | null> {
-    const tokens = question.match(/[A-Za-z0-9_][\w.\/\\-]*\.(ts|tsx|js|jsx|py|json|css|html|md|go|rs|java|sql)/gi) || [];
-    for (const token of tokens) {
-      const normalized = token.replace(/\\/g, '/');
-      const candidates = await this.entityRepo.search(token.replace(/[\\/.]/g, ' ').trim().split(/\s+/)[0]);
-      const file = candidates.find(
-        c => c.type === 'File' && c.filePath.replace(/\\/g, '/').toLowerCase().endsWith(normalized.toLowerCase())
-      );
-      if (file) return file;
-    }
-    return null;
-  }
-
   private async queryOwnership(filePath: string): Promise<{ owner: string; commits: number } | null> {
     // file paths in file_changes use forward slashes; normalize for matching
     const normalized = filePath.replace(/\\/g, '/');
@@ -446,6 +542,80 @@ export class QaService {
     const row = result.rows[0];
     if (!row || !row.owner) return null;
     return { owner: row.owner, commits: parseInt(row.commits) };
+  }
+
+  private getChangeAnalyzer(): ChangeAnalyzer {
+    if (!this.changeAnalyzer) {
+      this.changeAnalyzer = new ChangeAnalyzer({
+        fileChurnRows: (repoPath, days) => this.commitRepo.getFileChurn(repoPath, 100000, days),
+        entities: async () => {
+          const all: Entity[] = [];
+          const limit = 10000;
+          let offset = 0;
+          while (true) {
+            const batch = await this.entityRepo.findAll(limit, offset);
+            all.push(...batch);
+            if (batch.length < limit) break;
+            offset += limit;
+          }
+          return all;
+        },
+        relationships: async () => {
+          const all: Relationship[] = [];
+          for (const type of [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS, RelationshipType.HANDLES]) {
+            all.push(...(await this.relationshipRepo.findByType(type)));
+          }
+          return all;
+        },
+        lastCommitDate: (repoPath) => this.commitRepo.getLastCommitDate(repoPath),
+      });
+    }
+    return this.changeAnalyzer;
+  }
+
+  private async answerRepoLevel(
+    question: string,
+    intent: string,
+    evidence: Array<{ type: string; description: string }>
+  ): Promise<QaAnswer> {
+    if (!this.repoPath) {
+      return {
+        question,
+        intent,
+        answer: 'Churn and drift are per-repository analyses. Please ask against a specific repository.',
+        evidence: [{ type: 'change', description: 'Workspace-wide churn/drift is not supported' }],
+      };
+    }
+
+    const analyzer = this.getChangeAnalyzer();
+
+    if (intent === 'churn') {
+      const churn = await analyzer.computeFileChurn(this.repoPath, 10);
+      evidence.push({ type: 'churn', description: `Top ${churn.length} files by churn score` });
+      return {
+        question,
+        intent,
+        answer: churn.length
+          ? `Most changed files:\n${churn.map(c => `  ${c.filePath} — ${c.commits} commits, +${c.additions}/-${c.deletions} (score ${c.churnScore})`).join('\n')}`
+          : 'No churn data available yet (scan commit history first).',
+        evidence,
+      };
+    }
+
+    if (intent === 'drift') {
+      const report = await analyzer.detectDrift(this.repoPath);
+      evidence.push({ type: 'drift', description: `${report.signals.length} drift signal(s)` });
+      return {
+        question,
+        intent,
+        answer: report.signals.length
+          ? `Architecture drift signals:\n${report.signals.map(s => `  [${s.severity}] ${s.description}`).join('\n')}`
+          : 'No architecture drift signals detected.',
+        evidence,
+      };
+    }
+
+    return { question, intent, answer: '', evidence };
   }
 
   private async getDeadCode(): Promise<{ dead: Set<string>; exportedButUnused: Set<string> }> {

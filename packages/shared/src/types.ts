@@ -59,6 +59,7 @@ export type Language = (typeof Language)[keyof typeof Language];
 export interface Entity {
   id: string;
   stableId: string;
+  repoPath?: string;
   name: string;
   type: EntityType;
   language: Language;
@@ -97,6 +98,7 @@ export interface Relationship {
 
 export interface Commit {
   hash: string;
+  repoPath?: string;
   message: string;
   author: string;
   date: Date;
@@ -109,6 +111,14 @@ export interface FileChange {
   deletions: number;
   status: 'added' | 'modified' | 'deleted' | 'renamed';
   oldPath?: string;
+}
+
+export interface FileChurnRow {
+  filePath: string;
+  commits: number;
+  additions: number;
+  deletions: number;
+  lastChanged: Date;
 }
 
 export interface GraphEvent {

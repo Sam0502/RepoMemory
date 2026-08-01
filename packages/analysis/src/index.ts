@@ -27,3 +27,5 @@ export { inferDomain, inferArchitecturalRole, applyDomainMetadata, parseDomainCo
 export type { DomainConfig, DomainConfigDomain } from './domain.js';
 export { validateBoundaries } from './boundaries.js';
 export type { BoundaryReport, BoundaryViolation, BoundaryEndpoint, DomainSummary } from './boundaries.js';
+export { ChangeAnalyzer } from './change.js';
+export type { ChangeDataProvider, FileChurn, FileRisk, RiskBreakdown, EntityChangeInfo, DriftReport, DriftSignal } from './change.js';

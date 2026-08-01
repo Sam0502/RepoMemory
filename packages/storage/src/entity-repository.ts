@@ -139,31 +139,50 @@ export class EntityRepository {
   }
 
   async findSimilar(stableId: string, limit: number = 10, threshold: number = 0.5): Promise<Entity[]> {
-    const query = `
-      SELECT e.*, 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) AS similarity
-      FROM entities e
-      WHERE e.stable_id != $1
-        AND e.repo_path = $2
-        AND e.embedding IS NOT NULL
-        AND 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) > $3
-      ORDER BY similarity DESC
-      LIMIT $4
-    `;
-    const result = await this.pool.query(query, [stableId, this.repoPath, threshold, limit]);
+    const query = this.repoPath
+      ? `
+        SELECT e.*, 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) AS similarity
+        FROM entities e
+        WHERE e.stable_id != $1
+          AND e.repo_path = $2
+          AND e.embedding IS NOT NULL
+          AND 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) > $3
+        ORDER BY similarity DESC
+        LIMIT $4
+      `
+      : `
+        SELECT e.*, 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) AS similarity
+        FROM entities e
+        WHERE e.stable_id != $1
+          AND e.embedding IS NOT NULL
+          AND 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) > $2
+        ORDER BY similarity DESC
+        LIMIT $3
+      `;
+    const result = await this.pool.query(query, this.repoPath ? [stableId, this.repoPath, threshold, limit] : [stableId, threshold, limit]);
     return result.rows.map(this.mapRowToEntity);
   }
 
   async findByEmbedding(vector: number[], limit: number = 10, threshold: number = 0.5): Promise<Entity[]> {
-    const query = `
-      SELECT *, 1 - (embedding <=> $1::vector) AS similarity
-      FROM entities
-      WHERE repo_path = $2
-        AND embedding IS NOT NULL
-        AND 1 - (embedding <=> $1::vector) > $3
-      ORDER BY similarity DESC
-      LIMIT $4
-    `;
-    const result = await this.pool.query(query, [JSON.stringify(vector), this.repoPath, threshold, limit]);
+    const query = this.repoPath
+      ? `
+        SELECT *, 1 - (embedding <=> $1::vector) AS similarity
+        FROM entities
+        WHERE repo_path = $2
+          AND embedding IS NOT NULL
+          AND 1 - (embedding <=> $1::vector) > $3
+        ORDER BY similarity DESC
+        LIMIT $4
+      `
+      : `
+        SELECT *, 1 - (embedding <=> $1::vector) AS similarity
+        FROM entities
+        WHERE embedding IS NOT NULL
+          AND 1 - (embedding <=> $1::vector) > $2
+        ORDER BY similarity DESC
+        LIMIT $3
+      `;
+    const result = await this.pool.query(query, this.repoPath ? [JSON.stringify(vector), this.repoPath, threshold, limit] : [JSON.stringify(vector), threshold, limit]);
     return result.rows.map(this.mapRowToEntity);
   }
 
@@ -193,6 +212,7 @@ export class EntityRepository {
     return {
       id: row.id,
       stableId: row.stable_id,
+      repoPath: row.repo_path,
       name: row.name,
       type: row.type as EntityType,
       language: row.language as Language,

@@ -1,5 +1,5 @@
 import { Pool } from 'pg';
-import { Commit, FileChange } from '@repo-memory/shared';
+import { Commit, FileChange, FileChurnRow } from '@repo-memory/shared';
 
 export class CommitRepository {
   constructor(private pool: Pool, private repoPath: string = '') {}
@@ -84,15 +84,60 @@ export class CommitRepository {
     return result.rows[0]?.hash || null;
   }
 
+  async getLastCommitDate(repoPath: string): Promise<Date | null> {
+    const result = await this.pool.query(
+      `SELECT date FROM commits WHERE repo_path = $1 ORDER BY date DESC LIMIT 1`,
+      [repoPath]
+    );
+    return result.rows[0]?.date ? new Date(result.rows[0].date) : null;
+  }
+
+  async getFileChurn(repoPath: string, limit: number = 50, days?: number): Promise<FileChurnRow[]> {
+    const query = days
+      ? `SELECT f.file_path,
+                COUNT(*)::int AS commits,
+                COALESCE(SUM(f.additions), 0)::int AS additions,
+                COALESCE(SUM(f.deletions), 0)::int AS deletions,
+                MAX(c.date) AS last_changed
+         FROM file_changes f
+         JOIN commits c ON c.hash = f.commit_hash
+         WHERE c.repo_path = $1 AND c.date >= NOW() - make_interval(days => $2)
+         GROUP BY f.file_path
+         ORDER BY commits DESC
+         LIMIT $3`
+      : `SELECT f.file_path,
+                COUNT(*)::int AS commits,
+                COALESCE(SUM(f.additions), 0)::int AS additions,
+                COALESCE(SUM(f.deletions), 0)::int AS deletions,
+                MAX(c.date) AS last_changed
+         FROM file_changes f
+         JOIN commits c ON c.hash = f.commit_hash
+         WHERE c.repo_path = $1
+         GROUP BY f.file_path
+         ORDER BY commits DESC
+         LIMIT $2`;
+    const result = await this.pool.query(query, days ? [repoPath, days, limit] : [repoPath, limit]);
+    return result.rows.map(row => ({
+      filePath: row.file_path,
+      commits: parseInt(row.commits),
+      additions: parseInt(row.additions),
+      deletions: parseInt(row.deletions),
+      lastChanged: new Date(row.last_changed),
+    }));
+  }
+
   async findCommitsForFile(filePath: string, limit: number = 10): Promise<Commit[]> {
     const normalized = filePath.replace(/\\/g, '/');
-    const result = await this.pool.query(
-      `SELECT c.* FROM commits c
-       JOIN file_changes f ON f.commit_hash = c.hash
-       WHERE c.repo_path = $1 AND f.file_path = $2
-       ORDER BY c.date DESC LIMIT $3`,
-      [this.repoPath, normalized, limit]
-    );
+    const query = this.repoPath
+      ? `SELECT c.* FROM commits c
+         JOIN file_changes f ON f.commit_hash = c.hash
+         WHERE c.repo_path = $1 AND f.file_path = $2
+         ORDER BY c.date DESC LIMIT $3`
+      : `SELECT c.* FROM commits c
+         JOIN file_changes f ON f.commit_hash = c.hash
+         WHERE f.file_path = $1
+         ORDER BY c.date DESC LIMIT $2`;
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath, normalized, limit] : [normalized, limit]);
     return result.rows.map(this.mapRowToCommit);
   }
 
@@ -106,6 +151,7 @@ export class CommitRepository {
   private mapRowToCommit(row: any): Commit {
     return {
       hash: row.hash,
+      repoPath: row.repo_path,
       message: row.message,
       author: row.author,
       date: row.date,

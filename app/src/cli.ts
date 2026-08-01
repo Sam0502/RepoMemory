@@ -4,9 +4,19 @@ import { Command } from 'commander';
 import { Orchestrator } from './orchestrator.js';
 import { startServer } from '@repo-memory/api';
 import { GraphClient } from '@repo-memory/graph';
-import { createPool } from '@repo-memory/storage';
+import { createPool, EntityRepository, RelationshipRepository } from '@repo-memory/storage';
+import { detectDeadCode } from '@repo-memory/analysis';
+import { RelationshipType } from '@repo-memory/shared';
 import { resolve } from 'path';
 import type { EmbeddingConfig } from '@repo-memory/analysis';
+
+const DB_CONFIG = {
+  host: 'localhost',
+  port: 5433,
+  database: 'repo_memory',
+  user: 'repo_memory',
+  password: 'repo-memory-password',
+};
 
 function getEmbeddingConfig(): EmbeddingConfig {
   const provider = process.env.EMBEDDING_PROVIDER || 'onnx';
@@ -71,9 +81,45 @@ program
   .command('query')
   .description('Query the knowledge graph')
   .option('-r, --repo <path>', 'Repository path', process.cwd())
-  .argument('<type>', 'Query type: entity, dependencies, dependents, search, impact, dead-code')
+  .option('-a, --all-repos', 'Query across all scanned repositories (search, dead-code)', false)
+  .argument('<type>', 'Query type: entity, dependencies, dependents, search, impact, dead-code, churn, risk')
   .argument('[args...]', 'Query arguments')
   .action(async (type, args, options) => {
+    const crossRepo = options.allRepos && (type === 'search' || type === 'dead-code');
+
+    if (crossRepo) {
+      const pool = await createPool(DB_CONFIG);
+      try {
+        const entityRepo = new EntityRepository(pool, '');
+        const relationshipRepo = new RelationshipRepository(pool, '');
+        if (type === 'search') {
+          const results = await entityRepo.search(args.join(' '));
+          console.log(JSON.stringify(results, null, 2));
+        } else {
+          const entities: any[] = [];
+          const limit = 5000;
+          let offset = 0;
+          while (true) {
+            const batch = await entityRepo.findAll(limit, offset);
+            entities.push(...batch);
+            if (batch.length < limit) break;
+            offset += limit;
+          }
+          const relationships: any[] = [];
+          for (const t of [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS]) {
+            relationships.push(...(await relationshipRepo.findByType(t)));
+          }
+          console.log(JSON.stringify(detectDeadCode(entities, relationships), null, 2));
+        }
+      } catch (error) {
+        console.error('Workspace query failed:', error);
+        process.exit(1);
+      } finally {
+        await pool.end();
+      }
+      return;
+    }
+
     const orchestrator = new Orchestrator({
       repoPath: resolve(options.repo),
       embeddings: getEmbeddingConfig(),
@@ -123,6 +169,22 @@ program
           console.log(JSON.stringify(report, null, 2));
           break;
         }
+        case 'churn': {
+          const limit = args[0] ? parseInt(args[0]) : 50;
+          const churn = await orchestrator.getChurn(limit);
+          console.log(JSON.stringify(churn, null, 2));
+          break;
+        }
+        case 'risk': {
+          const id = args[0];
+          if (!id) {
+            console.error('Usage: repo-memory query risk <stableId>');
+            process.exit(1);
+          }
+          const risk = await orchestrator.getRisk(id);
+          console.log(JSON.stringify(risk, null, 2));
+          break;
+        }
         default:
           console.error(`Unknown query type: ${type}`);
           process.exit(1);
@@ -132,6 +194,50 @@ program
       process.exit(1);
     } finally {
       await orchestrator.close();
+    }
+  });
+
+program
+  .command('workspace')
+  .description('Workspace-wide (cross-repo) queries')
+  .argument('<type>', 'Query type: repos')
+  .action(async (type) => {
+    if (type !== 'repos') {
+      console.error(`Unknown workspace query type: ${type}`);
+      process.exit(1);
+    }
+
+    const pool = await createPool(DB_CONFIG);
+    try {
+      const result = await pool.query(
+        `SELECT e.repo_path AS repo_path,
+                COUNT(e.id)::int AS entity_count,
+                (SELECT COUNT(*)::int FROM commits c WHERE c.repo_path = e.repo_path) AS commit_count
+         FROM entities e
+         WHERE e.repo_path <> ''
+         GROUP BY e.repo_path
+         ORDER BY e.repo_path`
+      );
+      const state = await pool.query('SELECT repo_path, last_commit_hash, last_scan_at FROM repo_state');
+      const stateByPath = new Map(state.rows.map(r => [r.repo_path, r]));
+
+      if (result.rows.length === 0) {
+        console.log('No scanned repositories found.');
+        return;
+      }
+
+      for (const row of result.rows) {
+        const st = stateByPath.get(row.repo_path);
+        console.log(
+          `${row.repo_path}\t${row.entity_count} entities\t${row.commit_count} commits\t` +
+          `last: ${st?.last_commit_hash || 'n/a'} (${st?.last_scan_at ? new Date(st.last_scan_at).toISOString() : 'n/a'})`
+        );
+      }
+    } catch (error) {
+      console.error('Workspace query failed:', error);
+      process.exit(1);
+    } finally {
+      await pool.end();
     }
   });
 

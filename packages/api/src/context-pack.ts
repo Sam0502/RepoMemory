@@ -23,7 +23,7 @@ export class ContextPackBuilder {
       dependencies: deps.map(d => d.entity),
       dependents: dependents.map(d => d.entity),
       recentChanges: commits.filter(c =>
-        c.filesChanged.some(f => f === entity.filePath)
+        c.filesChanged.some(f => f === entity.filePath) && c.repoPath === entity.repoPath
       ),
       similarEntities: similar,
       metadata: {

@@ -14,6 +14,12 @@ RepoMemory parses your codebase, builds a knowledge graph of entities (classes, 
 - **Commit history** - browse recent commits and file changes
 - **Context packs** - token-budget context bundles for AI agents
 - **Similar entities** - semantic similarity search
+- **Cross-file symbol resolution** - bare-name calls/references resolved to real entities via a repo-wide symbol index
+- **Dead code detection** - reachability analysis over resolved edges
+- **Natural-language QA** - ask questions about the codebase, get evidence-backed answers
+- **Ownership & domain inference** - per-file authors, domain/architectural-role classification, boundary validation
+- **Change analytics** - churn, risk, and architectural drift scoring from commit history
+- **Workspace queries** - cross-repo search, QA, and reporting across all scanned repositories
 - **CLI and HTTP API** - query from command line or integrate with tools
 
 ## Prerequisites
@@ -54,16 +60,22 @@ RepoMemory/
 ├── packages/
 │   ├── shared/                 # Types, interfaces, enums
 │   ├── ingestion/              # Git operations, file watcher
-│   ├── analysis/               # Tree-sitter parser + embeddings
-│   │   └── extractors/         # Language-specific extractors
-│   │       ├── interface.ts    # LanguageExtractor interface
-│   │       ├── base.ts         # BaseExtractor with shared utilities
-│   │       ├── typescript.ts   # TypeScript/TSX extractor
-│   │       ├── javascript.ts   # JavaScript extractor
-│   │       └── python.ts       # Python extractor
+│   ├── analysis/               # Tree-sitter parser + embeddings + analysis
+│   │   ├── extractors/         # Language-specific extractors
+│   │   │   ├── interface.ts    # LanguageExtractor interface
+│   │   │   ├── base.ts         # BaseExtractor with shared utilities
+│   │   │   ├── typescript.ts   # TypeScript/TSX extractor
+│   │   │   ├── javascript.ts   # JavaScript extractor
+│   │   │   └── python.ts       # Python extractor
+│   │   ├── resolver/           # SymbolIndex + RelationshipResolver
+│   │   ├── deadcode.ts         # Dead code detection
+│   │   ├── domain.ts           # Domain/role inference + boundary config
+│   │   ├── boundaries.ts       # Architecture boundary validation
+│   │   ├── change.ts           # ChangeAnalyzer (churn, risk, drift)
+│   │   └── embedding/          # Embedding providers
 │   ├── graph/                  # Neo4j client
 │   ├── storage/                # PostgreSQL client
-│   └── api/                    # Hono HTTP API server + context packs
+│   └── api/                    # Hono HTTP API + QA + context packs
 ├── app/                        # CLI + orchestrator
 └── web/                        # Frontend (HTML/CSS/JS)
 ```
@@ -85,6 +97,28 @@ node app/dist/cli.js serve --repo /path/to/repo --port 3000
 
 # Query entities
 node app/dist/cli.js query search "GraphClient"
+
+# Look up an entity by stable ID
+node app/dist/cli.js query entity <stableId>
+
+# Get dependencies / dependents / impact
+node app/dist/cli.js query dependencies <stableId>
+node app/dist/cli.js query dependents <stableId>
+node app/dist/cli.js query impact <stableId>
+
+# Dead code report
+node app/dist/cli.js query dead-code
+
+# Change analytics
+node app/dist/cli.js query churn [limit]
+node app/dist/cli.js query risk <stableId>
+
+# Cross-repo queries (search, dead-code accept --all-repos)
+node app/dist/cli.js query search "createUser" --all-repos
+node app/dist/cli.js query dead-code --all-repos
+
+# List all scanned repositories
+node app/dist/cli.js workspace repos
 
 # Show repository stats
 node app/dist/cli.js stats --repo /path/to/repo
@@ -111,6 +145,21 @@ node app/dist/cli.js stats --repo /path/to/repo
 | GET | `/api/commits/:hash` | Get commit details + file changes |
 | GET | `/api/context-pack/:stableId` | Generate context pack for AI |
 | GET | `/api/analysis/impact/:stableId` | Impact analysis |
+| GET | `/api/analysis/dead-code` | Dead code report (`?includeExported=true`) |
+| GET | `/api/analysis/ownership` | Per-file dominant author report |
+| GET | `/api/analysis/boundaries` | Domain boundaries + violations |
+| GET | `/api/analysis/churn` | Top changed files with churn scores (`?limit=`) |
+| GET | `/api/analysis/risk` | Repo-level risk with explainable breakdown |
+| GET | `/api/analysis/risk/:stableId` | Entity-level change/risk info |
+| GET | `/api/analysis/drift` | Architecture drift signals with evidence |
+| POST | `/api/qa/ask` | Natural-language QA (`{"question": "..."}`) |
+| GET | `/api/workspace/repos` | List all scanned repositories + stats |
+| GET | `/api/workspace/entities` | Cross-repo entity list |
+| GET | `/api/workspace/entities/search/:query` | Cross-repo search |
+| GET | `/api/workspace/entities/type/:type` | Cross-repo type listing |
+| POST | `/api/workspace/qa/ask` | Cross-repo QA (answers name their repo) |
+
+All non-workspace endpoints are scoped to the repository passed to `serve --repo`. Workspace endpoints always read across every scanned repository.
 
 ## Docker Services
 
@@ -124,9 +173,29 @@ node app/dist/cli.js stats --repo /path/to/repo
 - Neo4j: `neo4j` / `repo-memory-password`
 - PostgreSQL: `repo_memory` / `repo-memory-password` (database: `repo_memory`)
 
+## Multi-Repository Support
+
+- Each scanned repo's data is tagged with `repo_path` in the `entities`, `relationships`, and `commits` tables
+- Serving a repo (`serve --repo <path>`) filters all non-workspace API responses to that repo only
+- Entity stable IDs are namespaced by repo path, so multiple repos with identical file layouts don't collide
+- `workspace repos` / `workspace` API endpoints / `query ... --all-repos` read across every scanned repo
+- Rescan a repo to re-tag existing data after upgrading from a pre-multi-repo version
+
 ## Environment Variables
 
 ```bash
+# Neo4j
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=repo-memory-password
+
+# PostgreSQL
+PG_HOST=localhost
+PG_PORT=5433
+PG_DATABASE=repo_memory
+PG_USER=repo_memory
+PG_PASSWORD=repo-memory-password
+
 # Embedding provider (onnx, gemini, or placeholder)
 EMBEDDING_PROVIDER=onnx
 
@@ -164,9 +233,14 @@ pnpm db:down
 - Incremental scanning from Git diffs (default mode)
 
 ### Analysis Layer
-- Tree-sitter WASM parser for TypeScript/JavaScript
-- Extracts: functions, classes, interfaces, types, enums, methods, properties
-- Relationships: imports, exports, extends, implements, calls
+- Tree-sitter WASM parser for TypeScript/JavaScript/Python (strategy-pattern extractors)
+- Extracts: functions, classes, interfaces, types, enums, methods, properties, constructors, tests, API endpoints, configs, models
+- Relationships: imports, exports, extends, implements, calls, references, contains, handles
+- **Symbol resolution**: repo-wide `SymbolIndex` + `RelationshipResolver` rewrite bare-name targets to real entity IDs
+- **Dead code detection**: reachability analysis over resolved inbound edges
+- **Domain inference**: per-file domain + architectural role + optional `.repomemory/boundaries.json`
+- **Boundary validation**: cross-domain edge reports against domain rules
+- **Change analysis**: `ChangeAnalyzer` computes churn, file risk, entity change info, and drift signals
 - Multi-provider embeddings (ONNX local, Gemini API, placeholder fallback)
 
 ### Storage Layer
@@ -179,9 +253,11 @@ pnpm db:down
 - CORS enabled for local development
 - Context pack generation for AI agents
 - Impact analysis with risk scoring
+- Natural-language QA service with intent classification and compound-question support
+- Workspace (cross-repo) endpoints alongside repo-scoped endpoints
 
 ### Frontend
-- Entity list with search and type filtering
+- Entity list with search, type filtering, and repo dropdown (multi-repo)
 - D3.js force-directed graph visualization
 - Architecture graph (file-level view)
 - Commit history panel with file changes
@@ -222,11 +298,21 @@ pnpm db:down
 - CALLS, REFERENCES, and CONTAINS relationship detection
 - Parser caching for better performance
 
-**Next (Phase 4):**
-- Multi-language parser support (Go, Rust, Java, etc.)
-- Cross-file symbol resolution
+**Phase 4 Complete** (v0.5.0–v0.6.0, M1–M9):
+- Cross-file symbol resolution (`SymbolIndex` + `RelationshipResolver`)
+- Dead code detection (reachability analysis)
+- Ownership & domain inference with `.repomemory/boundaries.json` config
 - Architecture boundary validation
-- Dead code detection
+- Detection improvements (config files, HANDLES, endpoints, models, tests)
+- Natural-language QA with compound/multi-hop questions
+- Query orchestration (impact, shortest path, changelog, file deps)
+- Workspace-wide cross-repo workflows (workspace API, CLI `--all-repos`, frontend repo dropdown)
+- Entity-change correlation (churn, risk, drift scoring)
+
+**Next (Phase 4 deferrals / Phase 5):**
+- Multi-language parser support (Go, Rust, Java, etc.)
+- Performance hardening and reconciliation/repair jobs
+- Observability, metrics, and quality gates
 
 ## License
 

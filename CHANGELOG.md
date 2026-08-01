@@ -2,6 +2,38 @@
 
 All notable changes to RepoMemory will be documented in this file.
 
+## [0.7.0] - 2026-08-01
+
+### Added (M8) - Workspace-Wide Workflows (cross-repo)
+- **Workspace API**: New `/api/workspace/*` endpoints that read across every scanned repository without changing the per-repo serving model:
+  - `GET /api/workspace/repos` — distinct repos with entity count, commit count, last-scan commit / timestamp
+  - `GET /api/workspace/entities` — cross-repo entity list (optional `repoPath` filter)
+  - `GET /api/workspace/entities/search/:query` — cross-repo search; results carry `repoPath`
+  - `GET /api/workspace/entities/type/:type` — cross-repo type listing
+  - `GET /api/workspace/qa/ask` — cross-repo QA with repo-annotated answers; ambiguous matches aggregate per repo (optional `repoPath` scopes to one repo)
+- **Unfiltered repositories**: `EntityRepository`, `RelationshipRepository`, and `CommitRepository` treat an empty `repoPath` as "no filter"; `findSimilar`/`findByEmbedding`/`findCommitsForFile` are unfiltered-safe
+- **`Entity.repoPath`** mapped through `entity-repository.ts`, `graph-client.ts` (`mapRecordToEntity`), and `commit-repository.ts`
+- **`QaService` workspace mode**: constructed with a `workspace` flag; `resolveCandidates` returns repo-qualified candidates, `workspaceAmbiguityAnswer` aggregates per repo, `entityPath` renders `repo:file` paths
+- **CLI**: `repo-memory workspace repos` and `--all-repos` flag on `query search` / `query dead-code` for cross-repo reporting
+- **Frontend repo dropdown**: `#repoFilter` select in the header ("All repos" or a specific repo), `repo-tag` styling, and `currentRepo` filtering across entity/search/commits/architecture loaders
+
+### Added (M9) - Entity-Change Correlation (churn, risk, drift)
+- **`ChangeAnalyzer`** (`packages/analysis/src/change.ts`): computes per-file churn (`computeFileChurn` with adds + k·deletes scoring and recent-window support), explainable 0-100 file risk (`computeFileRisk` combining churn, inbound fan-out, boundary violations, dead-code flags, staleness), entity change info (`computeEntityChange`: commit count, first/last seen, staleness, owning-file churn), and drift signals (`detectDrift`: test-gaps, recent boundary violations, unstable public surfaces). Backed by a `ChangeDataProvider` interface so the analysis package stays free of pg/storage dependencies
+- **Storage**: `CommitRepository.getFileChurn` (aggregate over `file_changes`) and `getLastCommitDate`
+- **API**: `GET /api/analysis/churn?limit=`, `GET /api/analysis/risk`, `GET /api/analysis/risk/:stableId` (cross-repo entity lookup), `GET /api/analysis/drift`
+- **QA intents**: `churn` ("which files change the most?") and `drift` ("is the architecture drifting?") handled in `answerRepoLevel`
+- **CLI**: `repo-memory query churn [limit]`, `repo-memory query risk <stableId>`; orchestrator `getChurn`/`getFileRisk`/`getRisk`/`getDrift`
+- **Orchestrator change provider**: `changeAnalyzerFor(repoPath)` wires `fileChurnRows`, `entities`, `relationships`, and `lastCommitDate` to the storage layer
+
+### Added (Frontend) - Analysis, Ask, and Change panels
+- **Analysis tab**: new header nav tab with sub-reports for Churn, Risk, Drift, Dead code, Owners, and Bounds (boundaries), rendering severity chips, risk/churn bars, and per-repo tags
+- **Ask tab**: natural-language QA input with suggestion chips hitting `POST /api/workspace/qa/ask` (repo-scoped when a specific repo is selected); renders intent, clickable entity (opens the detail panel), answer, and evidence
+- **Change Analysis section** in the entity detail panel: commits touching the entity, first/last seen commit, staleness, and owning-file churn bar via `GET /api/analysis/risk/:stableId`
+- **Backend support**: `GET /api/workspace/entities/:stableId` for cross-repo entity lookup (enables QA/detail links for any repo)
+
+### Fixed
+- `EntityRepository.findSimilar` / `findByEmbedding` threw `42P18: could not determine data type of parameter $2` when run against an unfiltered (empty `repoPath`) repository: the unfiltered SQL referenced `$1,$3,$4` while passing three params, leaving `$2` declared-but-unused. Renumbered the unfiltered branches to use `$2`/`$3` for threshold/limit
+
 ## [0.6.0] - 2026-08-01
 
 ### Added (M7)

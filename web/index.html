@@ -13,8 +13,13 @@
     <nav class="header-nav">
       <button class="nav-btn active" data-view="architecture">Architecture</button>
       <button class="nav-btn" data-view="commits">Commits</button>
+      <button class="nav-btn" data-view="analysis">Analysis</button>
+      <button class="nav-btn" data-view="ask">Ask</button>
     </nav>
     <div class="search-bar">
+      <select id="repoFilter" title="Repository">
+        <option value="all">All repos</option>
+      </select>
       <input type="text" id="searchInput" placeholder="Search entities..." />
       <button id="searchBtn">Search</button>
     </div>
@@ -51,6 +56,32 @@
           <button id="commitRefresh" class="icon-btn" title="Refresh">&#x21bb;</button>
         </div>
         <div id="commitListContent" class="scroll-area"></div>
+      </div>
+      <div id="analysisPanel" class="hidden">
+        <div class="panel-header">
+          <h2>Analysis</h2>
+          <span class="panel-note" title="Reports are computed for the repository this server was started with (serve --repo)">&#9432;</span>
+        </div>
+        <div class="analysis-tabs">
+          <button class="analysis-tab active" data-report="churn">Churn</button>
+          <button class="analysis-tab" data-report="risk">Risk</button>
+          <button class="analysis-tab" data-report="drift">Drift</button>
+          <button class="analysis-tab" data-report="dead-code">Dead code</button>
+          <button class="analysis-tab" data-report="ownership">Owners</button>
+          <button class="analysis-tab" data-report="boundaries">Bounds</button>
+        </div>
+        <div id="analysisContent" class="scroll-area"></div>
+      </div>
+      <div id="qaPanel" class="hidden">
+        <div class="panel-header">
+          <h2>Ask</h2>
+        </div>
+        <div class="qa-input-row">
+          <input type="text" id="qaInput" placeholder="Ask about the codebase..." />
+          <button id="qaBtn">Ask</button>
+        </div>
+        <div class="qa-suggestions" id="qaSuggestions"></div>
+        <div id="qaResult" class="scroll-area"></div>
       </div>
     </aside>
 

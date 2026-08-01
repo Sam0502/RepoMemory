@@ -375,6 +375,7 @@ export class GraphClient {
     return {
       id: node.identity.toString(),
       stableId: properties.stableId,
+      repoPath: properties.repoPath,
       name: properties.name,
       type: properties.type as EntityType,
       language: properties.language as Language,

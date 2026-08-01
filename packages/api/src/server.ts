@@ -3,7 +3,7 @@ import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { GraphClient } from '@repo-memory/graph';
 import { EntityRepository, RelationshipRepository, CommitRepository } from '@repo-memory/storage';
-import { detectDeadCode, validateBoundaries, parseDomainConfig } from '@repo-memory/analysis';
+import { detectDeadCode, validateBoundaries, parseDomainConfig, ChangeAnalyzer } from '@repo-memory/analysis';
 import type { DomainConfig } from '@repo-memory/analysis';
 import { Entity, Relationship, RelationshipType } from '@repo-memory/shared';
 import { Pool } from 'pg';
@@ -25,8 +25,53 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   const entityRepo = new EntityRepository(config.pgPool, config.repoPath);
   const relationshipRepo = new RelationshipRepository(config.pgPool, config.repoPath);
   const commitRepo = new CommitRepository(config.pgPool, config.repoPath);
-  const contextBuilder = new ContextPackBuilder(entityRepo, commitRepo, config.graphClient);
-  const qaService = new QaService(entityRepo, relationshipRepo, commitRepo, config.graphClient, config.pgPool);
+  const qaService = new QaService(entityRepo, relationshipRepo, commitRepo, config.graphClient, config.pgPool, false, config.repoPath);
+
+  // Unfiltered repositories for workspace-wide (cross-repo) queries.
+  // Entity stable IDs are namespaced by repo path, so cross-repo lookups are safe.
+  const workspaceEntityRepo = new EntityRepository(config.pgPool, '');
+  const workspaceRelationshipRepo = new RelationshipRepository(config.pgPool, '');
+  const workspaceCommitRepo = new CommitRepository(config.pgPool, '');
+  const workspaceContextBuilder = new ContextPackBuilder(workspaceEntityRepo, workspaceCommitRepo, config.graphClient);
+  const workspaceQa = new QaService(workspaceEntityRepo, workspaceRelationshipRepo, workspaceCommitRepo, config.graphClient, config.pgPool, true, '');
+
+  // Resolve a repo filter value ("all" / empty = every repo) to a scoped repo instance.
+  const repoFor = (repoPath: string | undefined): EntityRepository =>
+    repoPath && repoPath !== 'all' ? new EntityRepository(config.pgPool, repoPath) : workspaceEntityRepo;
+
+  // --- Change analysis (churn / risk / drift) ------------------------------
+  const loadAllEntities = async (repoPath: string): Promise<Entity[]> => {
+    const repo = new EntityRepository(config.pgPool, repoPath);
+    const entities: Entity[] = [];
+    const limit = 5000;
+    let offset = 0;
+    while (true) {
+      const batch = await repo.findAll(limit, offset);
+      entities.push(...batch);
+      if (batch.length < limit) break;
+      offset += limit;
+    }
+    return entities;
+  };
+
+  const loadAllRelationships = async (repoPath: string): Promise<Relationship[]> => {
+    const repo = new RelationshipRepository(config.pgPool, repoPath);
+    const rels: Relationship[] = [];
+    for (const type of [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS, RelationshipType.HANDLES]) {
+      rels.push(...(await repo.findByType(type)));
+    }
+    return rels;
+  };
+
+  const changeAnalyzerFor = (repoPath: string): ChangeAnalyzer =>
+    new ChangeAnalyzer({
+      fileChurnRows: (p, days) => new CommitRepository(config.pgPool, p).getFileChurn(p, 100000, days),
+      entities: loadAllEntities,
+      relationships: loadAllRelationships,
+      lastCommitDate: (p) => new CommitRepository(config.pgPool, p).getLastCommitDate(p),
+    });
+
+  const changeAnalyzer = changeAnalyzerFor(config.repoPath);
 
   // CORS for frontend
   app.use('*', async (c, next) => {
@@ -114,13 +159,13 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     const stableId = c.req.param('stableId');
     const depth = parseInt(c.req.query('depth') || '1');
 
-    const entity = await entityRepo.findByStableId(stableId);
+    const entity = await workspaceEntityRepo.findByStableId(stableId);
     if (!entity) {
       return c.json({ error: 'Entity not found' }, 404);
     }
 
     // Get all entities in the same file (file-level dependencies)
-    const sameFileEntities = await entityRepo.findByFilePath(entity.filePath);
+    const sameFileEntities = await workspaceEntityRepo.findByFilePath(entity.filePath);
     const dependencies = sameFileEntities
       .filter(e => e.stableId !== stableId)
       .slice(0, 20);
@@ -134,7 +179,7 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     for (const rel of importRels) {
       // Try to find entities with matching names from import
       const importName = rel.targetId.split('/').pop() || rel.targetId;
-      const matchingEntities = await entityRepo.search(importName);
+      const matchingEntities = await workspaceEntityRepo.search(importName);
       dependents.push(...matchingEntities.slice(0, 5));
     }
 
@@ -169,51 +214,63 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   app.get('/api/entities/similar/:stableId', async (c) => {
     const stableId = c.req.param('stableId');
     const limit = parseInt(c.req.query('limit') || '10');
-    const entity = await entityRepo.findByStableId(stableId);
+    const entity = await workspaceEntityRepo.findByStableId(stableId);
     if (!entity) {
       return c.json({ error: 'Entity not found' }, 404);
     }
-    const similar = await entityRepo.findSimilar(stableId, limit);
+    const similar = await workspaceEntityRepo.findSimilar(stableId, limit);
     return c.json({ entity, similar });
   });
 
   // Commit endpoints
   app.get('/api/commits', async (c) => {
     const limit = parseInt(c.req.query('limit') || '20');
-    const commits = await commitRepo.findRecent(limit);
+    const repoPath = c.req.query('repoPath');
+    const commits = repoPath && repoPath !== 'all'
+      ? await new CommitRepository(config.pgPool, repoPath).findRecent(limit)
+      : await workspaceCommitRepo.findRecent(limit);
     return c.json({ commits });
   });
 
   app.get('/api/commits/:hash', async (c) => {
     const hash = c.req.param('hash');
-    const commit = await commitRepo.findByHash(hash);
+    const commit = await workspaceCommitRepo.findByHash(hash);
     if (!commit) {
       return c.json({ error: 'Commit not found' }, 404);
     }
-    const fileChanges = await commitRepo.getFileChanges(hash);
+    const fileChanges = await workspaceCommitRepo.getFileChanges(hash);
     return c.json({ commit, fileChanges });
   });
 
   // Architecture graph - file-level view
   app.get('/api/graph/architecture', async (c) => {
+    const repoFilter = c.req.query('repoPath') || config.repoPath;
+    const isAll = repoFilter === 'all' || repoFilter === '';
+
     // Get all unique files with entity counts
-    const filesQuery = `
-      SELECT file_path, COUNT(*) as entity_count,
-             ARRAY_AGG(type) as entity_types
-      FROM entities 
-      WHERE repo_path = $1
-      GROUP BY file_path 
-      ORDER BY file_path
-    `;
-    const filesResult = await config.pgPool.query(filesQuery, [config.repoPath]);
-    
+    const filesQuery = isAll
+      ? `SELECT file_path, COUNT(*) as entity_count,
+                ARRAY_AGG(type) as entity_types
+         FROM entities 
+         GROUP BY file_path 
+         ORDER BY file_path`
+      : `SELECT file_path, COUNT(*) as entity_count,
+                ARRAY_AGG(type) as entity_types
+         FROM entities 
+         WHERE repo_path = $1
+         GROUP BY file_path 
+         ORDER BY file_path`;
+    const filesResult = await config.pgPool.query(filesQuery, isAll ? [] : [repoFilter]);
+
     // Get import relationships
-    const relsQuery = `
-      SELECT DISTINCT source_id as source, target_id as target, type
-      FROM relationships 
-      WHERE type = 'IMPORTS' AND repo_path = $1
-    `;
-    const relsResult = await config.pgPool.query(relsQuery, [config.repoPath]);
+    const relsQuery = isAll
+      ? `SELECT DISTINCT source_id as source, target_id as target, type
+         FROM relationships 
+         WHERE type = 'IMPORTS'`
+      : `SELECT DISTINCT source_id as source, target_id as target, type
+         FROM relationships 
+         WHERE type = 'IMPORTS' AND repo_path = $1`;
+    const relsResult = await config.pgPool.query(relsQuery, isAll ? [] : [repoFilter]);
     
     // Build file nodes
     const files = filesResult.rows.map(row => ({
@@ -312,7 +369,7 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   app.get('/api/context-pack/:stableId', async (c) => {
     const stableId = c.req.param('stableId');
     const tokenBudget = parseInt(c.req.query('tokenBudget') || '4000');
-    const pack = await contextBuilder.build(stableId, tokenBudget);
+    const pack = await workspaceContextBuilder.build(stableId, tokenBudget);
     if (!pack) {
       return c.json({ error: 'Entity not found' }, 404);
     }
@@ -418,6 +475,34 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     return c.json(report);
   });
 
+  // Change analysis: churn / risk / drift
+  app.get('/api/analysis/churn', async (c) => {
+    const limit = parseInt(c.req.query('limit') || '50');
+    const days = c.req.query('days') ? parseInt(c.req.query('days')!) : undefined;
+    const churn = await changeAnalyzer.computeFileChurn(config.repoPath, limit, days);
+    return c.json({ churn });
+  });
+
+  app.get('/api/analysis/risk', async (c) => {
+    const risk = await changeAnalyzer.computeFileRisk(config.repoPath);
+    return c.json({ risk });
+  });
+
+  app.get('/api/analysis/risk/:stableId', async (c) => {
+    const stableId = c.req.param('stableId');
+    const entity = await workspaceEntityRepo.findByStableId(stableId);
+    if (!entity) {
+      return c.json({ error: 'Entity not found' }, 404);
+    }
+    const info = await changeAnalyzerFor(entity.repoPath || config.repoPath).computeEntityChange(entity.repoPath || config.repoPath, stableId);
+    return c.json({ entity: info });
+  });
+
+  app.get('/api/analysis/drift', async (c) => {
+    const report = await changeAnalyzer.detectDrift(config.repoPath);
+    return c.json(report);
+  });
+
   // Question-answering for agents: classified intents over the stored graph
   app.post('/api/qa/ask', async (c) => {
     const body: { question?: string } = await c.req.json().catch(() => ({}));
@@ -426,6 +511,81 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
       return c.json({ error: 'question is required' }, 400);
     }
     const answer = await qaService.ask(question);
+    return c.json(answer);
+  });
+
+  // --- Workspace (cross-repo) endpoints -------------------------------------
+
+  app.get('/api/workspace/repos', async (c) => {
+    const result = await config.pgPool.query(
+      `SELECT e.repo_path AS repo_path,
+              COUNT(e.id)::int AS entity_count,
+              (SELECT COUNT(*)::int FROM commits c WHERE c.repo_path = e.repo_path) AS commit_count
+       FROM entities e
+       WHERE e.repo_path <> ''
+       GROUP BY e.repo_path
+       ORDER BY e.repo_path`
+    );
+    const state = await config.pgPool.query(
+      'SELECT repo_path, last_commit_hash, last_scan_at FROM repo_state'
+    );
+    const stateByPath = new Map(state.rows.map(r => [r.repo_path, r]));
+    return c.json({
+      repos: result.rows.map(row => ({
+        repoPath: row.repo_path,
+        entityCount: parseInt(row.entity_count),
+        commitCount: parseInt(row.commit_count),
+        lastCommitHash: stateByPath.get(row.repo_path)?.last_commit_hash || null,
+        lastScanAt: stateByPath.get(row.repo_path)?.last_scan_at || null,
+      })),
+    });
+  });
+
+  app.get('/api/workspace/entities', async (c) => {
+    const limit = parseInt(c.req.query('limit') || '100');
+    const repo = repoFor(c.req.query('repoPath'));
+    const entities = await repo.findAll(limit, 0);
+    const total = await repo.count();
+    return c.json({ entities, total, limit });
+  });
+
+  app.get('/api/workspace/entities/search/:query', async (c) => {
+    const query = c.req.param('query');
+    const repo = repoFor(c.req.query('repoPath'));
+    const entities = await repo.search(query);
+    return c.json({ entities });
+  });
+
+  app.get('/api/workspace/entities/type/:type', async (c) => {
+    const type = c.req.param('type');
+    const repo = repoFor(c.req.query('repoPath'));
+    const entities = await repo.findByType(type as any);
+    return c.json({ entities });
+  });
+
+  app.get('/api/workspace/entities/:stableId', async (c) => {
+    const stableId = c.req.param('stableId');
+    const entity = await workspaceEntityRepo.findByStableId(stableId);
+    if (!entity) return c.json({ error: 'Entity not found' }, 404);
+    return c.json({ entity });
+  });
+
+  app.post('/api/workspace/qa/ask', async (c) => {
+    const body: { question?: string; repoPath?: string } = await c.req.json().catch(() => ({}));
+    const question = (body.question || '').trim();
+    if (!question) {
+      return c.json({ error: 'question is required' }, 400);
+    }
+    // Optional repoPath scopes the question to a single repository; "all"/empty uses the cross-repo service.
+    const qa = body.repoPath && body.repoPath !== 'all'
+      ? new QaService(
+          new EntityRepository(config.pgPool, body.repoPath),
+          new RelationshipRepository(config.pgPool, body.repoPath),
+          new CommitRepository(config.pgPool, body.repoPath),
+          config.graphClient, config.pgPool, false, body.repoPath
+        )
+      : workspaceQa;
+    const answer = await qa.ask(question);
     return c.json(answer);
   });
 

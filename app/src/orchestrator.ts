@@ -6,7 +6,7 @@ import {
   TreeSitterParser, getLanguageFromFilePath, shouldParseFile, isConfigFilePath,
   configureEmbeddings, generateEntityEmbedding, getProviderName,
   SymbolIndex, RelationshipResolver, createFileEntity, detectDeadCode,
-  applyDomainMetadata, parseDomainConfig
+  applyDomainMetadata, parseDomainConfig, ChangeAnalyzer
 } from '@repo-memory/analysis';
 import type { EmbeddingConfig, DeadCodeReport, DomainConfig } from '@repo-memory/analysis';
 import { Language, RelationshipType } from '@repo-memory/shared';
@@ -37,6 +37,7 @@ export class Orchestrator {
   private config: OrchestratorConfig;
   private parserCache: Map<Language, TreeSitterParser> = new Map();
   private domainConfig: DomainConfig | null = null;
+  private changeAnalyzer: ChangeAnalyzer | null = null;
 
   constructor(config: OrchestratorConfig) {
     this.config = config;
@@ -657,6 +658,52 @@ export class Orchestrator {
     }
 
     return result.sort((a, b) => a.filePath.localeCompare(b.filePath));
+  }
+
+  private getChangeAnalyzer(): ChangeAnalyzer {
+    if (!this.changeAnalyzer) {
+      this.changeAnalyzer = new ChangeAnalyzer({
+        fileChurnRows: (repoPath, days) => this.commitRepo.getFileChurn(repoPath, 100000, days),
+        entities: async () => {
+          const all: Entity[] = [];
+          const limit = 5000;
+          let offset = 0;
+          while (true) {
+            const batch = await this.entityRepo.findAll(limit, offset);
+            all.push(...batch);
+            if (batch.length < limit) break;
+            offset += limit;
+          }
+          return all;
+        },
+        relationships: async () => {
+          const all: Relationship[] = [];
+          for (const type of [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS, RelationshipType.HANDLES]) {
+            all.push(...(await this.relationshipRepo.findByType(type)));
+          }
+          return all;
+        },
+        lastCommitDate: (repoPath) => this.commitRepo.getLastCommitDate(repoPath),
+      });
+    }
+    return this.changeAnalyzer;
+  }
+
+  async getChurn(limit: number = 50, days?: number) {
+    return this.getChangeAnalyzer().computeFileChurn(this.config.repoPath, limit, days);
+  }
+
+  async getFileRisk(limit: number = 100) {
+    const all = await this.getChangeAnalyzer().computeFileRisk(this.config.repoPath);
+    return all.slice(0, limit);
+  }
+
+  async getRisk(stableId: string) {
+    return this.getChangeAnalyzer().computeEntityChange(this.config.repoPath, stableId);
+  }
+
+  async getDrift() {
+    return this.getChangeAnalyzer().detectDrift(this.config.repoPath);
   }
 
   async close(): Promise<void> {

@@ -367,10 +367,10 @@ Use a three-store split:
 - Strengthen ownership and domain inference
 - Add architecture boundary validation
 
-### Phase 4 (Non-Multi-Language) ✅ M1-M7 COMPLETE
+### Phase 4 (Non-Multi-Language) ✅ M1-M9 COMPLETE
 
 **Started:** 2026-08-01
-**Completed:** 2026-08-01 (M1-M7)
+**Completed:** 2026-08-01 (M1-M9)
 
 #### 4.1 Cross-File Symbol Resolution ✅
 - Added `SymbolIndex` + `RelationshipResolver` in `packages/analysis/src/resolver/`
@@ -424,6 +424,42 @@ Use a three-store split:
 - **Path traversal includes CONTAINS/EXPORTS** so file↔symbol connectivity is reachable; dependency/dependent/impact queries keep the real dependency edge set (no containment noise)
 - **Impact API fix**: `/api/analysis/impact/:stableId` now uses `findTransitiveDependents` (was `findTransitiveDependencies` — wrong direction)
 - Verified end-to-end: `how does src\routes.ts relate to src\api\users.ts` → `IMPORTS getUser <-- IMPORTS src\api\users.ts`; `how is POST /users/:id related to createUser` → `HANDLES`; compound dead-code + ownership answers
+
+#### 4.8 Workspace-Wide Workflows (cross-repo queries) ✅ COMPLETE
+The engine already tags every entity / relationship / commit with `repo_path` and namespaces stable IDs per repo, but the API server is bound to a single `--repo`. M8 adds a workspace lens that reads across all scanned repositories without changing the per-repo serving model.
+
+- **Status:** Completed 2026-08-01. Verified against two scanned repos: `workspace/repos` lists both, cross-repo search returns results with distinct `repo_path`, and workspace QA answers are repo-annotated (ambiguity aggregates per repo).
+- **Unfiltered repositories**: `EntityRepository`, `RelationshipRepository`, and `CommitRepository` already treat an empty `repoPath` as "no filter" (`repoPath ? [..., repoPath] : [...]`); GraphClient must be confirmed/patched to do the same so workspace queries work against one unfiltered repo set
+- **Workspace API** (new endpoints in `packages/api/src/server.ts`, always available alongside the scoped ones):
+  - `GET /api/workspace/repos` — distinct repos with per-repo entity count, commit count, last-scan commit / timestamp (`SELECT repo_path, COUNT(*) ... GROUP BY repo_path`)
+  - `GET /api/workspace/entities/search/:query` — cross-repo search; each result carries its `repo_path`
+  - `GET /api/workspace/entities/type/:type` — cross-repo type listing grouped by repo
+  - `POST /api/workspace/qa/ask` — cross-repo QA where every answer/entity names its repo, and ambiguous matches aggregate per repo
+- **QaService workspace mode** (`packages/api/src/qa.ts`): construct QaService with `repoPath: ''`; `resolveEntity` matches across repos and returns repo-qualified candidates; dependents/impact answers annotate results with `repo_path`
+- **CLI**: `repo-memory workspace repos` and a `--all-repos` flag on `query search` / `query dead-code` (app/src/cli.ts) for cross-repo reporting
+- **Frontend (optional)**: repo dropdown in the entity/QA panels; no frontend work required for the API to be useful
+- **Verification**: scan a second test repo, then confirm `workspace/repos` lists both, cross-repo search returns results with distinct `repo_path`, and QA answers are repo-annotated; `pnpm -r run typecheck`
+- **Implemented**: `repoPath` mapped through entity/commit repos + graph client; workspace endpoints (`/api/workspace/repos|entities/search|entities/type|qa/ask`); `QaService` workspace mode with per-repo ambiguity aggregation; CLI `workspace repos` + `--all-repos` on `query search`/`query dead-code`; frontend repo dropdown (`#repoFilter`) with `repo-tag` styling and `currentRepo` filtering in `web/app.js`
+
+#### 4.9 Entity-Change Correlation (drift, churn, risk scoring) ✅ COMPLETE
+We ingest commit history + file changes + per-entity `firstSeenCommit`/`lastSeenCommit`, but nothing yet turns that history into change metrics. M9 adds a change-analysis layer over the existing data.
+
+- **Status:** Completed 2026-08-01. Verified: `query churn 10` → real per-file scores (e.g. `session-ses_0592.md` +1665/-1665 → 4995), `query risk <stableId>` → entity change info + owning-file churn, `GET /api/analysis/drift` → boundary/unstable-surface signals with evidence.
+
+- **ChangeAnalyzer** (`packages/analysis/src/change.ts`):
+  - `computeFileChurn(repoPath, limit, days?)` — per file: commit count, total additions/deletions, churn score (`adds + k*deletes`), recent-window churn (last N days)
+  - `computeFileRisk(repoPath)` — score 0-100 combining churn, inbound fan-out (dependents), boundary violations, dead-code flags, and staleness (age since last change); returns a breakdown so the score is explainable
+  - `computeEntityChange(stableId)` — change count, first/last seen, staleness, churn of the owning file
+  - `detectDrift(repoPath)` — signals of architectural drift: high-churn files whose tests didn't change in the same window, boundary violations introduced by recent changes, and unstable public surfaces (exported symbols churned across many commits)
+- **Storage additions** (`packages/storage/src/commit-repository.ts`): aggregate queries over `file_changes`/`commits` — `SELECT file_path, COUNT(*) AS commits, SUM(additions) AS added, SUM(deletions) AS deleted FROM file_changes GROUP BY file_path` with optional `repo_path` + date-window filters
+- **API** (`packages/api/src/server.ts`):
+  - `GET /api/analysis/churn?limit=` — top churned files with scores
+  - `GET /api/analysis/risk/:stableId` and `GET /api/analysis/risk` — entity-level and repo-level risk with breakdown
+  - `GET /api/analysis/drift` — drift signals with evidence (which commits introduced them)
+- **QA intents** (`packages/api/src/qa.ts`): `churn` ("which files change the most?"), `drift` ("is the architecture drifting?"); extend `changelog` to accept a symbol and list commits touching its owning file
+- **CLI**: `repo-memory query churn --repo <path>`, `repo-memory query risk <stableId>`
+- **Verification**: run churn/risk/drift against the test repo, sanity-check scores against known commits; `pnpm -r run typecheck`
+- **Implemented**: `ChangeAnalyzer` + `ChangeDataProvider` in `packages/analysis/src/change.ts` (provider interface keeps the analysis package free of pg/storage deps); storage aggregate queries `getFileChurn`/`getLastCommitDate`; API `GET /api/analysis/churn|risk|risk/:stableId|drift`; QA `churn`/`drift` intents in `answerRepoLevel`; CLI `query churn [limit]` / `query risk <stableId>` via orchestrator `getChurn`/`getFileRisk`/`getRisk`/`getDrift`
 
 ### Phase 4: AI and Developer Workflows
 - Ship traversal, impact analysis, and dead code detection

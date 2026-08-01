@@ -45,10 +45,13 @@ let simulation = null;
 let selectedEntityId = null;
 let currentView = 'architecture';
 let selectedCommitHash = null;
+let currentRepo = 'all';
+let activeAnalysisReport = 'churn';
 
 // DOM refs
 const searchInput = document.getElementById('searchInput');
 const searchBtn = document.getElementById('searchBtn');
+const repoFilter = document.getElementById('repoFilter');
 const entityListContent = document.getElementById('entityListContent');
 const entityCount = document.getElementById('entityCount');
 const statsEl = document.getElementById('stats');
@@ -65,6 +68,13 @@ const commitListContent = document.getElementById('commitListContent');
 const commitRefresh = document.getElementById('commitRefresh');
 const graphLoading = document.getElementById('graphLoading');
 const tooltipEl = document.getElementById('tooltip');
+const analysisPanel = document.getElementById('analysisPanel');
+const analysisContent = document.getElementById('analysisContent');
+const qaPanel = document.getElementById('qaPanel');
+const qaInput = document.getElementById('qaInput');
+const qaBtn = document.getElementById('qaBtn');
+const qaResult = document.getElementById('qaResult');
+const qaSuggestions = document.getElementById('qaSuggestions');
 
 // --- API ---
 async function api(path) {
@@ -118,21 +128,65 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
     if (view === 'architecture') {
       entityPanel.classList.remove('hidden');
       commitPanel.classList.add('hidden');
+      analysisPanel.classList.add('hidden');
+      qaPanel.classList.add('hidden');
       currentView = 'architecture';
       loadArchitectureGraph();
     } else if (view === 'commits') {
       entityPanel.classList.add('hidden');
       commitPanel.classList.remove('hidden');
+      analysisPanel.classList.add('hidden');
+      qaPanel.classList.add('hidden');
       currentView = 'commits';
       loadCommits();
+    } else if (view === 'analysis') {
+      entityPanel.classList.add('hidden');
+      commitPanel.classList.add('hidden');
+      analysisPanel.classList.remove('hidden');
+      qaPanel.classList.add('hidden');
+      currentView = 'analysis';
+      loadAnalysis(activeAnalysisReport);
+    } else if (view === 'ask') {
+      entityPanel.classList.add('hidden');
+      commitPanel.classList.add('hidden');
+      analysisPanel.classList.add('hidden');
+      qaPanel.classList.remove('hidden');
+      currentView = 'ask';
     }
   });
 });
 
 // --- Entities ---
+async function loadRepos() {
+  try {
+    const data = await api('/api/workspace/repos');
+    const repos = data.repos || [];
+    const current = repoFilter.value;
+    repoFilter.innerHTML = '<option value="all">All repos</option>' +
+      repos.map(r => `<option value="${escHtml(r.repoPath)}">${escHtml(r.repoPath)}</option>`).join('');
+    repoFilter.value = current;
+  } catch {
+    repoFilter.innerHTML = '<option value="all">All repos</option>';
+  }
+}
+
+repoFilter.addEventListener('change', () => {
+  currentRepo = repoFilter.value;
+  selectedCommitHash = null;
+  loadEntities();
+  if (currentView === 'architecture') {
+    loadArchitectureGraph();
+  } else if (currentView === 'commits') {
+    loadCommits();
+  } else if (currentView === 'analysis') {
+    loadAnalysis(activeAnalysisReport);
+  }
+});
+
 async function loadEntities() {
   try {
-    const data = await api('/api/entities?limit=1000');
+    const repoParam = currentRepo !== 'all' ? `&repoPath=${encodeURIComponent(currentRepo)}` : '';
+    const data = await api(`/api/workspace/entities?limit=1000${repoParam}`);
     allEntities = data.entities || [];
     entityCount.textContent = `(${allEntities.length})`;
     statsEl.textContent = `${allEntities.length} entities`;
@@ -160,7 +214,7 @@ function renderEntityList(entities) {
         <span class="type-badge type-${e.type}">${e.type}</span>
         ${escHtml(e.name)}
       </div>
-      <div class="meta">${escHtml(shortPath(e.filePath))}</div>
+      <div class="meta">${e.repoPath ? `<span class="repo-tag">${escHtml(e.repoPath)}</span>` : ''}${escHtml(shortPath(e.filePath))}</div>
     </div>
   `).join('');
 
@@ -177,7 +231,8 @@ searchBtn.addEventListener('click', async () => {
   const q = searchInput.value.trim();
   if (!q) { renderEntityList(getFilteredEntities()); return; }
   try {
-    const data = await api(`/api/entities/search/${encodeURIComponent(q)}`);
+    const repoParam = currentRepo !== 'all' ? `?repoPath=${encodeURIComponent(currentRepo)}` : '';
+    const data = await api(`/api/workspace/entities/search/${encodeURIComponent(q)}${repoParam}`);
     renderEntityList(data.entities || []);
   } catch { renderEntityList([]); }
 });
@@ -186,12 +241,26 @@ searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') searchBtn.
 
 // --- Entity selection & detail ---
 async function selectEntity(stableId) {
-  selectedEntityId = stableId;
-  const entity = allEntities.find(e => e.stableId === stableId);
+  let entity = allEntities.find(e => e.stableId === stableId);
+  if (!entity) {
+    try {
+      const data = await api(`/api/workspace/entities/${stableId}`);
+      entity = data.entity;
+    } catch { /* not found */ }
+  }
   if (!entity) return;
+  await openEntityDetail(entity);
+}
+
+async function openEntityDetail(entity) {
+  selectedEntityId = entity.stableId;
+  if (!allEntities.find(e => e.stableId === entity.stableId)) {
+    allEntities.unshift(entity);
+    renderEntityList(getFilteredEntities());
+  }
 
   entityListContent.querySelectorAll('.entity-item').forEach(el => {
-    el.classList.toggle('selected', el.dataset.stableId === stableId);
+    el.classList.toggle('selected', el.dataset.stableId === entity.stableId);
   });
 
   detailPanel.classList.remove('hidden');
@@ -200,10 +269,11 @@ async function selectEntity(stableId) {
   const depth = parseInt(depthSelect.value);
   showGraphLoading();
   await Promise.all([
-    loadGraph(stableId, depth),
-    loadImpactAnalysis(stableId),
-    loadSimilarEntities(stableId),
-    loadContextPack(stableId),
+    loadGraph(entity.stableId, depth),
+    loadImpactAnalysis(entity.stableId),
+    loadSimilarEntities(entity.stableId),
+    loadContextPack(entity.stableId),
+    loadChangeAnalysis(entity.stableId),
   ]);
   hideGraphLoading();
 }
@@ -247,6 +317,12 @@ function renderDetail(entity) {
   // Context pack (placeholder)
   html += `<div class="detail-section" id="contextPackSection">
     <h3>Context Pack</h3>
+    <div class="loading-text">Loading...</div>
+  </div>`;
+
+  // Change analysis (placeholder)
+  html += `<div class="detail-section" id="changeSection">
+    <h3>Change Analysis</h3>
     <div class="loading-text">Loading...</div>
   </div>`;
 
@@ -371,7 +447,8 @@ function renderGraph() {
 async function loadArchitectureGraph() {
   showGraphLoading();
   try {
-    const data = await api('/api/graph/architecture');
+    const repoParam = currentRepo !== 'all' ? `?repoPath=${encodeURIComponent(currentRepo)}` : '';
+    const data = await api(`/api/graph/architecture${repoParam}`);
     currentView = 'architecture';
     selectedEntityId = null;
     detailPanel.classList.add('hidden');
@@ -478,7 +555,8 @@ depthSelect.addEventListener('change', () => {
 async function loadCommits() {
   commitListContent.innerHTML = '<div class="loading-text">Loading commits...</div>';
   try {
-    const data = await api('/api/commits?limit=50');
+    const repoParam = currentRepo !== 'all' ? `&repoPath=${encodeURIComponent(currentRepo)}` : '';
+    const data = await api(`/api/commits?limit=50${repoParam}`);
     renderCommitList(data.commits || []);
   } catch (err) {
     commitListContent.innerHTML = `<div class="empty-state">No commits found<br><small>${escHtml(err.message)}</small></div>`;
@@ -495,6 +573,7 @@ function renderCommitList(commits) {
       <div class="hash">${c.hash.slice(0, 8)}</div>
       <div class="msg">${escHtml(c.message)}</div>
       <div class="meta">
+        ${c.repoPath && currentRepo === 'all' ? `<span class="repo-tag">${escHtml(c.repoPath)}</span>` : ''}
         <span>${escHtml(c.author)}</span>
         <span>${timeAgo(c.date)}</span>
       </div>
@@ -652,7 +731,247 @@ async function loadContextPack(stableId) {
   }
 }
 
+// --- Change Analysis (entity-level) ---
+async function loadChangeAnalysis(stableId) {
+  const section = document.getElementById('changeSection');
+  if (!section) return;
+  try {
+    const data = await api(`/api/analysis/risk/${stableId}`);
+    const info = data.entity;
+    if (!info) throw new Error('empty');
+
+    let html = `<h3>Change Analysis</h3>`;
+    html += `<div class="detail-row"><div class="label">Commits Touching It</div><div class="value">${info.commitCount}</div></div>`;
+    html += `<div class="detail-row"><div class="label">First Seen</div><div class="value mono">${info.firstSeenCommit ? info.firstSeenCommit.slice(0, 8) : 'n/a'}</div></div>`;
+    html += `<div class="detail-row"><div class="label">Last Seen</div><div class="value mono">${info.lastSeenCommit ? info.lastSeenCommit.slice(0, 8) : 'n/a'}</div></div>`;
+    if (info.stalenessDays != null) {
+      html += `<div class="detail-row"><div class="label">Staleness</div><div class="value">${info.stalenessDays} day(s) since last change</div></div>`;
+    }
+    if (info.owningFileChurn) {
+      const churn = info.owningFileChurn;
+      const score = churn.churnScore || 0;
+      const riskClass = score < 200 ? 'low' : score < 800 ? 'med' : 'high';
+      html += `<div class="detail-row"><div class="label">Owning File Churn</div>
+        <div class="value">${escHtml(shortPath(churn.filePath))} &mdash; ${churn.commits} commit(s), +${churn.additions}/-${churn.deletions}</div>
+        <div class="churn-bar churn-${riskClass}"><div class="fill" style="width:${Math.min(100, score / 10)}%"></div></div>
+      </div>`;
+    }
+    section.innerHTML = html;
+  } catch {
+    section.innerHTML = '<h3>Change Analysis</h3><div class="empty-state">Unavailable</div>';
+  }
+}
+
+// --- Analysis tab ---
+document.querySelectorAll('.analysis-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.analysis-tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    loadAnalysis(btn.dataset.report);
+  });
+});
+
+async function loadAnalysis(report) {
+  activeAnalysisReport = report;
+  analysisContent.innerHTML = '<div class="loading-text">Loading...</div>';
+  try {
+    if (report === 'churn') {
+      const data = await api('/api/analysis/churn?limit=100');
+      renderChurn(data.churn || []);
+    } else if (report === 'risk') {
+      const data = await api('/api/analysis/risk');
+      renderRisk(data.risk || []);
+    } else if (report === 'drift') {
+      const data = await api('/api/analysis/drift');
+      renderDrift(data.signals || []);
+    } else if (report === 'dead-code') {
+      const data = await api('/api/analysis/dead-code?includeExported=true');
+      renderDeadCode(data);
+    } else if (report === 'ownership') {
+      const data = await api('/api/analysis/ownership?limit=500');
+      renderOwnership(data.ownership || []);
+    } else if (report === 'boundaries') {
+      const data = await api('/api/analysis/boundaries');
+      renderBoundaries(data);
+    }
+  } catch (err) {
+    analysisContent.innerHTML = `<div class="empty-state">Failed to load<br><small>${escHtml(err.message)}</small></div>`;
+  }
+}
+
+function renderChurn(churn) {
+  if (!churn.length) {
+    analysisContent.innerHTML = '<div class="empty-state">No churn data</div>';
+    return;
+  }
+  analysisContent.innerHTML = churn.map(c => `
+    <div class="report-item">
+      <div class="report-main">${escHtml(shortPath(c.filePath))}</div>
+      <div class="report-sub">${c.commits} commit(s) &middot; <span class="add">+${c.additions}</span>/<span class="del">-${c.deletions}</span> &middot; ${c.daysSinceLastChange}d ago</div>
+      <div class="report-score score-${c.churnScore < 200 ? 'low' : c.churnScore < 800 ? 'med' : 'high'}">churn ${c.churnScore}</div>
+    </div>
+  `).join('');
+}
+
+function renderRisk(risk) {
+  if (!risk.length) {
+    analysisContent.innerHTML = '<div class="empty-state">No risk data</div>';
+    return;
+  }
+  analysisContent.innerHTML = risk.slice(0, 50).map(r => {
+    const cls = r.score < 30 ? 'low' : r.score < 60 ? 'med' : 'high';
+    const b = r.breakdown || {};
+    return `
+      <div class="report-item">
+        <div class="report-main">${escHtml(shortPath(r.filePath))}</div>
+        <div class="risk-bar risk-${cls}"><div class="fill" style="width:${r.score}%"></div></div>
+        <div class="report-sub">
+          ${['churn', 'fanout', 'boundary', 'deadCode', 'staleness'].map(k => `<span class="risk-chip chip-${(b[k] || 0) < 30 ? 'low' : (b[k] || 0) < 60 ? 'med' : 'high'}">${k} ${b[k] || 0}</span>`).join('')}
+        </div>
+        ${r.reasons && r.reasons.length ? `<div class="report-sub reasons">${r.reasons.map(x => escHtml(x)).join(' &middot; ')}</div>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+function renderDrift(signals) {
+  if (!signals.length) {
+    analysisContent.innerHTML = '<div class="empty-state">No drift signals detected</div>';
+    return;
+  }
+  analysisContent.innerHTML = signals.map(s => `
+    <div class="report-item">
+      <div class="report-main">
+        <span class="severity sev-${s.severity}">${s.severity}</span>
+        ${escHtml(s.type.replace(/-/g, ' '))}
+      </div>
+      <div class="report-sub">${escHtml(s.description)}</div>
+      ${s.evidence && s.evidence.length ? `
+        <div class="report-sub evidence">${s.evidence.slice(0, 5).map(e => `<div>&bull; ${escHtml(e)}</div>`).join('')}</div>
+      ` : ''}
+    </div>
+  `).join('');
+}
+
+function renderDeadCode(data) {
+  const dead = data.deadCode || [];
+  const exported = data.exportedButUnused || [];
+  const total = data.totalEntities || 0;
+  let html = `<div class="report-summary">${dead.length} dead of ${total} entities${exported.length ? ` &middot; ${exported.length} exported but unused` : ''}</div>`;
+  const items = [...dead, ...exported];
+  if (!items.length) {
+    analysisContent.innerHTML = html + '<div class="empty-state">No dead code</div>';
+    return;
+  }
+  html += items.slice(0, 100).map(d => `
+    <div class="report-item">
+      <div class="report-main"><span class="type-badge type-${d.entity.type}">${d.entity.type}</span> ${escHtml(d.entity.name)}</div>
+      <div class="report-sub">${d.entity.repoPath ? `<span class="repo-tag">${escHtml(d.entity.repoPath)}</span>` : ''}${escHtml(shortPath(d.entity.filePath))}</div>
+      <div class="report-sub dead-reason">${escHtml(d.reason)}</div>
+    </div>
+  `).join('');
+  analysisContent.innerHTML = html;
+}
+
+function renderOwnership(ownership) {
+  if (!ownership.length) {
+    analysisContent.innerHTML = '<div class="empty-state">No ownership data</div>';
+    return;
+  }
+  analysisContent.innerHTML = ownership.map(o => `
+    <div class="report-item">
+      <div class="report-main">${escHtml(shortPath(o.filePath))}</div>
+      <div class="report-sub"><span class="owner-badge">${escHtml(o.owner || 'unknown')}</span> &middot; ${o.commits} commit(s)</div>
+    </div>
+  `).join('');
+}
+
+function renderBoundaries(data) {
+  const domains = data.domains || [];
+  const violations = data.violations || [];
+  const edges = data.crossDomainEdges || [];
+  let html = `<div class="report-summary">${domains.length} domain(s) &middot; ${edges.length} cross-domain edge(s) &middot; ${violations.length} violation(s)${data.strict ? ' (strict)' : ''}</div>`;
+  if (domains.length) {
+    html += '<div class="domain-grid">' + domains.map(d =>
+      `<div class="domain-chip"><strong>${escHtml(d.name)}</strong> <span>${d.fileCount}f / ${d.entityCount}e</span></div>`
+    ).join('') + '</div>';
+  }
+  if (violations.length) {
+    html += violations.slice(0, 50).map(v => `
+      <div class="report-item">
+        <div class="report-main">${escHtml(shortPath(v.source.filePath))} <span class="rel-type">${v.relationshipType}</span> ${escHtml(shortPath(v.target.filePath))}</div>
+        <div class="report-sub">${escHtml(v.source.domain)} &rarr; ${escHtml(v.target.domain)}</div>
+      </div>
+    `).join('');
+  } else if (domains.length) {
+    html += '<div class="empty-state">No boundary violations</div>';
+  }
+  analysisContent.innerHTML = html;
+}
+
+// --- QA tab ---
+const QA_SUGGESTIONS = [
+  'who calls createUser',
+  'where is GraphClient defined',
+  'which files change the most',
+  'is the architecture drifting',
+  'what tests cover this',
+  'who owns src',
+  'what changed recently',
+];
+
+qaSuggestions.innerHTML = QA_SUGGESTIONS.map(s => `<button class="qa-chip" data-q="${escHtml(s)}">${escHtml(s)}</button>`).join('');
+qaSuggestions.querySelectorAll('.qa-chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    qaInput.value = chip.dataset.q;
+    askQuestion();
+  });
+});
+
+qaBtn.addEventListener('click', askQuestion);
+qaInput.addEventListener('keydown', e => { if (e.key === 'Enter') askQuestion(); });
+
+async function askQuestion() {
+  const q = qaInput.value.trim();
+  if (!q) return;
+  qaResult.innerHTML = '<div class="loading-text">Asking...</div>';
+  const body = { question: q };
+  if (currentRepo !== 'all') body.repoPath = currentRepo;
+  try {
+    const res = await fetch(`${API_BASE}/api/workspace/qa/ask`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`API ${res.status}`);
+    const ans = await res.json();
+    renderQaAnswer(ans);
+  } catch (err) {
+    qaResult.innerHTML = `<div class="empty-state">Failed: ${escHtml(err.message)}</div>`;
+  }
+}
+
+function renderQaAnswer(ans) {
+  let html = `<div class="qa-intent">intent: ${escHtml(ans.intent || 'info')}${currentRepo !== 'all' ? ` &middot; repo: ${escHtml(currentRepo)}` : ''}</div>`;
+  if (ans.entity) {
+    html += `<div class="qa-entity" data-stable-id="${escHtml(ans.entity.stableId)}">
+      <span class="type-badge type-${ans.entity.type}">${ans.entity.type}</span>
+      <span>${escHtml(ans.entity.name)}</span>
+      ${ans.entity.repoPath ? `<span class="repo-tag">${escHtml(ans.entity.repoPath)}</span>` : ''}
+    </div>`;
+  }
+  html += `<div class="qa-answer">${escHtml(ans.answer)}</div>`;
+  if (ans.evidence && ans.evidence.length) {
+    html += `<div class="qa-evidence">
+      ${ans.evidence.map(e => `<div class="qa-evidence-item"><span class="qa-ev-type">${escHtml(e.type)}</span>${escHtml(e.description)}</div>`).join('')}
+    </div>`;
+  }
+  qaResult.innerHTML = html;
+  const entEl = qaResult.querySelector('.qa-entity');
+  if (entEl) entEl.addEventListener('click', () => selectEntity(entEl.dataset.stableId));
+}
+
 // --- Init ---
-Promise.all([loadEntities(), loadArchitectureGraph()]).catch(err => {
+Promise.all([loadRepos(), loadEntities(), loadArchitectureGraph()]).catch(err => {
   entityListContent.innerHTML = `<div class="empty-state">Failed to connect<br><small>${escHtml(err.message)}</small></div>`;
 });

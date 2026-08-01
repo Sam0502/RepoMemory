@@ -366,7 +366,8 @@ export class Orchestrator {
     for (const result of results) {
       const fileEntity = createFileEntity(result.filePath, this.config.repoPath);
       const resolved = resolver.resolveRelationships(result.relationships);
-      await this.persistFileResult(result, fileEntity, resolved, embeddings);
+      await this.persistFileEntities(result, fileEntity, embeddings);
+      await this.persistFileRelationships(result, fileEntity, resolved);
     }
   }
 
@@ -455,28 +456,31 @@ export class Orchestrator {
     }
 
     const resolver = new RelationshipResolver(index, this.config.repoPath);
+    const resolvedByFile = new Map<string, Relationship[]>();
 
     for (const result of results) {
       const fileEntity = fileEntities.get(result.filePath)!;
       const resolved = resolver.resolveRelationships(result.relationships);
-      await this.persistFileResult(result, fileEntity, resolved, embeddings);
+      resolvedByFile.set(result.filePath, resolved);
+      await this.persistFileEntities(result, fileEntity, embeddings);
+    }
+
+    // Store relationships after all entity nodes exist (graph upserts require both endpoints)
+    for (const result of results) {
+      await this.persistFileRelationships(result, fileEntities.get(result.filePath)!, resolvedByFile.get(result.filePath)!);
     }
   }
 
-  private async persistFileResult(
+  private async persistFileEntities(
     result: ParseResult,
     fileEntity: Entity,
-    resolvedRelationships: Relationship[],
     embeddings: Map<string, number[]>
   ): Promise<void> {
-    // Remove stale relationships for this file (e.g. previously unresolved targets)
-    await this.relationshipRepo.deleteByFilePath(result.filePath);
-
     // Populate domain / architecturalRole metadata
     applyDomainMetadata(result.entities, this.domainConfig || undefined);
 
     const entities = [...result.entities, fileEntity];
-    
+
     // Store entities in both databases
     for (const entity of entities) {
       try {
@@ -490,9 +494,39 @@ export class Orchestrator {
         console.error(`Failed to store entity ${entity.name}:`, error);
       }
     }
-    
+  }
+
+  private async persistFileRelationships(
+    result: ParseResult,
+    fileEntity: Entity,
+    resolvedRelationships: Relationship[]
+  ): Promise<void> {
+    // Remove stale relationships for this file (e.g. previously unresolved targets)
+    await this.relationshipRepo.deleteByFilePath(result.filePath);
+
+    const rels: Relationship[] = resolvedRelationships.map(rel =>
+      // EXPORTS / module-level IMPORTS use the raw file path as sourceId; re-anchor to the file entity
+      rel.sourceId === result.filePath ? { ...rel, sourceId: fileEntity.stableId } : rel
+    );
+
+    // Structural containment: the file contains each top-level entity, so file
+    // nodes connect to their symbols in the graph
+    for (const entity of result.entities) {
+      rels.push({
+        id: `contains:${fileEntity.stableId}:${entity.stableId}`,
+        sourceId: fileEntity.stableId,
+        targetId: entity.stableId,
+        type: RelationshipType.CONTAINS,
+        filePath: result.filePath,
+        line: entity.startLine,
+        confidence: 1.0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+    }
+
     // Store relationships in both databases
-    for (const relationship of resolvedRelationships) {
+    for (const relationship of rels) {
       try {
         await this.relationshipRepo.upsert(relationship);
         await this.graphClient.upsertRelationship(relationship);

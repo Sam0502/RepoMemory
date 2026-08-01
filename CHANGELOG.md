@@ -2,19 +2,18 @@
 
 All notable changes to RepoMemory will be documented in this file.
 
-### Added (M6)
-- **Natural-Language QA**: `QaService` in `packages/api/src/qa.ts` classifies questions into intents (dependencies / dependents / location / ownership / dead code / tests / info) and returns structured answers with evidence. New endpoint `POST /api/qa/ask`
-- **Commit History on Scans**: Full/incremental/working-tree scans now ingest the last 100 commits and annotate each entity with `firstSeenCommit`/`lastSeenCommit`
-- **Real File-Change Counts**: Git ingestion switched from `--name-status` to `--numstat --summary` (with a parser for both line formats), so `file_changes` carry true add/delete counts and added/modified/deleted/renamed statuses
+## [0.6.0] - 2026-08-01
 
-### Changed (M6)
-- `CommitRepository` upsert now `ON CONFLICT (commit_hash, file_path) DO UPDATE` so re-scans refresh stale change counts
-- Graph dependency/dependent/transitive queries now include `HANDLES`, so API routes appear as callers of their handlers
-- Frontend contract fixes: commit list reads `date`, file-change rows read `status`, context pack panel renders the structured `ContextPack` shape
+### Added (M7)
+- **Query Orchestration**: `QaService.ask` now splits compound questions (`and`/`then`/`;`/`.`) and answers each fragment, inheriting the entity from a prior fragment. New intents: `impact` (direct + transitive dependents, affected files, risk score), `path` (shortest path between two entities), `changelog` (recent commits touching a file), `file-deps` (imports + referenced symbols for a file)
+- **Graph Traversal Additions**: `GraphClient.findTransitiveDependents()` and `findShortestPath()` (direction-aware via relationship source identity)
+- **File→Symbol Graph Connectivity**: the orchestrator re-anchors `EXPORTS`/module `IMPORTS` source IDs from the raw file-path string to the File entity's stable ID, and synthesizes `File -[CONTAINS]-> symbol` edges, so file nodes connect to their symbols in Neo4j
+- **Two-Phase Persistence**: full scans store all entity nodes before any relationship, so graph relationship upserts no longer silently drop edges to not-yet-stored targets
+- **Endpoint/File Entity Resolution**: HTTP-verb extraction (`POST /users/:id`) and file-path token extraction are tried before the generic symbol search; second-entity resolution for path questions scans from the end of the question and avoids the first entity's own tokens
 
-### Fixed (M6)
-- `extractReferencesFromNode` emitted self-referencing `REFERENCES` for function/variable names because `childForFieldName` returns a distinct node object (identity comparison never matched). Names are now compared by node position
-- QA ownership answers matched the wrong file; questions naming a file path now resolve the exact file before falling back to generic entity search
+### Changed (M7)
+- `/api/analysis/impact/:stableId` now uses `findTransitiveDependents` (was `findTransitiveDependencies`, wrong direction)
+- Path traversal includes `CONTAINS`/`EXPORTS` edges; dependency/dependent/impact queries keep the real dependency edge set
 
 ## [0.5.0] - 2026-08-01
 
@@ -58,6 +57,20 @@ All notable changes to RepoMemory will be documented in this file.
 - **Python Double-Extraction Fix**: `decorated_definition` no longer re-extracts its wrapped function/class via recursion
 - **Model Entity Detection**: New `EntityType.MODEL`; classes matching `Model`/`Dto`/`Schema`/`Record`/`Entity`/`Document` naming, ORM decorators (`@Entity`, `@Schema`, ...), or ORM base classes (`BaseModel`, `db.Model`, ...) are typed as models
 - **Test File Detection**: `isTestFileByContent` (describe/it/expect/assert patterns) is now wired into `createEntity`; `isTestFile` also matches Python naming (`test_*.py`, `*_test.py`)
+
+### Added (M6)
+- **Natural-Language QA**: `QaService` in `packages/api/src/qa.ts` classifies questions into intents (dependencies / dependents / location / ownership / dead code / tests / info) and returns structured answers with evidence. New endpoint `POST /api/qa/ask`
+- **Commit History on Scans**: Full/incremental/working-tree scans now ingest the last 100 commits and annotate each entity with `firstSeenCommit`/`lastSeenCommit`
+- **Real File-Change Counts**: Git ingestion switched from `--name-status` to `--numstat --summary` (with a parser for both line formats), so `file_changes` carry true add/delete counts and added/modified/deleted/renamed statuses
+
+### Changed (M6)
+- `CommitRepository` upsert now `ON CONFLICT (commit_hash, file_path) DO UPDATE` so re-scans refresh stale change counts
+- Graph dependency/dependent/transitive queries now include `HANDLES`, so API routes appear as callers of their handlers
+- Frontend contract fixes: commit list reads `date`, file-change rows read `status`, context pack panel renders the structured `ContextPack` shape
+
+### Fixed (M6)
+- `extractReferencesFromNode` emitted self-referencing `REFERENCES` for function/variable names because `childForFieldName` returns a distinct node object (identity comparison never matched). Names are now compared by node position
+- QA ownership answers matched the wrong file; questions naming a file path now resolve the exact file before falling back to generic entity search
 
 ## [0.4.0] - 2026-07-31
 

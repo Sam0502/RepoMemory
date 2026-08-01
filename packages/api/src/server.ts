@@ -324,7 +324,7 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     const stableId = c.req.param('stableId');
     
     const directImpact = await graphClient.findDependents(stableId);
-    const indirectImpact = await graphClient.findTransitiveDependencies(stableId, 3);
+    const indirectImpact = await graphClient.findTransitiveDependents(stableId, 3);
     
     const affectedFiles = new Set<string>();
     directImpact.forEach(d => affectedFiles.add(d.entity.filePath));

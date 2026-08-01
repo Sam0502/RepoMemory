@@ -1,6 +1,5 @@
 # Repository Memory Engine Plan
 
-# Phase 2 session: opencode -s ses_051b766b4ffePsBsCVmp6HYZsF
 
 ## Objective
 Build a repository-scale memory engine that continuously scans a source code repository, extracts structural and semantic knowledge, tracks change over time, and exposes that knowledge to developers and AI agents as a persistent, queryable source of truth.
@@ -368,10 +367,10 @@ Use a three-store split:
 - Strengthen ownership and domain inference
 - Add architecture boundary validation
 
-### Phase 4 (Non-Multi-Language) ✅ M1-M6 COMPLETE
+### Phase 4 (Non-Multi-Language) ✅ M1-M7 COMPLETE
 
 **Started:** 2026-08-01
-**Completed:** 2026-08-01 (M1-M6)
+**Completed:** 2026-08-01 (M1-M7)
 
 #### 4.1 Cross-File Symbol Resolution ✅
 - Added `SymbolIndex` + `RelationshipResolver` in `packages/analysis/src/resolver/`
@@ -414,6 +413,17 @@ Use a three-store split:
 - **Graph traversal fixes**: `HANDLES` added to dependency/dependent/transitive queries so routes show as callers of their handlers; self-referencing `REFERENCES` eliminated (function/variable names compared by position, not object identity, since `childForFieldName` returns a distinct node object)
 - **QA ownership fix**: questions naming a file (e.g. `who owns src/unused.ts`) resolve the exact file via path tokens before falling back to the generic entity search
 - Verified end-to-end: `who calls createUser` → "used by: POST /users/:id"; `who calls list_users` → "GET /users"; `who owns src\unused.ts` → "owned by test (1 commits)"; commits/file-changes show real `+11 -0` etc.
+
+#### 4.7 Query Orchestration (compound / multi-hop questions) ✅
+- **Compound questions**: `QaService.ask` splits questions on `and` / `then` / `;` / `.` and answers each fragment, inheriting the entity from the previous fragment when a fragment doesn't name one (`where is X defined and who calls it`)
+- **New intents**: `impact` (direct + transitive dependents, affected files, risk score), `path` (shortest path between two entities), `changelog` (recent commits touching a file), `file-deps` (imports + referenced symbols for a File entity)
+- **GraphClient additions**: `findTransitiveDependents`, `findShortestPath` (shortest-path traversal, direction-aware via relationship source identity)
+- **Entity resolution improvements**: HTTP-verb extraction (`POST /users/:id`), file-path token extraction, second-entity search from the end of the question (skipping generic tokens + the first entity's name tokens), file-different-from-first scan for path questions
+- **File-level graph connectivity**: the orchestrator now re-anchors `EXPORTS`/module `IMPORTS` sourceIds from the raw file-path string to the File entity's stableId, and synthesizes `File -[CONTAINS]-> symbol` edges so file nodes connect to their symbols in Neo4j
+- **Two-phase persistence**: full scans store all entity nodes before any relationship, so graph `upsertRelationship` (which `MATCH`es both endpoints) no longer silently drops edges to not-yet-stored targets
+- **Path traversal includes CONTAINS/EXPORTS** so file↔symbol connectivity is reachable; dependency/dependent/impact queries keep the real dependency edge set (no containment noise)
+- **Impact API fix**: `/api/analysis/impact/:stableId` now uses `findTransitiveDependents` (was `findTransitiveDependencies` — wrong direction)
+- Verified end-to-end: `how does src\routes.ts relate to src\api\users.ts` → `IMPORTS getUser <-- IMPORTS src\api\users.ts`; `how is POST /users/:id related to createUser` → `HANDLES`; compound dead-code + ownership answers
 
 ### Phase 4: AI and Developer Workflows
 - Ship traversal, impact analysis, and dead code detection

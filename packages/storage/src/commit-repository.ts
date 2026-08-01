@@ -84,6 +84,18 @@ export class CommitRepository {
     return result.rows[0]?.hash || null;
   }
 
+  async findCommitsForFile(filePath: string, limit: number = 10): Promise<Commit[]> {
+    const normalized = filePath.replace(/\\/g, '/');
+    const result = await this.pool.query(
+      `SELECT c.* FROM commits c
+       JOIN file_changes f ON f.commit_hash = c.hash
+       WHERE c.repo_path = $1 AND f.file_path = $2
+       ORDER BY c.date DESC LIMIT $3`,
+      [this.repoPath, normalized, limit]
+    );
+    return result.rows.map(this.mapRowToCommit);
+  }
+
   async deleteByHash(hash: string): Promise<void> {
     const query = this.repoPath
       ? 'DELETE FROM commits WHERE hash = $1 AND repo_path = $2'

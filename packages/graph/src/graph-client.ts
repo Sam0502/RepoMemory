@@ -255,6 +255,55 @@ export class GraphClient {
     }
   }
 
+  async findTransitiveDependents(stableId: string, maxDepth: number = 5): Promise<Entity[]> {
+    const session = this.driver.session();
+    try {
+      const result = await session.run(
+        `
+        MATCH path = (source)-[:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES*1..${maxDepth}]->(target {stableId: $stableId})
+        RETURN DISTINCT source as entity
+        `,
+        { stableId }
+      );
+      
+      return result.records.map(record => this.mapRecordToEntity(record.get('entity')));
+    } finally {
+      await session.close();
+    }
+  }
+
+  async findShortestPath(
+    sourceId: string,
+    targetId: string,
+    maxDepth: number = 5
+  ): Promise<{ nodes: Entity[]; relationships: Array<{ type: string; direction: 'out' | 'in' }> } | null> {
+    const session = this.driver.session();
+    try {
+      const result = await session.run(
+        `
+        MATCH p = shortestPath((a {stableId: $sourceId})-[rels:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES|CONTAINS|EXPORTS*1..${maxDepth}]-(b {stableId: $targetId}))
+        RETURN p
+        `,
+        { sourceId, targetId }
+      );
+      if (result.records.length === 0) return null;
+
+      const path = result.records[0].get('p');
+      const nodes = [this.mapRecordToEntity(path.start), ...path.segments.map((s: any) => this.mapRecordToEntity(s.end))];
+      const relationships: Array<{ type: string; direction: 'out' | 'in' }> = path.segments.map((s: any) => {
+        const rel = s.relationship;
+        const nodeId = (n: any) => ((n?.identity !== undefined ? n.identity : n) as any).toString();
+        return {
+          type: rel.type,
+          direction: nodeId(rel.start) === nodeId(s.start) ? 'out' : 'in',
+        };
+      });
+      return { nodes, relationships };
+    } finally {
+      await session.close();
+    }
+  }
+
   async searchEntities(query: string, limit: number = 50): Promise<Entity[]> {
     const session = this.driver.session();
     try {

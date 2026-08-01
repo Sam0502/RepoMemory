@@ -71,7 +71,7 @@ program
   .command('query')
   .description('Query the knowledge graph')
   .option('-r, --repo <path>', 'Repository path', process.cwd())
-  .argument('<type>', 'Query type: entity, dependencies, dependents, search, impact')
+  .argument('<type>', 'Query type: entity, dependencies, dependents, search, impact, dead-code')
   .argument('[args...]', 'Query arguments')
   .action(async (type, args, options) => {
     const orchestrator = new Orchestrator({
@@ -118,6 +118,11 @@ program
           console.log(JSON.stringify({ directImpact, indirectImpact }, null, 2));
           break;
         }
+        case 'dead-code': {
+          const report = await orchestrator.getDeadCodeReport();
+          console.log(JSON.stringify(report, null, 2));
+          break;
+        }
         default:
           console.error(`Unknown query type: ${type}`);
           process.exit(1);
@@ -160,6 +165,7 @@ program
     startServer({
       port,
       host,
+      repoPath,
       graphClient,
       pgPool,
     }, resolve(process.cwd(), 'web'));

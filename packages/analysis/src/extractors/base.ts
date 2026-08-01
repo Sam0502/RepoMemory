@@ -21,7 +21,7 @@ export abstract class BaseExtractor implements LanguageExtractor {
   ): Entity | null {
     if (!name || name.length === 0) return null;
 
-    const stableId = this.generateStableId(ctx.filePath, name);
+    const stableId = this.generateStableId(ctx.filePath, name, ctx.repoPath);
 
     return {
       id: stableId,
@@ -200,13 +200,14 @@ export abstract class BaseExtractor implements LanguageExtractor {
       filePath,
       line: node.startPosition.row + 1,
       confidence: 0.9,
+      metadata: { importPath },
       createdAt: new Date(),
       updatedAt: new Date(),
     };
   }
 
-  protected generateStableId(filePath: string, name: string): string {
-    const input = `${filePath}:${name}`;
+  protected generateStableId(filePath: string, name: string, repoPath: string = ''): string {
+    const input = `${repoPath}:${filePath}:${name}`;
     return createHash('md5').update(input).digest('hex');
   }
 

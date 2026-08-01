@@ -2,13 +2,14 @@ import { Pool } from 'pg';
 import { Commit, FileChange } from '@repo-memory/shared';
 
 export class CommitRepository {
-  constructor(private pool: Pool) {}
+  constructor(private pool: Pool, private repoPath: string = '') {}
 
   async upsert(commit: Omit<Commit, 'id' | 'createdAt' | 'updatedAt'> & { fileChanges?: FileChange[] }): Promise<Commit> {
     const query = `
-      INSERT INTO commits (hash, message, author, date, files_changed)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO commits (hash, repo_path, message, author, date, files_changed)
+      VALUES ($1, $2, $3, $4, $5, $6)
       ON CONFLICT (hash) DO UPDATE SET
+        repo_path = EXCLUDED.repo_path,
         message = EXCLUDED.message,
         author = EXCLUDED.author,
         date = EXCLUDED.date,
@@ -17,6 +18,7 @@ export class CommitRepository {
     `;
     const values = [
       commit.hash,
+      this.repoPath,
       commit.message,
       commit.author,
       commit.date,
@@ -39,16 +41,20 @@ export class CommitRepository {
   }
 
   async findByHash(hash: string): Promise<Commit | null> {
-    const result = await this.pool.query('SELECT * FROM commits WHERE hash = $1', [hash]);
+    const result = this.repoPath
+      ? await this.pool.query('SELECT * FROM commits WHERE hash = $1 AND repo_path = $2', [hash, this.repoPath])
+      : await this.pool.query('SELECT * FROM commits WHERE hash = $1', [hash]);
     if (result.rows.length === 0) return null;
     return this.mapRowToCommit(result.rows[0]);
   }
 
   async findRecent(limit: number = 20): Promise<Commit[]> {
-    const result = await this.pool.query(
-      'SELECT * FROM commits ORDER BY date DESC LIMIT $1',
-      [limit]
-    );
+    const result = this.repoPath
+      ? await this.pool.query(
+          'SELECT * FROM commits WHERE repo_path = $1 ORDER BY date DESC LIMIT $2',
+          [this.repoPath, limit]
+        )
+      : await this.pool.query('SELECT * FROM commits ORDER BY date DESC LIMIT $1', [limit]);
     return result.rows.map(this.mapRowToCommit);
   }
 
@@ -68,13 +74,17 @@ export class CommitRepository {
 
   async getLastCommitForRepo(repoPath: string): Promise<string | null> {
     const result = await this.pool.query(
-      `SELECT hash FROM commits ORDER BY date DESC LIMIT 1`
+      `SELECT hash FROM commits WHERE repo_path = $1 ORDER BY date DESC LIMIT 1`,
+      [repoPath]
     );
     return result.rows[0]?.hash || null;
   }
 
   async deleteByHash(hash: string): Promise<void> {
-    await this.pool.query('DELETE FROM commits WHERE hash = $1', [hash]);
+    const query = this.repoPath
+      ? 'DELETE FROM commits WHERE hash = $1 AND repo_path = $2'
+      : 'DELETE FROM commits WHERE hash = $1';
+    await this.pool.query(query, this.repoPath ? [hash, this.repoPath] : [hash]);
   }
 
   private mapRowToCommit(row: any): Commit {

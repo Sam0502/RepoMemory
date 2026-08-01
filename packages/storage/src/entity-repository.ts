@@ -2,21 +2,21 @@ import { Pool } from 'pg';
 import { Entity, Relationship, EntityType, RelationshipType, Language } from '@repo-memory/shared';
 
 export class EntityRepository {
-  constructor(private pool: Pool) {}
+  constructor(private pool: Pool, private repoPath: string = '') {}
 
   async create(entity: Omit<Entity, 'id' | 'createdAt' | 'updatedAt'>): Promise<Entity> {
     const query = `
       INSERT INTO entities (
-        stable_id, name, type, language, file_path, start_line, end_line,
+        repo_path, stable_id, name, type, language, file_path, start_line, end_line,
         start_column, end_column, signature, docstring, purpose, responsibility,
         domain, architectural_role, is_exported, is_test, confidence,
         first_seen_commit, last_seen_commit
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
       RETURNING *
     `;
     
     const values = [
-      entity.stableId, entity.name, entity.type, entity.language,
+      this.repoPath, entity.stableId, entity.name, entity.type, entity.language,
       entity.filePath, entity.startLine, entity.endLine,
       entity.startColumn, entity.endColumn, entity.signature,
       entity.docstring, entity.purpose, entity.responsibility,
@@ -32,11 +32,11 @@ export class EntityRepository {
   async upsert(entity: Omit<Entity, 'id' | 'createdAt' | 'updatedAt'>): Promise<Entity> {
     const query = `
       INSERT INTO entities (
-        stable_id, name, type, language, file_path, start_line, end_line,
+        repo_path, stable_id, name, type, language, file_path, start_line, end_line,
         start_column, end_column, signature, docstring, purpose, responsibility,
         domain, architectural_role, is_exported, is_test, confidence,
         first_seen_commit, last_seen_commit
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
       ON CONFLICT (stable_id) DO UPDATE SET
         name = EXCLUDED.name,
         type = EXCLUDED.type,
@@ -61,7 +61,7 @@ export class EntityRepository {
     `;
     
     const values = [
-      entity.stableId, entity.name, entity.type, entity.language,
+      this.repoPath, entity.stableId, entity.name, entity.type, entity.language,
       entity.filePath, entity.startLine, entity.endLine,
       entity.startColumn, entity.endColumn, entity.signature,
       entity.docstring, entity.purpose, entity.responsibility,
@@ -75,43 +75,61 @@ export class EntityRepository {
   }
 
   async findById(id: string): Promise<Entity | null> {
-    const query = 'SELECT * FROM entities WHERE id = $1';
-    const result = await this.pool.query(query, [id]);
+    const query = this.repoPath
+      ? 'SELECT * FROM entities WHERE id = $1 AND repo_path = $2'
+      : 'SELECT * FROM entities WHERE id = $1';
+    const result = await this.pool.query(query, this.repoPath ? [id, this.repoPath] : [id]);
     return result.rows[0] ? this.mapRowToEntity(result.rows[0]) : null;
   }
 
   async findByStableId(stableId: string): Promise<Entity | null> {
-    const query = 'SELECT * FROM entities WHERE stable_id = $1';
-    const result = await this.pool.query(query, [stableId]);
+    const query = this.repoPath
+      ? 'SELECT * FROM entities WHERE stable_id = $1 AND repo_path = $2'
+      : 'SELECT * FROM entities WHERE stable_id = $1';
+    const result = await this.pool.query(query, this.repoPath ? [stableId, this.repoPath] : [stableId]);
     return result.rows[0] ? this.mapRowToEntity(result.rows[0]) : null;
   }
 
   async findByFilePath(filePath: string): Promise<Entity[]> {
-    const query = 'SELECT * FROM entities WHERE file_path = $1 ORDER BY start_line';
-    const result = await this.pool.query(query, [filePath]);
+    const query = this.repoPath
+      ? 'SELECT * FROM entities WHERE file_path = $1 AND repo_path = $2 ORDER BY start_line'
+      : 'SELECT * FROM entities WHERE file_path = $1 ORDER BY start_line';
+    const result = await this.pool.query(query, this.repoPath ? [filePath, this.repoPath] : [filePath]);
     return result.rows.map(this.mapRowToEntity);
   }
 
   async findByType(type: EntityType): Promise<Entity[]> {
-    const query = 'SELECT * FROM entities WHERE type = $1 ORDER BY name';
-    const result = await this.pool.query(query, [type]);
+    const query = this.repoPath
+      ? 'SELECT * FROM entities WHERE type = $1 AND repo_path = $2 ORDER BY name'
+      : 'SELECT * FROM entities WHERE type = $1 ORDER BY name';
+    const result = await this.pool.query(query, this.repoPath ? [type, this.repoPath] : [type]);
     return result.rows.map(this.mapRowToEntity);
   }
 
   async search(query: string): Promise<Entity[]> {
-    const searchQuery = `
-      SELECT * FROM entities 
-      WHERE name ILIKE $1 OR purpose ILIKE $1 OR responsibility ILIKE $1
-      ORDER BY name
-      LIMIT 50
-    `;
-    const result = await this.pool.query(searchQuery, [`%${query}%`]);
+    const searchQuery = this.repoPath
+      ? `
+        SELECT * FROM entities 
+        WHERE (name ILIKE $1 OR purpose ILIKE $1 OR responsibility ILIKE $1)
+          AND repo_path = $2
+        ORDER BY name
+        LIMIT 50
+      `
+      : `
+        SELECT * FROM entities 
+        WHERE name ILIKE $1 OR purpose ILIKE $1 OR responsibility ILIKE $1
+        ORDER BY name
+        LIMIT 50
+      `;
+    const result = await this.pool.query(searchQuery, this.repoPath ? [`%${query}%`, this.repoPath] : [`%${query}%`]);
     return result.rows.map(this.mapRowToEntity);
   }
 
   async findAll(limit: number = 100, offset: number = 0): Promise<Entity[]> {
-    const query = 'SELECT * FROM entities ORDER BY name LIMIT $1 OFFSET $2';
-    const result = await this.pool.query(query, [limit, offset]);
+    const query = this.repoPath
+      ? 'SELECT * FROM entities WHERE repo_path = $1 ORDER BY name LIMIT $2 OFFSET $3'
+      : 'SELECT * FROM entities ORDER BY name LIMIT $1 OFFSET $2';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath, limit, offset] : [limit, offset]);
     return result.rows.map(this.mapRowToEntity);
   }
 
@@ -125,12 +143,13 @@ export class EntityRepository {
       SELECT e.*, 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) AS similarity
       FROM entities e
       WHERE e.stable_id != $1
+        AND e.repo_path = $2
         AND e.embedding IS NOT NULL
         AND 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) > $3
       ORDER BY similarity DESC
-      LIMIT $2
+      LIMIT $4
     `;
-    const result = await this.pool.query(query, [stableId, limit, threshold]);
+    const result = await this.pool.query(query, [stableId, this.repoPath, threshold, limit]);
     return result.rows.map(this.mapRowToEntity);
   }
 
@@ -138,24 +157,36 @@ export class EntityRepository {
     const query = `
       SELECT *, 1 - (embedding <=> $1::vector) AS similarity
       FROM entities
-      WHERE embedding IS NOT NULL
+      WHERE repo_path = $2
+        AND embedding IS NOT NULL
         AND 1 - (embedding <=> $1::vector) > $3
       ORDER BY similarity DESC
-      LIMIT $2
+      LIMIT $4
     `;
-    const result = await this.pool.query(query, [JSON.stringify(vector), limit, threshold]);
+    const result = await this.pool.query(query, [JSON.stringify(vector), this.repoPath, threshold, limit]);
     return result.rows.map(this.mapRowToEntity);
   }
 
   async count(): Promise<number> {
-    const query = 'SELECT COUNT(*) as count FROM entities';
-    const result = await this.pool.query(query);
+    const query = this.repoPath
+      ? 'SELECT COUNT(*) as count FROM entities WHERE repo_path = $1'
+      : 'SELECT COUNT(*) as count FROM entities';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
     return parseInt(result.rows[0].count);
   }
 
   async deleteByFilePath(filePath: string): Promise<void> {
-    const query = 'DELETE FROM entities WHERE file_path = $1';
-    await this.pool.query(query, [filePath]);
+    const query = this.repoPath
+      ? 'DELETE FROM entities WHERE file_path = $1 AND repo_path = $2'
+      : 'DELETE FROM entities WHERE file_path = $1';
+    await this.pool.query(query, this.repoPath ? [filePath, this.repoPath] : [filePath]);
+  }
+
+  async deleteAll(): Promise<void> {
+    const query = this.repoPath
+      ? 'DELETE FROM entities WHERE repo_path = $1'
+      : 'DELETE FROM entities';
+    await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
   }
 
   private mapRowToEntity(row: any): Entity {

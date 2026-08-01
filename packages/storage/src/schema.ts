@@ -10,6 +10,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- Entities table
 CREATE TABLE IF NOT EXISTS entities (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  repo_path VARCHAR(1000) NOT NULL DEFAULT '',
   stable_id VARCHAR(255) NOT NULL UNIQUE,
   name VARCHAR(500) NOT NULL,
   type VARCHAR(50) NOT NULL,
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS entities (
 -- Relationships table
 CREATE TABLE IF NOT EXISTS relationships (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  repo_path VARCHAR(1000) NOT NULL DEFAULT '',
   source_id VARCHAR(1000) NOT NULL,
   target_id VARCHAR(1000) NOT NULL,
   type VARCHAR(50) NOT NULL,
@@ -46,12 +48,13 @@ CREATE TABLE IF NOT EXISTS relationships (
   metadata JSONB,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  UNIQUE(source_id, target_id, type, file_path)
+  UNIQUE(repo_path, source_id, target_id, type, file_path)
 );
 
 -- Commits table
 CREATE TABLE IF NOT EXISTS commits (
   hash VARCHAR(40) PRIMARY KEY,
+  repo_path VARCHAR(1000) NOT NULL DEFAULT '',
   message TEXT NOT NULL,
   author VARCHAR(255) NOT NULL,
   date TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -93,14 +96,71 @@ CREATE TABLE IF NOT EXISTS repo_state (
   last_scan_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Add repo_path column to existing installs (safe migration)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'entities' AND column_name = 'repo_path'
+  ) THEN
+    ALTER TABLE entities ADD COLUMN repo_path VARCHAR(1000) NOT NULL DEFAULT '';
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'relationships' AND column_name = 'repo_path'
+  ) THEN
+    ALTER TABLE relationships ADD COLUMN repo_path VARCHAR(1000) NOT NULL DEFAULT '';
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'commits' AND column_name = 'repo_path'
+  ) THEN
+    ALTER TABLE commits ADD COLUMN repo_path VARCHAR(1000) NOT NULL DEFAULT '';
+  END IF;
+END $$;
+
+-- Replace old non-repo-scoped unique constraint on relationships with repo-scoped one
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'relationships_source_id_target_id_type_file_path_key'
+  ) THEN
+    ALTER TABLE relationships DROP CONSTRAINT relationships_source_id_target_id_type_file_path_key;
+  END IF;
+END $$;
+
+-- Ensure repo-scoped unique constraint exists (used by ON CONFLICT upsert)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'relationships_repo_path_source_id_target_id_type_file_path_key'
+  ) THEN
+    ALTER TABLE relationships
+      ADD CONSTRAINT relationships_repo_path_source_id_target_id_type_file_path_key
+      UNIQUE (repo_path, source_id, target_id, type, file_path);
+  END IF;
+END $$;
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_entities_stable_id ON entities(stable_id);
 CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
 CREATE INDEX IF NOT EXISTS idx_entities_language ON entities(language);
 CREATE INDEX IF NOT EXISTS idx_entities_file_path ON entities(file_path);
+CREATE INDEX IF NOT EXISTS idx_entities_repo_path ON entities(repo_path);
 CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_id);
 CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_id);
 CREATE INDEX IF NOT EXISTS idx_relationships_type ON relationships(type);
+CREATE INDEX IF NOT EXISTS idx_relationships_repo_path ON relationships(repo_path);
 CREATE INDEX IF NOT EXISTS idx_file_changes_commit ON file_changes(commit_hash);
 CREATE INDEX IF NOT EXISTS idx_file_changes_file ON file_changes(file_path);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);

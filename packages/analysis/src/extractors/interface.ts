@@ -4,6 +4,7 @@ export interface ExtractorContext {
   filePath: string;
   content: string;
   language: Language;
+  repoPath: string;
 }
 
 export interface LanguageExtractor {

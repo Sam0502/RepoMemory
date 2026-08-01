@@ -78,6 +78,9 @@ importers:
       '@hono/node-server':
         specifier: ^1.13.0
         version: 1.19.17(hono@4.12.32)
+      '@repo-memory/analysis':
+        specifier: workspace:*
+        version: link:../analysis
       '@repo-memory/graph':
         specifier: workspace:*
         version: link:../graph

@@ -3,21 +3,27 @@ import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { GraphClient } from '@repo-memory/graph';
 import { EntityRepository, RelationshipRepository, CommitRepository } from '@repo-memory/storage';
+import { detectDeadCode, validateBoundaries, parseDomainConfig } from '@repo-memory/analysis';
+import type { DomainConfig } from '@repo-memory/analysis';
+import { Entity, Relationship, RelationshipType } from '@repo-memory/shared';
 import { Pool } from 'pg';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { ContextPackBuilder } from './context-pack.js';
 
 export interface ApiConfig {
   port: number;
   host: string;
+  repoPath: string;
   graphClient: GraphClient;
   pgPool: Pool;
 }
 
 export function createApp(config: ApiConfig, webDir?: string): Hono {
   const app = new Hono();
-  const entityRepo = new EntityRepository(config.pgPool);
-  const relationshipRepo = new RelationshipRepository(config.pgPool);
-  const commitRepo = new CommitRepository(config.pgPool);
+  const entityRepo = new EntityRepository(config.pgPool, config.repoPath);
+  const relationshipRepo = new RelationshipRepository(config.pgPool, config.repoPath);
+  const commitRepo = new CommitRepository(config.pgPool, config.repoPath);
   const contextBuilder = new ContextPackBuilder(entityRepo, commitRepo, config.graphClient);
 
   // CORS for frontend
@@ -193,18 +199,19 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
       SELECT file_path, COUNT(*) as entity_count,
              ARRAY_AGG(type) as entity_types
       FROM entities 
+      WHERE repo_path = $1
       GROUP BY file_path 
       ORDER BY file_path
     `;
-    const filesResult = await config.pgPool.query(filesQuery);
+    const filesResult = await config.pgPool.query(filesQuery, [config.repoPath]);
     
     // Get import relationships
     const relsQuery = `
       SELECT DISTINCT source_id as source, target_id as target, type
       FROM relationships 
-      WHERE type = 'IMPORTS'
+      WHERE type = 'IMPORTS' AND repo_path = $1
     `;
-    const relsResult = await config.pgPool.query(relsQuery);
+    const relsResult = await config.pgPool.query(relsQuery, [config.repoPath]);
     
     // Build file nodes
     const files = filesResult.rows.map(row => ({
@@ -327,6 +334,86 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
       affectedFiles: Array.from(affectedFiles),
       riskScore: Math.min(1.0, directImpact.length * 0.1 + indirectImpact.length * 0.05),
     });
+  });
+
+  // Dead code detection
+  app.get('/api/analysis/dead-code', async (c) => {
+    const includeExported = c.req.query('includeExported') === 'true';
+
+    const entities: Entity[] = [];
+    const limit = 10000;
+    let offset = 0;
+    while (true) {
+      const batch = await entityRepo.findAll(limit, offset);
+      entities.push(...batch);
+      if (batch.length < limit) break;
+      offset += limit;
+    }
+
+    const relationships: Relationship[] = [];
+    for (const type of [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS]) {
+      relationships.push(...(await relationshipRepo.findByType(type)));
+    }
+
+    const report = detectDeadCode(entities, relationships);
+    return c.json(includeExported ? report : { ...report, exportedButUnused: [] });
+  });
+
+  // Ownership analysis (dominant author per file from commit history)
+  app.get('/api/analysis/ownership', async (c) => {
+    const limit = parseInt(c.req.query('limit') || '500');
+    const result = await config.pgPool.query(
+      `SELECT file_path,
+              (ARRAY_AGG(author ORDER BY cnt DESC))[1] AS owner,
+              MAX(cnt) AS commits
+       FROM (
+         SELECT f.file_path, c.author, COUNT(*) AS cnt
+         FROM file_changes f
+         JOIN commits c ON c.hash = f.commit_hash
+         WHERE c.repo_path = $1
+         GROUP BY f.file_path, c.author
+       ) sub
+       GROUP BY file_path
+       ORDER BY file_path
+       LIMIT $2`,
+      [config.repoPath, limit]
+    );
+    return c.json({
+      ownership: result.rows.map(row => ({
+        filePath: row.file_path,
+        owner: row.owner,
+        commits: parseInt(row.commits),
+      })),
+    });
+  });
+
+  // Architecture boundary validation
+  app.get('/api/analysis/boundaries', async (c) => {
+    const entities: Entity[] = [];
+    const limit = 10000;
+    let offset = 0;
+    while (true) {
+      const batch = await entityRepo.findAll(limit, offset);
+      entities.push(...batch);
+      if (batch.length < limit) break;
+      offset += limit;
+    }
+
+    const relationships: Relationship[] = [];
+    for (const type of [RelationshipType.IMPORTS, RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS]) {
+      relationships.push(...(await relationshipRepo.findByType(type)));
+    }
+
+    let domainConfig: DomainConfig | undefined;
+    try {
+      const content = readFileSync(join(config.repoPath, '.repomemory', 'boundaries.json'), 'utf-8');
+      domainConfig = parseDomainConfig(content);
+    } catch {
+      domainConfig = undefined;
+    }
+
+    const report = validateBoundaries(entities, relationships, domainConfig);
+    return c.json(report);
   });
 
   return app;

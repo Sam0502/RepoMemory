@@ -46,13 +46,19 @@ export class GraphClient {
         CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.stableId IS UNIQUE
       `);
 
+      // Create fulltext index used by searchEntities
+      await session.run(`
+        CREATE FULLTEXT INDEX entitySearch IF NOT EXISTS
+        FOR (e:Entity) ON EACH [e.name, e.purpose, e.responsibility]
+      `);
+
       console.log('Neo4j schema created successfully.');
     } finally {
       await session.close();
     }
   }
 
-  async upsertEntity(entity: Entity): Promise<void> {
+  async upsertEntity(entity: Entity, repoPath: string = ''): Promise<void> {
     const session = this.driver.session();
     try {
       const query = `
@@ -60,6 +66,7 @@ export class GraphClient {
         SET e.name = $name,
             e.type = $type,
             e.language = $language,
+            e.repoPath = $repoPath,
             e.filePath = $filePath,
             e.startLine = $startLine,
             e.endLine = $endLine,
@@ -85,6 +92,7 @@ export class GraphClient {
         name: entity.name,
         type: entity.type,
         language: entity.language,
+        repoPath: repoPath,
         filePath: entity.filePath,
         startLine: entity.startLine,
         endLine: entity.endLine,
@@ -152,13 +160,18 @@ export class GraphClient {
     }
   }
 
-  async findEntitiesByType(type: EntityType, limit: number = 100): Promise<Entity[]> {
+  async findEntitiesByType(type: EntityType, limit: number = 100, repoPath?: string): Promise<Entity[]> {
     const session = this.driver.session();
     try {
-      const result = await session.run(
-        `MATCH (e:${type}) RETURN e LIMIT $limit`,
-        { limit }
-      );
+      const result = repoPath
+        ? await session.run(
+            `MATCH (e:${type}) WHERE e.repoPath = $repoPath RETURN e LIMIT $limit`,
+            { repoPath, limit }
+          )
+        : await session.run(
+            `MATCH (e:${type}) RETURN e LIMIT $limit`,
+            { limit }
+          );
       
       return result.records.map(record => this.mapRecordToEntity(record.get('e')));
     } finally {
@@ -166,13 +179,18 @@ export class GraphClient {
     }
   }
 
-  async findEntitiesByFilePath(filePath: string): Promise<Entity[]> {
+  async findEntitiesByFilePath(filePath: string, repoPath?: string): Promise<Entity[]> {
     const session = this.driver.session();
     try {
-      const result = await session.run(
-        'MATCH (e {filePath: $filePath}) RETURN e',
-        { filePath }
-      );
+      const result = repoPath
+        ? await session.run(
+            'MATCH (e {filePath: $filePath, repoPath: $repoPath}) RETURN e',
+            { filePath, repoPath }
+          )
+        : await session.run(
+            'MATCH (e {filePath: $filePath}) RETURN e',
+            { filePath }
+          );
       
       return result.records.map(record => this.mapRecordToEntity(record.get('e')));
     } finally {
@@ -268,12 +286,31 @@ export class GraphClient {
     }
   }
 
-  async deleteEntitiesByFilePath(filePath: string): Promise<void> {
+  async deleteEntitiesByFilePath(filePath: string, repoPath?: string): Promise<void> {
+    const session = this.driver.session();
+    try {
+      if (repoPath) {
+        await session.run(
+          'MATCH (e {filePath: $filePath, repoPath: $repoPath}) DETACH DELETE e',
+          { filePath, repoPath }
+        );
+      } else {
+        await session.run(
+          'MATCH (e {filePath: $filePath}) DETACH DELETE e',
+          { filePath }
+        );
+      }
+    } finally {
+      await session.close();
+    }
+  }
+
+  async deleteAll(repoPath: string): Promise<void> {
     const session = this.driver.session();
     try {
       await session.run(
-        'MATCH (e {filePath: $filePath}) DETACH DELETE e',
-        { filePath }
+        'MATCH (e) WHERE e.repoPath = $repoPath DETACH DELETE e',
+        { repoPath }
       );
     } finally {
       await session.close();

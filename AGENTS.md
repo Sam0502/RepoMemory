@@ -132,6 +132,12 @@ GEMINI_API_KEY=your-key         # if using gemini
 EMBEDDING_CACHE_DIR=./models    # model cache directory
 ```
 
+## Multi-Repository Support
+- Each scanned repo's data is tagged with `repo_path` in the `entities`, `relationships`, and `commits` tables
+- Serving a repo (`serve --repo <path>`) filters all API responses to that repo only
+- Entity stable IDs are namespaced by repo path, so multiple repos with identical file layouts don't collide
+- Rescan a repo to re-tag existing data after upgrading from a pre-multi-repo version
+
 ## Docker Services
 - **Neo4j:** http://localhost:7474 (browser), bolt://localhost:7687
 - **PostgreSQL:** localhost:5433

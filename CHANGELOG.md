@@ -2,9 +2,44 @@
 
 All notable changes to RepoMemory will be documented in this file.
 
+## [0.5.0] - 2026-08-01
+
+### Added
+- **Cross-File Symbol Resolution (Phase 4 M1)**: New `SymbolIndex` + `RelationshipResolver` in `packages/analysis/src/resolver/` that rewrite bare-name relationship targets (`CALLS`, `REFERENCES`, `EXTENDS`, `IMPLEMENTS`, import symbols) to real entity stable IDs, scope-aware: same-file definitions → imported symbols (resolved via import paths) → globally-unique name → ambiguous (prefers exported)
+- **FILE Entities**: A `File` entity is now created for every scanned source file, giving imports and exports real graph nodes
+- **Relationship Provenance**: Resolved relationships record `resolvedBy`, `resolutionHint`, and `unresolvedTarget` in `metadata`; unresolved references drop to confidence 0.3
+- **Import Path Resolution**: `resolveImportPath` helper handles relative paths, package-name → directory index, and unique-basename matches (used by the resolver and reusable by the architecture view)
+- **Orchestrator Resolution Pipeline**: Full scans buffer parse results, build a repo-wide symbol index, resolve all relationships, then persist (with repo-scoped cleanup). Incremental scans load the symbol index from the database so only changed files need re-parsing
+- **Repo-Scoped Deletes**: `EntityRepository.deleteAll()`, `RelationshipRepository.deleteAll()`, and `GraphClient.deleteAll(repoPath)` for consistent full-scan rebuilds
+
+### Changed
+- Import-symbol relationships now store their `importPath` in `metadata` so the resolver can build per-file import maps
+- `processFile` split into `parseFile`, `generateEmbeddings`, `persistFileResult`, and `processChanges`/`storeResolvedResults`
+
+### Fixed
+- Neo4j `searchEntities` fulltext index (`entitySearch`) was never created, causing runtime errors; it is now created in `createSchema()`
+- Neo4j silently dropped every relationship whose source/target wasn't a real stable ID; symbol-level `CALLS`/`REFERENCES`/`EXTENDS`/`IMPLEMENTS` and import-symbol edges now materialize, so dependency/dependent/impact queries return real data
+
+### Added (M2)
+- **Dead Code Detection**: `detectDeadCode()` in `packages/analysis/src/deadcode.ts` performs reachability analysis from entrypoint/test roots over resolved edges. Non-exported unreachable entities are flagged dead; exported-but-unreferenced symbols are reported separately
+- **Dead Code API**: `GET /api/analysis/dead-code?includeExported=true`
+- **Dead Code CLI**: `repo-memory query dead-code --repo <path>`
+
+### Added (M3)
+- **Domain Inference**: `inferDomain()` + `inferArchitecturalRole()` in `packages/analysis/src/domain.ts` classify each file into a domain (api / services / core / shared / frontend / scripts / unknown) and architectural role (entrypoint / application / implementation / interface / config)
+- **Domain Config**: Optional `.repomemory/boundaries.json` at the repo root defines custom domains, file patterns, `allowedCrossDomain`, and `strict` mode; parsed by `parseDomainConfig()` and applied to entities during scans
+- **Ownership Report**: `GET /api/analysis/ownership` computes per-file dominant author from commit history
+- **Commit History Ingestion**: Full scans now ingest the last 100 commits (via `getRecentCommitsWithChanges()`) so ownership/commit reports have real data instead of an empty working-tree diff
+
+### Added (M4)
+- **Boundary Validation**: `validateBoundaries()` in `packages/analysis/src/boundaries.ts` reports cross-domain edges with allow/deny status against the domain config
+- **Boundaries API**: `GET /api/analysis/boundaries` returns domains (with file/entity counts), cross-domain edges, and violations
+
 ## [0.4.0] - 2026-07-31
 
 ### Added
+- **Multi-Repository Isolation**: Added `repo_path` scoping to entities, relationships, and commits. Each scanned repo's data is now tagged with its path and filtered out when serving a different repo
+- **Repo-Scoped Stable IDs**: Entity stable IDs now include the repo path, preventing collisions between repos with identical file paths/entity names
 - **Python Language Support**: New Python parser using Tree-sitter WASM grammar. Extracts functions, classes, methods, constructors (`__init__`), decorators, imports, variables, and docstrings
 - **Strategy Pattern Parser Architecture**: Refactored `TreeSitterParser` into a pluggable `LanguageExtractor` interface with per-language implementations (`TypeScriptExtractor`, `JavaScriptExtractor`, `PythonExtractor`)
 - **Constructor Detection**: Extracts `constructor` methods from TypeScript/JavaScript classes and `__init__` methods from Python classes as `CONSTRUCTOR` entities
@@ -21,6 +56,7 @@ All notable changes to RepoMemory will be documented in this file.
 - Updated `EntityRepository` with `deleteByFilePath` method for proper file deletion handling
 - Improved `isTestFile()` to detect test files by path patterns (`/test/`, `/tests/`, `/__tests__/`)
 - Added `getGrammarKeyFromFilePath()` for proper grammar resolution (fixed TSX grammar bug)
+- Added `repoPath` to `ExtractorContext` and `parse()`; repositories and API now filter by served repo path
 
 ### Fixed
 - Fixed TSX grammar loading bug (grammar key was hardcoded to `'typescript'`)

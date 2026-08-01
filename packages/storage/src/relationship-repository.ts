@@ -2,17 +2,17 @@ import { Pool } from 'pg';
 import { Relationship, RelationshipType } from '@repo-memory/shared';
 
 export class RelationshipRepository {
-  constructor(private pool: Pool) {}
+  constructor(private pool: Pool, private repoPath: string = '') {}
 
   async create(relationship: Omit<Relationship, 'id' | 'createdAt' | 'updatedAt'>): Promise<Relationship> {
     const query = `
-      INSERT INTO relationships (source_id, target_id, type, file_path, line, confidence, metadata)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      INSERT INTO relationships (repo_path, source_id, target_id, type, file_path, line, confidence, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING *
     `;
     
     const values = [
-      relationship.sourceId, relationship.targetId, relationship.type,
+      this.repoPath, relationship.sourceId, relationship.targetId, relationship.type,
       relationship.filePath, relationship.line, relationship.confidence,
       JSON.stringify(relationship.metadata)
     ];
@@ -23,9 +23,9 @@ export class RelationshipRepository {
 
   async upsert(relationship: Omit<Relationship, 'id' | 'createdAt' | 'updatedAt'>): Promise<Relationship> {
     const query = `
-      INSERT INTO relationships (source_id, target_id, type, file_path, line, confidence, metadata)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      ON CONFLICT (source_id, target_id, type, file_path) DO UPDATE SET
+      INSERT INTO relationships (repo_path, source_id, target_id, type, file_path, line, confidence, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (repo_path, source_id, target_id, type, file_path) DO UPDATE SET
         line = EXCLUDED.line,
         confidence = EXCLUDED.confidence,
         metadata = EXCLUDED.metadata,
@@ -34,7 +34,7 @@ export class RelationshipRepository {
     `;
     
     const values = [
-      relationship.sourceId, relationship.targetId, relationship.type,
+      this.repoPath, relationship.sourceId, relationship.targetId, relationship.type,
       relationship.filePath, relationship.line, relationship.confidence,
       JSON.stringify(relationship.metadata)
     ];
@@ -44,69 +44,104 @@ export class RelationshipRepository {
   }
 
   async findById(id: string): Promise<Relationship | null> {
-    const query = 'SELECT * FROM relationships WHERE id = $1';
-    const result = await this.pool.query(query, [id]);
+    const query = this.repoPath
+      ? 'SELECT * FROM relationships WHERE id = $1 AND repo_path = $2'
+      : 'SELECT * FROM relationships WHERE id = $1';
+    const result = await this.pool.query(query, this.repoPath ? [id, this.repoPath] : [id]);
     return result.rows[0] ? this.mapRowToRelationship(result.rows[0]) : null;
   }
 
   async findBySourceId(sourceId: string): Promise<Relationship[]> {
-    const query = 'SELECT * FROM relationships WHERE source_id = $1 ORDER BY type';
-    const result = await this.pool.query(query, [sourceId]);
+    const query = this.repoPath
+      ? 'SELECT * FROM relationships WHERE source_id = $1 AND repo_path = $2 ORDER BY type'
+      : 'SELECT * FROM relationships WHERE source_id = $1 ORDER BY type';
+    const result = await this.pool.query(query, this.repoPath ? [sourceId, this.repoPath] : [sourceId]);
     return result.rows.map(this.mapRowToRelationship);
   }
 
   async findByTargetId(targetId: string): Promise<Relationship[]> {
-    const query = 'SELECT * FROM relationships WHERE target_id = $1 ORDER BY type';
-    const result = await this.pool.query(query, [targetId]);
+    const query = this.repoPath
+      ? 'SELECT * FROM relationships WHERE target_id = $1 AND repo_path = $2 ORDER BY type'
+      : 'SELECT * FROM relationships WHERE target_id = $1 ORDER BY type';
+    const result = await this.pool.query(query, this.repoPath ? [targetId, this.repoPath] : [targetId]);
     return result.rows.map(this.mapRowToRelationship);
   }
 
   async findByEntityId(entityId: string): Promise<Relationship[]> {
-    const query = 'SELECT * FROM relationships WHERE source_id = $1 OR target_id = $1 ORDER BY type';
-    const result = await this.pool.query(query, [entityId]);
+    const query = this.repoPath
+      ? 'SELECT * FROM relationships WHERE (source_id = $1 OR target_id = $1) AND repo_path = $2 ORDER BY type'
+      : 'SELECT * FROM relationships WHERE source_id = $1 OR target_id = $1 ORDER BY type';
+    const result = await this.pool.query(query, this.repoPath ? [entityId, this.repoPath] : [entityId]);
     return result.rows.map(this.mapRowToRelationship);
   }
 
   async findByType(type: RelationshipType): Promise<Relationship[]> {
-    const query = 'SELECT * FROM relationships WHERE type = $1 ORDER BY created_at';
-    const result = await this.pool.query(query, [type]);
+    const query = this.repoPath
+      ? 'SELECT * FROM relationships WHERE type = $1 AND repo_path = $2 ORDER BY created_at'
+      : 'SELECT * FROM relationships WHERE type = $1 ORDER BY created_at';
+    const result = await this.pool.query(query, this.repoPath ? [type, this.repoPath] : [type]);
     return result.rows.map(this.mapRowToRelationship);
   }
 
   async findByFilePath(filePath: string): Promise<Relationship[]> {
-    const query = 'SELECT * FROM relationships WHERE file_path = $1 ORDER BY type';
-    const result = await this.pool.query(query, [filePath]);
+    const query = this.repoPath
+      ? 'SELECT * FROM relationships WHERE file_path = $1 AND repo_path = $2 ORDER BY type'
+      : 'SELECT * FROM relationships WHERE file_path = $1 ORDER BY type';
+    const result = await this.pool.query(query, this.repoPath ? [filePath, this.repoPath] : [filePath]);
     return result.rows.map(this.mapRowToRelationship);
   }
 
   async findDependencies(entityId: string): Promise<Relationship[]> {
-    const query = `
-      SELECT * FROM relationships 
-      WHERE source_id = $1 AND type IN ('IMPORTS', 'DEPENDS_ON', 'CALLS', 'REFERENCES')
-      ORDER BY type
-    `;
-    const result = await this.pool.query(query, [entityId]);
+    const query = this.repoPath
+      ? `
+        SELECT * FROM relationships 
+        WHERE source_id = $1 AND repo_path = $2 AND type IN ('IMPORTS', 'DEPENDS_ON', 'CALLS', 'REFERENCES')
+        ORDER BY type
+      `
+      : `
+        SELECT * FROM relationships 
+        WHERE source_id = $1 AND type IN ('IMPORTS', 'DEPENDS_ON', 'CALLS', 'REFERENCES')
+        ORDER BY type
+      `;
+    const result = await this.pool.query(query, this.repoPath ? [entityId, this.repoPath] : [entityId]);
     return result.rows.map(this.mapRowToRelationship);
   }
 
   async findDependents(entityId: string): Promise<Relationship[]> {
-    const query = `
-      SELECT * FROM relationships 
-      WHERE target_id = $1 AND type IN ('IMPORTS', 'DEPENDS_ON', 'CALLS', 'REFERENCES')
-      ORDER BY type
-    `;
-    const result = await this.pool.query(query, [entityId]);
+    const query = this.repoPath
+      ? `
+        SELECT * FROM relationships 
+        WHERE target_id = $1 AND repo_path = $2 AND type IN ('IMPORTS', 'DEPENDS_ON', 'CALLS', 'REFERENCES')
+        ORDER BY type
+      `
+      : `
+        SELECT * FROM relationships 
+        WHERE target_id = $1 AND type IN ('IMPORTS', 'DEPENDS_ON', 'CALLS', 'REFERENCES')
+        ORDER BY type
+      `;
+    const result = await this.pool.query(query, this.repoPath ? [entityId, this.repoPath] : [entityId]);
     return result.rows.map(this.mapRowToRelationship);
   }
 
   async deleteByFilePath(filePath: string): Promise<void> {
-    const query = 'DELETE FROM relationships WHERE file_path = $1';
-    await this.pool.query(query, [filePath]);
+    const query = this.repoPath
+      ? 'DELETE FROM relationships WHERE file_path = $1 AND repo_path = $2'
+      : 'DELETE FROM relationships WHERE file_path = $1';
+    await this.pool.query(query, this.repoPath ? [filePath, this.repoPath] : [filePath]);
+  }
+
+  async deleteAll(): Promise<void> {
+    const query = this.repoPath
+      ? 'DELETE FROM relationships WHERE repo_path = $1'
+      : 'DELETE FROM relationships';
+    await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
   }
 
   async count(): Promise<number> {
-    const query = 'SELECT COUNT(*) as count FROM relationships';
-    const result = await this.pool.query(query);
+    const query = this.repoPath
+      ? 'SELECT COUNT(*) as count FROM relationships WHERE repo_path = $1'
+      : 'SELECT COUNT(*) as count FROM relationships';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
     return parseInt(result.rows[0].count);
   }
 

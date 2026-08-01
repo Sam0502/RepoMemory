@@ -353,11 +353,53 @@ Use a three-store split:
 - Fixed `getGroup()` to support external repositories with generic directory patterns (tests, source, lib, cmd, etc.)
 - Fixed frontend scrolling for entity list, commit list, and detail panel (added `min-height: 0` and flex layout)
 
+#### 3.6 Multi-Repository Isolation ✅
+- Added `repo_path` column to `entities`, `relationships`, and `commits` tables with safe migrations
+- Replaced relationships unique constraint with repo-scoped variant `(repo_path, source_id, target_id, type, file_path)`
+- Namespaced stable ID generation with repo path to prevent cross-repo collisions in PostgreSQL and Neo4j
+- Scoped `EntityRepository`, `RelationshipRepository`, and `CommitRepository` by repo path
+- Scoped Neo4j `GraphClient` entity storage/querying by repo path
+- Filtered all API endpoints and architecture graph queries by the served repo path
+- Passed `repoPath` through CLI `serve` command and orchestrator
+
 ### Phase 4: Multi-Language Coverage
-- Add parser adapters for more languages (Go, Rust, Java, etc.)
+- Add parser adapters for more languages (Go, Rust, Java, etc.) — *deferred, not part of this Phase 4 pass*
 - Improve API, test, config, and model detection
 - Strengthen ownership and domain inference
 - Add architecture boundary validation
+
+### Phase 4 (Non-Multi-Language) ✅ M1-M4 COMPLETE
+
+**Started:** 2026-08-01
+
+#### 4.1 Cross-File Symbol Resolution ✅
+- Added `SymbolIndex` + `RelationshipResolver` in `packages/analysis/src/resolver/`
+- Rewrites bare-name relationship targets (CALLS/REFERENCES/EXTENDS/IMPLEMENTS/import symbols) to real entity stable IDs via scope-aware lookup (same-file → import → global-unique → ambiguous)
+- Added `File` entities per source file so imports/exports participate in the graph
+- Import-symbol relationships now store `importPath` in metadata for per-file import-map building
+- Orchestrator full scans buffer + resolve + persist (with repo-scoped cleanup); incremental scans load the symbol index from the database
+- Fixed Neo4j `entitySearch` fulltext index (missing → runtime error) and `deleteAll(repoPath)`
+- Verified: CALLS/REFERENCES/import symbols resolve across files; Neo4j dependents + CLI impact analysis return real data
+
+#### 4.2 Dead Code Detection ✅
+- Reachability from root set over resolved inbound edges; non-exported unreachable entities flagged
+- `detectDeadCode()` in `packages/analysis/src/deadcode.ts`, `GET /api/analysis/dead-code`, CLI `query dead-code`
+
+#### 4.3 Ownership & Domain Inference ✅
+- Per-file dominant author from commits; heuristic domain/architecturalRole inference; optional `.repomemory/boundaries.json`
+- `inferDomain()`/`inferArchitecturalRole()`/`parseDomainConfig()` in `packages/analysis/src/domain.ts`
+- Full scans ingest last 100 commits (`getRecentCommitsWithChanges()`) so ownership reports have real data
+- `GET /api/analysis/ownership` returns per-file dominant author
+
+#### 4.4 Architecture Boundary Validation ✅
+- Boundary rules over resolved edges + inferred domains; violation reporting
+- `validateBoundaries()` in `packages/analysis/src/boundaries.ts`; `GET /api/analysis/boundaries`
+
+#### 4.5 Detection Improvements
+- Fix config-entity creation bug (skipped by `shouldParseFile` gate); HANDLES relationship; wire `isTestFileByContent`; Python describe/it; model entity detection
+
+#### 4.6 AI & Developer Workflows
+- Confidence scoring + provenance surfacing; QA endpoints; frontend contract fixes + new views
 
 ### Phase 4: AI and Developer Workflows
 - Ship traversal, impact analysis, and dead code detection

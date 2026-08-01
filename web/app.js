@@ -430,7 +430,7 @@ function renderArchitectureGraph() {
     .force('link', d3.forceLink(graphLinks).id(d => d.id).distance(140))
     .force('charge', d3.forceManyBody().strength(-400))
     .force('center', d3.forceCenter(width / 2, height / 2))
-    .force('collision', d3.forceCollide().radius(d => Math.max(18, d.entityCount * 2.5)));
+    .force('collision', d3.forceCollide().radius(d => Math.min(32, Math.max(12, d.entityCount * 1.8))));
 
   const link = g.append('g').selectAll('line').data(graphLinks).join('line')
     .attr('class', 'link').attr('marker-end', 'url(#arrow-arch)');

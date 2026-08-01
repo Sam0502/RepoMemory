@@ -50,6 +50,29 @@ export class GitOperations {
     }
   }
 
+  // Returns the last `limit` commits, each with its own changed files (from git show).
+  async getRecentCommitsWithChanges(limit: number = 100): Promise<Array<Commit & { fileChanges: FileChange[] }>> {
+    try {
+      const log = await this.git.log({ maxCount: limit });
+      const commits: Array<Commit & { fileChanges: FileChange[] }> = [];
+      for (const entry of log.all) {
+        const show = await this.git.show([entry.hash, '--name-status', '--format=']);
+        const fileChanges = this.parseDiffOutput(show);
+        commits.push({
+          hash: entry.hash,
+          message: entry.message,
+          author: entry.author_name,
+          date: new Date(entry.date),
+          filesChanged: fileChanges.map(fc => fc.filePath),
+          fileChanges,
+        });
+      }
+      return commits;
+    } catch {
+      return [];
+    }
+  }
+
   async getDiffBetweenCommits(from: string, to: string): Promise<FileChange[]> {
     try {
       const diff = await this.git.diff([from, to, '--name-status']);

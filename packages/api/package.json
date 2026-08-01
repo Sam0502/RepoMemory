@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@repo-memory/shared": "workspace:*",
+    "@repo-memory/analysis": "workspace:*",
     "@repo-memory/graph": "workspace:*",
     "@repo-memory/storage": "workspace:*",
     "hono": "^4.6.0",

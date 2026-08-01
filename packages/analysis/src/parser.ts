@@ -78,14 +78,14 @@ export class TreeSitterParser {
     this.tsParser.setLanguage(wasmModule);
   }
 
-  async parse(filePath: string, content: string): Promise<ParseResult> {
+  async parse(filePath: string, content: string, repoPath: string = ''): Promise<ParseResult> {
     const entities: Entity[] = [];
     const relationships: Relationship[] = [];
     const errors: ParseResult['errors'] = [];
 
     // Check for config files
     if (this.isConfigFile(filePath)) {
-      const configEntity = this.createConfigEntity(filePath);
+      const configEntity = this.createConfigEntity(filePath, repoPath);
       if (configEntity) {
         entities.push(configEntity);
       }
@@ -104,7 +104,7 @@ export class TreeSitterParser {
       }
 
       const rootNode = tree.rootNode;
-      const ctx: ExtractorContext = { filePath, content, language: this.language };
+      const ctx: ExtractorContext = { filePath, content, language: this.language, repoPath };
       this.extractor.extractNodes(rootNode, ctx, entities, relationships);
     } catch (error) {
       errors.push({
@@ -143,11 +143,11 @@ export class TreeSitterParser {
     return configPatterns.some(pattern => pattern.test(filePath));
   }
 
-  private createConfigEntity(filePath: string): Entity | null {
+  private createConfigEntity(filePath: string, repoPath: string = ''): Entity | null {
     const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || filePath;
     const name = fileName.replace(/\.[^.]+$/, '');
     
-    const stableId = createHash('md5').update(`config:${filePath}:${name}`).digest('hex');
+    const stableId = createHash('md5').update(`config:${repoPath}:${filePath}:${name}`).digest('hex');
     
     return {
       id: stableId,

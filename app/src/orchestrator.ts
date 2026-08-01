@@ -155,6 +155,9 @@ export class Orchestrator {
 
     // Ingest commit history so ownership/domain reports have data
     await this.recordCommitHistory(100);
+
+    // Back-fill first/last seen commit hashes onto entities from history
+    await this.annotateEntitiesWithCommits();
     
     console.log('Full repository scan complete.');
   }
@@ -189,6 +192,52 @@ export class Orchestrator {
       }
     } catch (error) {
       console.error('Failed to record commit history:', error);
+    }
+  }
+
+  // Back-fill firstSeenCommit/lastSeenCommit on entities from the commit
+  // history, matching by file path. Git paths use `/`; entity file paths may
+  // use `\` on Windows, so separators are normalized for the comparison.
+  private async annotateEntitiesWithCommits(): Promise<void> {
+    try {
+      const result = await this.pgPool.query(
+        `SELECT fc.file_path, c.hash, c.date
+         FROM file_changes fc
+         JOIN commits c ON c.hash = fc.commit_hash
+         WHERE c.repo_path = $1
+         ORDER BY c.date ASC`,
+        [this.config.repoPath]
+      );
+
+      const firstSeen = new Map<string, string>();
+      const lastSeen = new Map<string, string>();
+      for (const row of result.rows) {
+        const key = row.file_path.replace(/\\/g, '/');
+        if (!firstSeen.has(key)) firstSeen.set(key, row.hash);
+        lastSeen.set(key, row.hash);
+      }
+
+      for (const [fileKey, hash] of firstSeen) {
+        await this.pgPool.query(
+          `UPDATE entities
+           SET first_seen_commit = $1, updated_at = NOW()
+           WHERE repo_path = $2 AND REPLACE(file_path, '\\', '/') = $3
+             AND first_seen_commit IS NULL`,
+          [hash, this.config.repoPath, fileKey]
+        );
+      }
+      for (const [fileKey, hash] of lastSeen) {
+        await this.pgPool.query(
+          `UPDATE entities
+           SET last_seen_commit = $1, updated_at = NOW()
+           WHERE repo_path = $2 AND REPLACE(file_path, '\\', '/') = $3`,
+          [hash, this.config.repoPath, fileKey]
+        );
+      }
+
+      console.log(`Annotated entity first/last seen commits for ${firstSeen.size} files.`);
+    } catch (error) {
+      console.error('Failed to annotate entities with commits:', error);
     }
   }
 
@@ -227,6 +276,7 @@ export class Orchestrator {
     await this.processChanges(changes);
     
     await this.recordCurrentCommit();
+    await this.annotateEntitiesWithCommits();
     console.log('Incremental scan complete.');
   }
 
@@ -246,6 +296,7 @@ export class Orchestrator {
     await this.processChanges(changes);
 
     await this.recordCurrentCommit();
+    await this.annotateEntitiesWithCommits();
     console.log('Incremental scan complete.');
   }
 
@@ -276,6 +327,7 @@ export class Orchestrator {
     await this.processChanges(changes);
     
     await this.recordCurrentCommit();
+    await this.annotateEntitiesWithCommits();
     console.log('Working tree scan complete.');
   }
 

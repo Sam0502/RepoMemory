@@ -203,7 +203,7 @@ export class GraphClient {
     try {
       const result = await session.run(
         `
-        MATCH (source {stableId: $stableId})-[r:IMPORTS|DEPENDS_ON|CALLS|REFERENCES]->(target)
+        MATCH (source {stableId: $stableId})-[r:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES]->(target)
         RETURN target as entity, r as relationship
         `,
         { stableId }
@@ -223,7 +223,7 @@ export class GraphClient {
     try {
       const result = await session.run(
         `
-        MATCH (source)-[r:IMPORTS|DEPENDS_ON|CALLS|REFERENCES]->(target {stableId: $stableId})
+        MATCH (source)-[r:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES]->(target {stableId: $stableId})
         RETURN source as entity, r as relationship
         `,
         { stableId }
@@ -243,7 +243,7 @@ export class GraphClient {
     try {
       const result = await session.run(
         `
-        MATCH path = (source {stableId: $stableId})-[:IMPORTS|DEPENDS_ON|CALLS|REFERENCES*1..${maxDepth}]->(target)
+        MATCH path = (source {stableId: $stableId})-[:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES*1..${maxDepth}]->(target)
         RETURN DISTINCT target as entity
         `,
         { stableId }

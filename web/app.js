@@ -496,7 +496,7 @@ function renderCommitList(commits) {
       <div class="msg">${escHtml(c.message)}</div>
       <div class="meta">
         <span>${escHtml(c.author)}</span>
-        <span>${timeAgo(c.timestamp)}</span>
+        <span>${timeAgo(c.date)}</span>
       </div>
     </div>
   `).join('');
@@ -527,7 +527,7 @@ async function showCommitDetail(hash) {
       div.className = 'commit-files';
       div.innerHTML = changes.slice(0, 20).map(fc => `
         <div class="file-change">
-          <span class="status ${fc.changeType}">${fc.changeType}</span>
+          <span class="status ${fc.status}">${fc.status}</span>
           <span class="path">${escHtml(shortPath(fc.filePath))}</span>
         </div>
       `).join('');
@@ -613,11 +613,39 @@ async function loadContextPack(stableId) {
   if (!section) return;
   try {
     const data = await api(`/api/context-pack/${stableId}?tokenBudget=4000`);
-    const content = data.packedContent || data.content || '';
-    const tokens = data.totalTokens || 0;
+    const tokens = data.tokenCount || 0;
+    const deps = data.dependencies || [];
+    const dependents = data.dependents || [];
+    const similar = data.similarEntities || [];
+    const recent = data.recentChanges || [];
+    const metadata = data.metadata || {};
+    const lines = [];
+
+    lines.push(`${data.entity.name} (${data.entity.type})`);
+    lines.push(`File: ${data.entity.filePath}`);
+    if (metadata.packageName) lines.push(`Package: ${metadata.packageName}`);
+    if (data.entity.purpose) lines.push(`Purpose: ${data.entity.purpose}`);
+    lines.push('');
+    if (deps.length) {
+      lines.push('Dependencies:');
+      deps.forEach(d => lines.push(`  ${d.name} (${d.type}) ${d.filePath}`));
+    }
+    if (dependents.length) {
+      lines.push('Dependents:');
+      dependents.forEach(d => lines.push(`  ${d.name} (${d.type}) ${d.filePath}`));
+    }
+    if (recent.length) {
+      lines.push('Recent changes:');
+      recent.forEach(r => lines.push(`  ${r.hash.slice(0, 8)} ${r.message}`));
+    }
+    if (similar.length) {
+      lines.push('Similar entities:');
+      similar.forEach(s => lines.push(`  ${s.name} (${s.type})`));
+    }
+
     section.innerHTML = `
       <h3>Context Pack <span style="font-weight:400;text-transform:none;color:#8b949e">${tokens} tokens</span></h3>
-      <div class="context-pack">${escHtml(content.slice(0, 3000))}</div>
+      <div class="context-pack">${escHtml(lines.join('\n').slice(0, 3000))}</div>
     `;
   } catch {
     section.innerHTML = '<h3>Context Pack</h3><div class="empty-state">Unavailable</div>';

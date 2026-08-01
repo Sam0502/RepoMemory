@@ -31,7 +31,11 @@ export class CommitRepository {
         await this.pool.query(
           `INSERT INTO file_changes (commit_hash, file_path, additions, deletions, status, old_path)
            VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT DO NOTHING`,
+           ON CONFLICT (commit_hash, file_path) DO UPDATE SET
+             additions = EXCLUDED.additions,
+             deletions = EXCLUDED.deletions,
+             status = EXCLUDED.status,
+             old_path = EXCLUDED.old_path`,
           [commit.hash, fc.filePath, fc.additions, fc.deletions, fc.status, fc.oldPath || null]
         );
       }

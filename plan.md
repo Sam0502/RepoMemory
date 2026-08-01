@@ -368,9 +368,10 @@ Use a three-store split:
 - Strengthen ownership and domain inference
 - Add architecture boundary validation
 
-### Phase 4 (Non-Multi-Language) ✅ M1-M5 COMPLETE
+### Phase 4 (Non-Multi-Language) ✅ M1-M6 COMPLETE
 
 **Started:** 2026-08-01
+**Completed:** 2026-08-01 (M1-M6)
 
 #### 4.1 Cross-File Symbol Resolution ✅
 - Added `SymbolIndex` + `RelationshipResolver` in `packages/analysis/src/resolver/`
@@ -404,8 +405,15 @@ Use a three-store split:
 - Model entity detection: `EntityType.MODEL` via naming, ORM decorators, and ORM base classes
 - `isTestFileByContent` wired into `createEntity`; `isTestFile` matches Python `test_*`/`*_test` naming
 
-#### 4.6 AI & Developer Workflows
-- Confidence scoring + provenance surfacing; QA endpoints; frontend contract fixes + new views
+#### 4.6 AI & Developer Workflows ✅
+- **Git commit metadata fixes**: `git log --numstat --summary` (with parse of numstat + summary lines) replaces the old `--name-status` for commit + file-change ingestion; `git show` no longer used. File changes now carry real add/delete counts (added/modified/deleted/renamed statuses)
+- **Commit history on scans**: full/incremental/working-tree scans ingest last 100 commits and annotate entity `firstSeenCommit`/`lastSeenCommit` (matched via normalized paths)
+- **Commit upsert fix**: `commit_repository` upsert now `ON CONFLICT (commit_hash, file_path) DO UPDATE` so stale `0` counts from previous `--name-status` rows don't persist
+- **Natural-language QA**: `QaService` (`packages/api/src/qa.ts`) classifies intents (dependencies / dependents / location / ownership / dead-code / tests / info) and answers with evidence; `POST /api/qa/ask` endpoint
+- **Frontend contract fixes**: commit list uses `date`, file-change rows use `status` (numstat statuses), context-pack panel renders the structured `ContextPack` shape
+- **Graph traversal fixes**: `HANDLES` added to dependency/dependent/transitive queries so routes show as callers of their handlers; self-referencing `REFERENCES` eliminated (function/variable names compared by position, not object identity, since `childForFieldName` returns a distinct node object)
+- **QA ownership fix**: questions naming a file (e.g. `who owns src/unused.ts`) resolve the exact file via path tokens before falling back to the generic entity search
+- Verified end-to-end: `who calls createUser` → "used by: POST /users/:id"; `who calls list_users` → "GET /users"; `who owns src\unused.ts` → "owned by test (1 commits)"; commits/file-changes show real `+11 -0` etc.
 
 ### Phase 4: AI and Developer Workflows
 - Ship traversal, impact analysis, and dead code detection

@@ -2,6 +2,20 @@
 
 All notable changes to RepoMemory will be documented in this file.
 
+### Added (M6)
+- **Natural-Language QA**: `QaService` in `packages/api/src/qa.ts` classifies questions into intents (dependencies / dependents / location / ownership / dead code / tests / info) and returns structured answers with evidence. New endpoint `POST /api/qa/ask`
+- **Commit History on Scans**: Full/incremental/working-tree scans now ingest the last 100 commits and annotate each entity with `firstSeenCommit`/`lastSeenCommit`
+- **Real File-Change Counts**: Git ingestion switched from `--name-status` to `--numstat --summary` (with a parser for both line formats), so `file_changes` carry true add/delete counts and added/modified/deleted/renamed statuses
+
+### Changed (M6)
+- `CommitRepository` upsert now `ON CONFLICT (commit_hash, file_path) DO UPDATE` so re-scans refresh stale change counts
+- Graph dependency/dependent/transitive queries now include `HANDLES`, so API routes appear as callers of their handlers
+- Frontend contract fixes: commit list reads `date`, file-change rows read `status`, context pack panel renders the structured `ContextPack` shape
+
+### Fixed (M6)
+- `extractReferencesFromNode` emitted self-referencing `REFERENCES` for function/variable names because `childForFieldName` returns a distinct node object (identity comparison never matched). Names are now compared by node position
+- QA ownership answers matched the wrong file; questions naming a file path now resolve the exact file before falling back to generic entity search
+
 ## [0.5.0] - 2026-08-01
 
 ### Added

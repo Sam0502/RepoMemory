@@ -149,13 +149,24 @@ export abstract class BaseExtractor implements LanguageExtractor {
       // Skip identifiers that are part of function calls (handled by extractCallsFromNode)
       if (identifier.parent?.type === 'call_expression') continue;
       
-      // Skip identifiers that are function definitions
-      if (identifier.parent?.type === 'function_declaration' && 
-          identifier.parent.childForFieldName('name') === identifier) continue;
+      // Skip identifiers that are function definitions (compare positions:
+      // childForFieldName may return a distinct node object)
+      if (identifier.parent?.type === 'function_declaration' ||
+          identifier.parent?.type === 'method_definition' ||
+          identifier.parent?.type === 'function_definition') {
+        const selfName = identifier.parent.childForFieldName?.('name');
+        if (selfName && selfName.startIndex === identifier.startIndex && selfName.endIndex === identifier.endIndex) {
+          continue;
+        }
+      }
       
-      // Skip identifiers that are variable declarations
-      if (identifier.parent?.type === 'variable_declarator' && 
-          identifier.parent.childForFieldName('name') === identifier) continue;
+      // Skip identifiers that are variable declarations (position-based, as above)
+      if (identifier.parent?.type === 'variable_declarator') {
+        const declName = identifier.parent.childForFieldName?.('name');
+        if (declName && declName.startIndex === identifier.startIndex && declName.endIndex === identifier.endIndex) {
+          continue;
+        }
+      }
       
       const name = identifier.text;
       if (name && name.length > 1) { // Skip single-char identifiers

@@ -10,6 +10,7 @@ import { Pool } from 'pg';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { ContextPackBuilder } from './context-pack.js';
+import { QaService } from './qa.js';
 
 export interface ApiConfig {
   port: number;
@@ -25,6 +26,7 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   const relationshipRepo = new RelationshipRepository(config.pgPool, config.repoPath);
   const commitRepo = new CommitRepository(config.pgPool, config.repoPath);
   const contextBuilder = new ContextPackBuilder(entityRepo, commitRepo, config.graphClient);
+  const qaService = new QaService(entityRepo, relationshipRepo, commitRepo, config.graphClient, config.pgPool);
 
   // CORS for frontend
   app.use('*', async (c, next) => {
@@ -414,6 +416,17 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
 
     const report = validateBoundaries(entities, relationships, domainConfig);
     return c.json(report);
+  });
+
+  // Question-answering for agents: classified intents over the stored graph
+  app.post('/api/qa/ask', async (c) => {
+    const body: { question?: string } = await c.req.json().catch(() => ({}));
+    const question = (body.question || '').trim();
+    if (!question) {
+      return c.json({ error: 'question is required' }, 400);
+    }
+    const answer = await qaService.ask(question);
+    return c.json(answer);
   });
 
   return app;

@@ -38,6 +38,11 @@ export class PythonExtractor extends BaseExtractor {
     }
 
     for (const child of node.children) {
+      // decorated_definition already handles its wrapped function/class
+      if (nodeType === 'decorated_definition' &&
+          (child.type === 'function_definition' || child.type === 'class_definition')) {
+        continue;
+      }
       this.extractNodes(child, ctx, entities, relationships);
     }
   }
@@ -48,9 +53,9 @@ export class PythonExtractor extends BaseExtractor {
     entities: Entity[],
     relationships: Relationship[],
     parentClassStableId?: string
-  ): void {
+  ): Entity | null {
     const nameNode = this.findChildByType(node, 'identifier') || node.childForFieldName('name');
-    if (!nameNode) return;
+    if (!nameNode) return null;
 
     const name = nameNode.text;
     const isExported = this.isExported(name);
@@ -62,7 +67,10 @@ export class PythonExtractor extends BaseExtractor {
       entityType = EntityType.CONSTRUCTOR;
     } else if (parentClassStableId) {
       entityType = EntityType.METHOD;
-    } else if (this.isTestFile(ctx.filePath) && this.isTestFunction(name)) {
+    } else if (/^describe_/.test(name)) {
+      // pytest-describe style blocks
+      entityType = EntityType.TEST_SUITE;
+    } else if (/^it_/.test(name) || (this.isTestFile(ctx.filePath) && this.isTestFunction(name))) {
       entityType = EntityType.TEST;
     }
 
@@ -83,7 +91,11 @@ export class PythonExtractor extends BaseExtractor {
 
       // Extract docstring
       this.extractDocstring(node, entity, ctx);
+
+      return entity;
     }
+
+    return null;
   }
 
   private extractClass(
@@ -98,7 +110,13 @@ export class PythonExtractor extends BaseExtractor {
     const name = nameNode.text;
     const isExported = this.isExported(name);
 
-    const entity = this.createEntity(name, ctx, EntityType.CLASS, node, isExported);
+    const entity = this.createEntity(
+      name,
+      ctx,
+      this.isModelClass(name, node) ? EntityType.MODEL : EntityType.CLASS,
+      node,
+      isExported
+    );
     if (entity) {
       entities.push(entity);
 
@@ -147,11 +165,81 @@ export class PythonExtractor extends BaseExtractor {
       c.type === 'class_definition'
     );
     
+    let handlerEntity: Entity | null = null;
     if (definition) {
       if (definition.type === 'function_definition') {
-        this.extractFunction(definition, ctx, entities, relationships, parentClassStableId);
+        handlerEntity = this.extractFunction(definition, ctx, entities, relationships, parentClassStableId);
       } else if (definition.type === 'class_definition') {
         this.extractClass(definition, ctx, entities, relationships);
+      }
+    }
+
+    // Detect route decorators (@app.route('/x'), @app.get('/x')) and link
+    // each endpoint to the wrapped handler via HANDLES
+    const decorators = this.findChildrenByType(node, 'decorator');
+    for (const decorator of decorators) {
+      const call = decorator.children?.find((c: any) => c.type === 'call');
+      if (call) {
+        this.extractRouteDecorator(call, handlerEntity, ctx, entities, relationships);
+      }
+    }
+  }
+
+  private extractRouteDecorator(
+    callNode: any,
+    handlerEntity: Entity | null,
+    ctx: ExtractorContext,
+    entities: Entity[],
+    relationships: Relationship[]
+  ): void {
+    const functionNode = callNode.children?.[0];
+    if (!functionNode || functionNode.type !== 'attribute') return;
+
+    const methodNode = this.findChildrenByType(functionNode, 'identifier').pop();
+    const methodName = methodNode?.text;
+    if (!methodName) return;
+
+    // Flask/FastAPI route patterns
+    const httpMethods = ['get', 'post', 'put', 'patch', 'delete', 'route'];
+    if (!httpMethods.includes(methodName)) return;
+
+    const argsNode = callNode.children?.[1];
+    if (!argsNode || argsNode.type !== 'argument_list') return;
+
+    const pathNode = argsNode.children?.find((c: any) => c.type === 'string' || c.type === 'concatenated_string');
+    if (!pathNode) return;
+
+    const routePath = pathNode.text.replace(/['"]/g, '');
+
+    let method = 'GET';
+    if (methodName === 'post') method = 'POST';
+    else if (methodName === 'put') method = 'PUT';
+    else if (methodName === 'patch') method = 'PATCH';
+    else if (methodName === 'delete') method = 'DELETE';
+    else if (methodName === 'route') {
+      const methodArg = argsNode.children?.find((c: any) => 
+        c.type === 'keyword_argument' && c.children?.[0]?.text === 'methods'
+      );
+      if (methodArg) {
+        const methodsValue = methodArg.children?.[2]?.text?.replace(/[\[\]'"]/g, '');
+        if (methodsValue) {
+          method = methodsValue.split(',')[0].trim().toUpperCase();
+        }
+      }
+    }
+
+    const name = `${method} ${routePath}`;
+    const entity = this.createEntity(name, ctx, EntityType.API_ENDPOINT, callNode, false);
+
+    if (entity) {
+      entities.push(entity);
+
+      // Add EXPOSES relationship from file to endpoint
+      relationships.push(this.createExportRel(ctx.filePath, entity.stableId, callNode));
+
+      // HANDLES: endpoint -> wrapped handler function
+      if (handlerEntity) {
+        relationships.push(this.createHandlesRel(entity.stableId, handlerEntity.stableId, ctx.filePath, callNode));
       }
     }
   }
@@ -293,7 +381,8 @@ export class PythonExtractor extends BaseExtractor {
     const functionNode = node.children?.[0];
     if (!functionNode || functionNode.type !== 'attribute') return;
     
-    const methodName = functionNode.children?.[1]?.text;
+    const methodNode = this.findChildrenByType(functionNode, 'identifier').pop();
+    const methodName = methodNode?.text;
     if (!methodName) return;
     
     // Flask/FastAPI route patterns
@@ -336,6 +425,12 @@ export class PythonExtractor extends BaseExtractor {
       
       // Add EXPOSES relationship from file to endpoint
       relationships.push(this.createExportRel(ctx.filePath, entity.stableId, node));
+
+      // HANDLES: endpoint -> named handler (bare name, resolved later)
+      const handlerNode = argsNode.children?.find((c: any) => c.type === 'identifier');
+      if (handlerNode) {
+        relationships.push(this.createHandlesRel(entity.stableId, handlerNode.text, ctx.filePath, handlerNode));
+      }
     }
   }
 

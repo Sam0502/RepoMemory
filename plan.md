@@ -368,7 +368,7 @@ Use a three-store split:
 - Strengthen ownership and domain inference
 - Add architecture boundary validation
 
-### Phase 4 (Non-Multi-Language) ✅ M1-M4 COMPLETE
+### Phase 4 (Non-Multi-Language) ✅ M1-M5 COMPLETE
 
 **Started:** 2026-08-01
 
@@ -395,8 +395,14 @@ Use a three-store split:
 - Boundary rules over resolved edges + inferred domains; violation reporting
 - `validateBoundaries()` in `packages/analysis/src/boundaries.ts`; `GET /api/analysis/boundaries`
 
-#### 4.5 Detection Improvements
-- Fix config-entity creation bug (skipped by `shouldParseFile` gate); HANDLES relationship; wire `isTestFileByContent`; Python describe/it; model entity detection
+#### 4.5 Detection Improvements ✅
+- Config-entity bug fixed: exported `isConfigFilePath()`; config files now flow through discovery + parsing (previously gated out by `shouldParseFile`)
+- HANDLES relationship: endpoints link to handlers (named via symbol index, inline promoted to entities); added to resolver symbol-target types; already-resolved targets pass through
+- API endpoint detection fixed: `arguments` node wrapping meant TS/JS endpoints were never extracted; Python `@app.route`/`@app.get` decorators now create endpoints + HANDLES (was unreachable)
+- Python parser fixed: `PARSER_CONFIGS` missing `python` caused TS grammar load → 0 entities
+- Python describe/it: `describe_*` → TEST_SUITE, `it_*` → TEST; fixed double-extraction of decorated functions
+- Model entity detection: `EntityType.MODEL` via naming, ORM decorators, and ORM base classes
+- `isTestFileByContent` wired into `createEntity`; `isTestFile` matches Python `test_*`/`*_test` naming
 
 #### 4.6 AI & Developer Workflows
 - Confidence scoring + provenance surfacing; QA endpoints; frontend contract fixes + new views

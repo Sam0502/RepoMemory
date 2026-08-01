@@ -35,7 +35,7 @@ export abstract class BaseExtractor implements LanguageExtractor {
       startColumn: node.startPosition.column,
       endColumn: node.endPosition.column,
       isExported,
-      isTest: this.isTestFile(ctx.filePath),
+      isTest: this.isTestFile(ctx.filePath) || this.isTestFileByContent(ctx.content || ''),
       confidence: 0.9,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -206,6 +206,26 @@ export abstract class BaseExtractor implements LanguageExtractor {
     };
   }
 
+  protected createHandlesRel(
+    sourceId: string,
+    handlerName: string,
+    filePath: string,
+    node: any
+  ): Relationship {
+    const truncated = this.truncateId(handlerName);
+    return {
+      id: createHash('md5').update(`handles:${filePath}:${sourceId}:${truncated}`).digest('hex'),
+      sourceId,
+      targetId: truncated,
+      type: RelationshipType.HANDLES,
+      filePath,
+      line: node.startPosition.row + 1,
+      confidence: 0.85,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
   protected generateStableId(filePath: string, name: string, repoPath: string = ''): string {
     const input = `${repoPath}:${filePath}:${name}`;
     return createHash('md5').update(input).digest('hex');
@@ -219,11 +239,16 @@ export abstract class BaseExtractor implements LanguageExtractor {
   }
 
   protected isTestFile(filePath: string): boolean {
-    return filePath.includes('.test.') || 
-           filePath.includes('.spec.') || 
-           filePath.includes('/__tests__/') ||
-           filePath.includes('/test/') ||
-           filePath.includes('/tests/');
+    const normalized = filePath.replace(/\\/g, '/');
+    const fileName = normalized.split('/').pop() || '';
+    return normalized.includes('.test.') || 
+           normalized.includes('.spec.') || 
+           normalized.includes('/__tests__/') ||
+           normalized.includes('/test/') ||
+           normalized.includes('/tests/') ||
+           fileName.startsWith('test_') ||
+           fileName.endsWith('_test') ||
+           fileName.startsWith('test-');
   }
 
   protected isTestFunction(name: string): boolean {
@@ -255,6 +280,29 @@ export abstract class BaseExtractor implements LanguageExtractor {
       /unittest\.TestCase/,
     ];
     return testPatterns.some(pattern => pattern.test(content));
+  }
+
+  protected isModelClass(name: string, node: any): boolean {
+    const modelNamePatterns = [/Model$/i, /Dto$/i, /Record$/i, /Schema$/i, /Entity$/i, /Document$/i];
+    if (modelNamePatterns.some(pattern => pattern.test(name))) return true;
+
+    // ORM/schema decorators (TypeORM @Entity, Mongoose @Schema/@Model, etc.)
+    const decoratorRegex = /@(Entity|Schema|Table|Model|ObjectType|DataObject|Document|Collection|MappedSuperclass|Sequelize)\b/i;
+    for (const decorator of this.findChildrenByType(node, 'decorator')) {
+      if (decoratorRegex.test(decorator.text || '')) return true;
+    }
+
+    // ORM base classes (Pydantic BaseModel, Django Model, SQLAlchemy Base, ...)
+    const baseNames = new Set(['BaseModel', 'SQLModel', 'Model', 'Base', 'MappedBase', 'Document']);
+    const bases = this.findChildByType(node, 'argument_list');
+    for (const arg of bases?.children || []) {
+      if (arg.type === 'identifier' || arg.type === 'attribute' || arg.type === 'scoped_identifier') {
+        const lastSegment = (arg.text || '').split('.').pop() || arg.text;
+        if (baseNames.has(lastSegment)) return true;
+      }
+    }
+
+    return false;
   }
 
   protected isConfigFile(filePath: string): boolean {

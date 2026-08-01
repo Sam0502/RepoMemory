@@ -25,6 +25,11 @@ export const PARSER_CONFIGS: Record<string, ParserConfig> = {
     grammarKey: 'javascript',
     fileExtensions: ['.js', '.jsx', '.mjs', '.cjs'],
   },
+  python: {
+    language: Language.PYTHON,
+    grammarKey: 'python',
+    fileExtensions: ['.py', '.pyw'],
+  },
 };
 
 const LANGUAGE_EXTRACTORS: Record<string, () => LanguageExtractor> = {
@@ -54,6 +59,7 @@ export class TreeSitterParser {
     }
     // Default fallback
     if (language === Language.JAVASCRIPT) return 'javascript';
+    if (language === Language.PYTHON) return 'python';
     return 'typescript';
   }
 
@@ -89,6 +95,12 @@ export class TreeSitterParser {
       if (configEntity) {
         entities.push(configEntity);
       }
+      // Pure config files (package.json, Dockerfile, .env) aren't valid AST
+      // source; skip the tree-sitter pass. Code-based configs (vite.config.ts,
+      // jest.config.js) fall through and are parsed normally too.
+      if (!shouldParseFile(filePath)) {
+        return { filePath, language: this.language, entities, relationships, errors };
+      }
     }
 
     if (!this.tsParser) {
@@ -119,28 +131,7 @@ export class TreeSitterParser {
   }
 
   private isConfigFile(filePath: string): boolean {
-    const configPatterns = [
-      /package\.json$/,
-      /tsconfig\.json$/,
-      /\.eslintrc\./,
-      /\.prettierrc\./,
-      /webpack\.config\./,
-      /vite\.config\./,
-      /rollup\.config\./,
-      /babel\.config\./,
-      /jest\.config\./,
-      /vitest\.config\./,
-      /\.env\./,
-      /docker-compose\./,
-      /Dockerfile$/,
-      /pyproject\.toml$/,
-      /setup\.cfg$/,
-      /setup\.py$/,
-      /requirements.*\.txt$/,
-      /Cargo\.toml$/,
-      /go\.mod$/,
-    ];
-    return configPatterns.some(pattern => pattern.test(filePath));
+    return isConfigFilePath(filePath);
   }
 
   private createConfigEntity(filePath: string, repoPath: string = ''): Entity | null {
@@ -213,6 +204,31 @@ export function getGrammarKeyFromFilePath(filePath: string): string {
 export function shouldParseFile(filePath: string): boolean {
   const ext = filePath.split('.').pop()?.toLowerCase();
   return ['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'pyw'].includes(ext || '');
+}
+
+export function isConfigFilePath(filePath: string): boolean {
+  const configPatterns = [
+    /package\.json$/,
+    /tsconfig\.json$/,
+    /\.eslintrc\./,
+    /\.prettierrc\./,
+    /webpack\.config\./,
+    /vite\.config\./,
+    /rollup\.config\./,
+    /babel\.config\./,
+    /jest\.config\./,
+    /vitest\.config\./,
+    /\.env\./,
+    /docker-compose\./,
+    /Dockerfile$/,
+    /pyproject\.toml$/,
+    /setup\.cfg$/,
+    /setup\.py$/,
+    /requirements.*\.txt$/,
+    /Cargo\.toml$/,
+    /go\.mod$/,
+  ];
+  return configPatterns.some(pattern => pattern.test(filePath));
 }
 
 export function registerLanguageExtractor(language: Language, factory: () => LanguageExtractor): void {

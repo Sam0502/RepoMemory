@@ -35,6 +35,16 @@ All notable changes to RepoMemory will be documented in this file.
 - **Boundary Validation**: `validateBoundaries()` in `packages/analysis/src/boundaries.ts` reports cross-domain edges with allow/deny status against the domain config
 - **Boundaries API**: `GET /api/analysis/boundaries` returns domains (with file/entity counts), cross-domain edges, and violations
 
+### Added (M5)
+- **Config Entity Fix**: Config files (`package.json`, `tsconfig.json`, `.env`, `Dockerfile`, ...) were skipped by the `shouldParseFile` gate, so `CONFIG` entities never existed. Added exported `isConfigFilePath()` and included config files in both file discovery and parsing
+- **HANDLES Relationship**: API endpoints now link to their handlers via `HANDLES`. Named handlers resolve through the symbol index; inline arrow/function handlers are promoted to real entities with `CONTAINS` + `HANDLES` + extracted calls. `HANDLES` added to the resolver's symbol-target types, and targets that are already real stable IDs pass through untouched
+- **API Endpoint Detection Fix**: `call_expression` wraps arguments in an `arguments` node, so the old path-string lookup never matched — TypeScript/JavaScript endpoints were never extracted. Now resolved correctly; also added HANDLES to the Python decorator path (`@app.route`/`@app.get`), which was previously unreachable
+- **Python Parser Fix**: `PARSER_CONFIGS` was missing `python`, so `resolveGrammarKey` loaded the TypeScript grammar for `.py` files (0 entities). Added the Python entry and fallback
+- **Python describe/it Detection**: `describe_*` functions are `TEST_SUITE`, `it_*` are `TEST` (pytest-describe style); fixed ordering so `describe_*` isn't swallowed by `isTestFunction`
+- **Python Double-Extraction Fix**: `decorated_definition` no longer re-extracts its wrapped function/class via recursion
+- **Model Entity Detection**: New `EntityType.MODEL`; classes matching `Model`/`Dto`/`Schema`/`Record`/`Entity`/`Document` naming, ORM decorators (`@Entity`, `@Schema`, ...), or ORM base classes (`BaseModel`, `db.Model`, ...) are typed as models
+- **Test File Detection**: `isTestFileByContent` (describe/it/expect/assert patterns) is now wired into `createEntity`; `isTestFile` also matches Python naming (`test_*.py`, `*_test.py`)
+
 ## [0.4.0] - 2026-07-31
 
 ### Added

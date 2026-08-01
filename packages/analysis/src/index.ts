@@ -1,4 +1,4 @@
-export { TreeSitterParser, getLanguageFromFilePath, shouldParseFile, getGrammarKeyFromFilePath, PARSER_CONFIGS, registerLanguageExtractor } from './parser.js';
+export { TreeSitterParser, getLanguageFromFilePath, shouldParseFile, isConfigFilePath, getGrammarKeyFromFilePath, PARSER_CONFIGS, registerLanguageExtractor } from './parser.js';
 export type { ParserConfig } from './parser.js';
 export { initTreeSitter, createParser, getGrammarBytes } from './tree-sitter-init.js';
 export {

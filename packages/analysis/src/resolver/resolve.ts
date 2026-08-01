@@ -7,6 +7,7 @@ const SYMBOL_TARGET_TYPES = new Set<RelationshipType>([
   RelationshipType.REFERENCES,
   RelationshipType.EXTENDS,
   RelationshipType.IMPLEMENTS,
+  RelationshipType.HANDLES,
 ]);
 
 // Rewrites bare-name relationship targets to real entity stable IDs using a
@@ -62,6 +63,16 @@ export class RelationshipResolver {
     const sourceFilePath = this.index.fileOf(rel.sourceId);
     const name = rel.targetId;
     const metadata = (rel.metadata || {}) as Record<string, unknown>;
+
+    // Target is already a real entity stable ID (e.g. an inline handler entity) —
+    // nothing to resolve.
+    if (this.index.hasEntity(rel.targetId)) {
+      return {
+        ...rel,
+        confidence: rel.confidence,
+        metadata: { ...metadata, resolvedBy: 'symbol-index', resolutionHint: 'already-resolved' },
+      };
+    }
 
     if (!sourceFilePath) {
       return this.markUnresolved(rel, metadata, 'no-source-file', name);

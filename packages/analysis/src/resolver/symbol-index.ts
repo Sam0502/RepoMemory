@@ -90,6 +90,10 @@ export class SymbolIndex {
     return this.stableIdToFile.get(stableId) || null;
   }
 
+  hasEntity(stableId: string): boolean {
+    return this.seenStableIds.has(stableId);
+  }
+
   // Scope-aware lookup: same-file -> imported -> globally-unique -> ambiguous exported.
   lookup(name: string, sourceFilePath: string): ResolvedSymbol | null {
     const local = (this.byFile.get(sourceFilePath) || []).filter(def => def.name === name);

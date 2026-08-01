@@ -91,8 +91,9 @@ export class TypeScriptExtractor extends BaseExtractor {
 
     const name = nameNode.text;
     const isExported = this.hasExportDecorator(node);
+    const entityType = this.isModelClass(name, node) ? EntityType.MODEL : EntityType.CLASS;
 
-    const entity = this.createEntity(name, ctx, EntityType.CLASS, node, isExported);
+    const entity = this.createEntity(name, ctx, entityType, node, isExported);
     if (entity) {
       entities.push(entity);
 
@@ -421,37 +422,81 @@ export class TypeScriptExtractor extends BaseExtractor {
     entities: Entity[],
     relationships: Relationship[]
   ): void {
-    // Get the route path from the first string argument
-    const args = node.children?.filter((c: any) => c.type !== 'identifier' && c.type !== 'arrow_function' && c.type !== 'function') || [];
-    const pathNode = args.find((c: any) => c.type === 'string' || c.type === 'template_string');
-    
-    if (!pathNode) return;
-    
-    const routePath = pathNode.text.replace(/['"]/g, '');
-    
-    // Get the HTTP method from the callee
-    const callee = node.children?.[0];
+    const children = node.children || [];
+    const callee = children[0];
     if (!callee) return;
-    
+
     const calleeText = callee.text;
+
+    // Route arguments are wrapped in an `arguments` node in TS/JS.
+    const argsNode = children.find((c: any) => c.type === 'arguments');
+    const args = argsNode ? (argsNode.children || []) : children;
+
+    // Get the route path from the first string argument
+    const pathNode = args.find((c: any) => c.type === 'string' || c.type === 'template_string');
+    if (!pathNode) return;
+
+    const routePath = pathNode.text.replace(/['"]/g, '');
+
     let method = 'GET';
-    
+
     if (calleeText.includes('.post')) method = 'POST';
     else if (calleeText.includes('.put')) method = 'PUT';
     else if (calleeText.includes('.patch')) method = 'PATCH';
     else if (calleeText.includes('.delete')) method = 'DELETE';
     else if (calleeText.includes('.all')) method = 'ALL';
     else if (calleeText.includes('.use')) method = 'MIDDLEWARE';
-    
+
     const name = `${method} ${routePath}`;
     const entity = this.createEntity(name, ctx, EntityType.API_ENDPOINT, node, false);
-    
+
     if (entity) {
       entities.push(entity);
-      
+
       // Add EXPOSES relationship from file to endpoint
       relationships.push(this.createExportRel(ctx.filePath, entity.stableId, node));
+
+      // HANDLES relationship to the handler (named symbol or inline function)
+      const handlerNode = args.find(
+        (c: any) =>
+          c.type === 'arrow_function' ||
+          c.type === 'function' ||
+          c.type === 'function_expression' ||
+          c.type === 'identifier'
+      );
+      this.extractRouteHandler(entity, handlerNode, ctx, entities, relationships);
     }
+  }
+
+  private extractRouteHandler(
+    endpointEntity: Entity,
+    handlerNode: any,
+    ctx: ExtractorContext,
+    entities: Entity[],
+    relationships: Relationship[]
+  ): void {
+    if (!handlerNode) return;
+
+    if (handlerNode.type === 'identifier') {
+      // Named handler: bare-name target, resolved to a real stable ID later
+      relationships.push(this.createHandlesRel(endpointEntity.stableId, handlerNode.text, ctx.filePath, handlerNode));
+      return;
+    }
+
+    // Inline function: promote it to a real entity so the endpoint's body is traceable
+    const handlerEntity = this.createEntity(
+      `${endpointEntity.name} handler`,
+      ctx,
+      EntityType.FUNCTION,
+      handlerNode,
+      false
+    );
+    if (!handlerEntity) return;
+
+    entities.push(handlerEntity);
+    relationships.push(this.createContainsRel(endpointEntity.stableId, handlerEntity.stableId, ctx.filePath, handlerNode));
+    relationships.push(this.createHandlesRel(endpointEntity.stableId, handlerEntity.stableId, ctx.filePath, handlerNode));
+    this.extractCallsFromNode(handlerNode, handlerEntity.stableId, ctx, relationships);
   }
 
   private extractTestBlock(

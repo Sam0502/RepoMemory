@@ -3,7 +3,7 @@ import { GraphClient } from '@repo-memory/graph';
 import { EntityRepository, RelationshipRepository, CommitRepository, migrate, createPool } from '@repo-memory/storage';
 import { GitOperations } from '@repo-memory/ingestion';
 import {
-  TreeSitterParser, getLanguageFromFilePath, shouldParseFile,
+  TreeSitterParser, getLanguageFromFilePath, shouldParseFile, isConfigFilePath,
   configureEmbeddings, generateEntityEmbedding, getProviderName,
   SymbolIndex, RelationshipResolver, createFileEntity, detectDeadCode,
   applyDomainMetadata, parseDomainConfig
@@ -340,7 +340,8 @@ export class Orchestrator {
   }
 
   private async parseFile(filePath: string): Promise<ParseResult | null> {
-    if (!shouldParseFile(filePath)) {
+    const isConfig = isConfigFilePath(filePath);
+    if (!shouldParseFile(filePath) && !isConfig) {
       return null;
     }
     
@@ -481,7 +482,7 @@ export class Orchestrator {
         
         const subFiles = await this.getSourceFiles(fullPath);
         files.push(...subFiles);
-      } else if (entry.isFile() && shouldParseFile(entry.name)) {
+      } else if (entry.isFile() && (shouldParseFile(entry.name) || isConfigFilePath(entry.name))) {
         files.push(fullPath);
       }
     }

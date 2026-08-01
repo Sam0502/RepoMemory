@@ -15,6 +15,7 @@ export const EntityType = {
   TEST_SUITE: 'TestSuite',
   CONFIG: 'Config',
   MODULE: 'Module',
+  MODEL: 'Model',
   VARIABLE: 'Variable',
   TYPE_ALIAS: 'TypeAlias',
 } as const;

@@ -4,6 +4,8 @@ A repository-scale memory engine that scans source code, extracts structural and
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
+**New here? Start with the [System Overview](docs/system-overview.md)** — a plain-English guide to how RepoMemory works, no coding knowledge required.
+
 ## What It Does
 
 RepoMemory parses your codebase, builds a knowledge graph of entities (classes, functions, interfaces, etc.) and their relationships, and lets you explore the structure through:

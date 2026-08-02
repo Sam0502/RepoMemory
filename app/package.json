@@ -18,7 +18,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "dev": "tsx watch src/cli.ts serve",
-    "start": "node dist/cli.js serve"
+    "start": "node dist/cli.js serve",
+    "bench": "tsx src/bench.ts"
   },
   "dependencies": {
     "@repo-memory/shared": "workspace:*",

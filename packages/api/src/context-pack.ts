@@ -1,4 +1,4 @@
-import { Entity, ContextPack } from '@repo-memory/shared';
+import { ContextPack } from '@repo-memory/shared';
 import { EntityRepository, CommitRepository } from '@repo-memory/storage';
 import { GraphClient } from '@repo-memory/graph';
 

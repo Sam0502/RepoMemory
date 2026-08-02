@@ -4,11 +4,14 @@ import { Command } from 'commander';
 import { Orchestrator } from './orchestrator.js';
 import { startServer } from '@repo-memory/api';
 import { GraphClient } from '@repo-memory/graph';
-import { createPool, EntityRepository, RelationshipRepository } from '@repo-memory/storage';
-import { detectDeadCode } from '@repo-memory/analysis';
-import { RelationshipType } from '@repo-memory/shared';
+import { createPool, EntityRepository, RelationshipRepository, migrate } from '@repo-memory/storage';
+import { streamDeadCode } from '@repo-memory/analysis';
+import { RelationshipType, getLogger } from '@repo-memory/shared';
+import type { ScanReport } from '@repo-memory/shared';
 import { resolve } from 'path';
 import type { EmbeddingConfig } from '@repo-memory/analysis';
+
+const logger = getLogger({ component: 'cli' });
 
 const DB_CONFIG = {
   host: 'localhost',
@@ -58,24 +61,52 @@ program
     try {
       await orchestrator.initialize();
 
+      let report: ScanReport;
       if (options.full) {
-        await orchestrator.scanFullRepository();
+        report = await orchestrator.scanFullRepository();
       } else if (options.incremental) {
-        await orchestrator.scanIncremental();
+        report = await orchestrator.scanIncremental();
       } else if (options.commit) {
-        await orchestrator.scanFromCommit(options.commit);
+        report = await orchestrator.scanFromCommit(options.commit);
       } else if (options.workingTree) {
-        await orchestrator.scanWorkingTree();
+        report = await orchestrator.scanWorkingTree();
       } else {
-        await orchestrator.scanIncremental();
+        report = await orchestrator.scanIncremental();
       }
+      printScanReport(report);
     } catch (error) {
-      console.error('Scan failed:', error);
+      logger.error({ err: error }, 'Scan failed');
       process.exit(1);
     } finally {
       await orchestrator.close();
     }
   });
+
+function printScanReport(report: ScanReport): void {
+  console.log(`Scan completed in ${report.totalDurationMs}ms`);
+  console.log(
+    `  Type: ${report.scanType}${report.commit ? ` | Commit: ${report.commit}` : ''} | Repo: ${report.repoPath}`
+  );
+  console.log(
+    `  Files discovered: ${report.filesDiscovered} | Parsed: ${report.filesParsed} | ` +
+    `Entities: ${report.entitiesExtracted} | Relationships: ${report.relationshipsExtracted} | ` +
+    `Embeddings: ${report.embeddingsGenerated}`
+  );
+  console.log(
+    `  Stored: ${report.entitiesStored} entities, ${report.relationshipsStored} relationships`
+  );
+  if (report.phases.length > 0) {
+    const nameWidth = Math.max(...report.phases.map(p => p.name.length));
+    console.log('  Phases:');
+    for (const phase of report.phases) {
+      console.log(
+        `    ${phase.name.padEnd(nameWidth)}  ${phase.durationMs}ms` +
+        (phase.entityCount ? `  entities: ${phase.entityCount}` : '') +
+        (phase.relationshipCount ? `  relationships: ${phase.relationshipCount}` : '')
+      );
+    }
+  }
+}
 
 program
   .command('query')
@@ -96,23 +127,21 @@ program
           const results = await entityRepo.search(args.join(' '));
           console.log(JSON.stringify(results, null, 2));
         } else {
-          const entities: any[] = [];
-          const limit = 5000;
-          let offset = 0;
-          while (true) {
-            const batch = await entityRepo.findAll(limit, offset);
-            entities.push(...batch);
-            if (batch.length < limit) break;
-            offset += limit;
-          }
-          const relationships: any[] = [];
-          for (const t of [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS]) {
-            relationships.push(...(await relationshipRepo.findByType(t)));
-          }
-          console.log(JSON.stringify(detectDeadCode(entities, relationships), null, 2));
+          const report = await streamDeadCode(
+            { page: (offset, limit) => entityRepo.findAll(limit, offset) },
+            {
+              page: (offset, limit) =>
+                relationshipRepo.findByTypesPaged(
+                  [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS],
+                  limit,
+                  offset
+                ),
+            }
+          );
+          console.log(JSON.stringify(report, null, 2));
         }
       } catch (error) {
-        console.error('Workspace query failed:', error);
+        logger.error({ err: error }, 'Workspace query failed');
         process.exit(1);
       } finally {
         await pool.end();
@@ -178,7 +207,7 @@ program
         case 'risk': {
           const id = args[0];
           if (!id) {
-            console.error('Usage: repo-memory query risk <stableId>');
+            logger.error('Usage: repo-memory query risk <stableId>');
             process.exit(1);
           }
           const risk = await orchestrator.getRisk(id);
@@ -186,11 +215,11 @@ program
           break;
         }
         default:
-          console.error(`Unknown query type: ${type}`);
+          logger.error(`Unknown query type: ${type}`);
           process.exit(1);
       }
     } catch (error) {
-      console.error('Query failed:', error);
+      logger.error({ err: error }, 'Query failed');
       process.exit(1);
     } finally {
       await orchestrator.close();
@@ -203,7 +232,7 @@ program
   .argument('<type>', 'Query type: repos')
   .action(async (type) => {
     if (type !== 'repos') {
-      console.error(`Unknown workspace query type: ${type}`);
+      logger.error(`Unknown workspace query type: ${type}`);
       process.exit(1);
     }
 
@@ -234,7 +263,42 @@ program
         );
       }
     } catch (error) {
-      console.error('Workspace query failed:', error);
+      logger.error({ err: error }, 'Workspace query failed');
+      process.exit(1);
+    } finally {
+      await pool.end();
+    }
+  });
+
+program
+  .command('db')
+  .description('Database operations')
+  .argument('<action>', 'Action: migrate')
+  .action(async (action) => {
+    if (action !== 'migrate') {
+      logger.error(`Unknown db action: ${action}. Available: migrate`);
+      process.exit(1);
+    }
+
+    const pool = await createPool({
+      host: process.env.PG_HOST || 'localhost',
+      port: parseInt(process.env.PG_PORT || '5433', 10),
+      database: process.env.PG_DATABASE || 'repo_memory',
+      user: process.env.PG_USER || 'repo_memory',
+      password: process.env.PG_PASSWORD || 'repo-memory-password',
+    });
+    try {
+      const applied = await migrate(pool);
+      if (applied.length === 0) {
+        console.log('Database schema is up to date (0 pending migrations).');
+      } else {
+        for (const migration of applied) {
+          console.log(`  Applied migration ${migration.id}-${migration.name}`);
+        }
+        console.log(`Applied ${applied.length} pending migration(s).`);
+      }
+    } catch (error) {
+      logger.error({ err: error }, 'Migration failed');
       process.exit(1);
     } finally {
       await pool.end();
@@ -252,7 +316,7 @@ program
     const port = parseInt(options.port);
     const host = options.host;
 
-    console.log(`Starting API server for repository: ${repoPath}`);
+    logger.info({ repoPath }, 'Starting API server');
 
     // Initialize orchestrator for database connections
     const orchestrator = new Orchestrator({ repoPath, embeddings: getEmbeddingConfig() });
@@ -274,7 +338,50 @@ program
       repoPath,
       graphClient,
       pgPool,
+      logger,
+      runJob: (type, repoPath) => orchestrator.runJob(type, repoPath),
     }, resolve(process.cwd(), 'web'));
+  });
+
+program
+  .command('jobs')
+  .description('Run reconciliation & repair jobs (verify / repair)')
+  .argument('<action>', 'Job: verify, repair')
+  .option('-r, --repo <path>', 'Repository path', process.cwd())
+  .option('-a, --all-repos', 'Run the job against every scanned repository', false)
+  .action(async (action, options) => {
+    if (action !== 'verify' && action !== 'repair') {
+      logger.error(`Unknown job: ${action}. Available: verify, repair`);
+      process.exit(1);
+    }
+
+    const orchestrator = new Orchestrator({
+      repoPath: resolve(options.repo),
+      embeddings: getEmbeddingConfig(),
+    });
+
+    try {
+      await orchestrator.initialize();
+      const targets = options.allRepos ? await orchestrator.listScannedRepos() : [resolve(options.repo)];
+      for (const target of targets) {
+        const job = await orchestrator.runJob(action, target);
+        console.log(JSON.stringify({
+          jobId: job.id,
+          type: job.type,
+          status: job.status,
+          repoPath: job.repositoryPath,
+          result: job.result,
+          error: job.error,
+          createdAt: job.createdAt,
+          completedAt: job.completedAt,
+        }, null, 2));
+      }
+    } catch (error) {
+      logger.error({ err: error }, 'Job failed');
+      process.exit(1);
+    } finally {
+      await orchestrator.close();
+    }
   });
 
 program
@@ -298,7 +405,7 @@ program
       console.log(`  Total entities: ${totalEntities}`);
       console.log(`  Repository path: ${options.repo}`);
     } catch (error) {
-      console.error('Failed to get stats:', error);
+      logger.error({ err: error }, 'Failed to get stats');
       process.exit(1);
     } finally {
       await orchestrator.close();

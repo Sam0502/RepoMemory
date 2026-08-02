@@ -1,4 +1,4 @@
-import { Language, ParseResult, Entity, Relationship, EntityType, RelationshipType } from '@repo-memory/shared';
+import { Language, ParseResult, Entity, Relationship, EntityType } from '@repo-memory/shared';
 import { initTreeSitter, createParser, getGrammarBytes } from './tree-sitter-init.js';
 import { LanguageExtractor, ExtractorContext, TypeScriptExtractor, JavaScriptExtractor, PythonExtractor } from './extractors/index.js';
 import { createHash } from 'crypto';

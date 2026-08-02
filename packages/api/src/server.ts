@@ -2,13 +2,15 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { GraphClient } from '@repo-memory/graph';
-import { EntityRepository, RelationshipRepository, CommitRepository } from '@repo-memory/storage';
-import { detectDeadCode, validateBoundaries, parseDomainConfig, ChangeAnalyzer } from '@repo-memory/analysis';
+import { EntityRepository, RelationshipRepository, CommitRepository, JobRepository } from '@repo-memory/storage';
+import { parseDomainConfig, ChangeAnalyzer, streamDeadCode, streamBoundaries, resolveBatchSize } from '@repo-memory/analysis';
 import type { DomainConfig } from '@repo-memory/analysis';
-import { Entity, Relationship, RelationshipType } from '@repo-memory/shared';
+import { Entity, Relationship, RelationshipType, JobType, getLogger, metrics, registerDefaultMetrics } from '@repo-memory/shared';
+import type { Logger, Job } from '@repo-memory/shared';
 import { Pool } from 'pg';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { randomUUID } from 'crypto';
 import { ContextPackBuilder } from './context-pack.js';
 import { QaService } from './qa.js';
 
@@ -18,13 +20,20 @@ export interface ApiConfig {
   repoPath: string;
   graphClient: GraphClient;
   pgPool: Pool;
+  logger?: Logger;
+  // Optional job runner (wired from the CLI's initialized orchestrator). When
+  // absent, the POST job endpoints respond 501 but job history stays readable.
+  runJob?: (type: JobType, repoPath?: string) => Promise<Job>;
 }
 
 export function createApp(config: ApiConfig, webDir?: string): Hono {
   const app = new Hono();
+  const log = config.logger || getLogger({ component: 'api', repoPath: config.repoPath });
+  registerDefaultMetrics();
   const entityRepo = new EntityRepository(config.pgPool, config.repoPath);
   const relationshipRepo = new RelationshipRepository(config.pgPool, config.repoPath);
   const commitRepo = new CommitRepository(config.pgPool, config.repoPath);
+  const jobRepo = new JobRepository(config.pgPool);
   const qaService = new QaService(entityRepo, relationshipRepo, commitRepo, config.graphClient, config.pgPool, false, config.repoPath);
 
   // Unfiltered repositories for workspace-wide (cross-repo) queries.
@@ -40,38 +49,96 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     repoPath && repoPath !== 'all' ? new EntityRepository(config.pgPool, repoPath) : workspaceEntityRepo;
 
   // --- Change analysis (churn / risk / drift) ------------------------------
-  const loadAllEntities = async (repoPath: string): Promise<Entity[]> => {
-    const repo = new EntityRepository(config.pgPool, repoPath);
-    const entities: Entity[] = [];
-    const limit = 5000;
-    let offset = 0;
-    while (true) {
-      const batch = await repo.findAll(limit, offset);
-      entities.push(...batch);
-      if (batch.length < limit) break;
-      offset += limit;
-    }
-    return entities;
-  };
-
-  const loadAllRelationships = async (repoPath: string): Promise<Relationship[]> => {
-    const repo = new RelationshipRepository(config.pgPool, repoPath);
-    const rels: Relationship[] = [];
-    for (const type of [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS, RelationshipType.HANDLES]) {
-      rels.push(...(await repo.findByType(type)));
-    }
-    return rels;
-  };
-
-  const changeAnalyzerFor = (repoPath: string): ChangeAnalyzer =>
+  // Paged access so the streaming analysis paths keep only one window of each
+  // store in memory regardless of repo size.
+  const changeAnalyzerFor = (_repoPath: string): ChangeAnalyzer =>
     new ChangeAnalyzer({
       fileChurnRows: (p, days) => new CommitRepository(config.pgPool, p).getFileChurn(p, 100000, days),
-      entities: loadAllEntities,
-      relationships: loadAllRelationships,
+      entityPage: (p, offset, limit) => new EntityRepository(config.pgPool, p).findAll(limit, offset),
+      relationshipPage: (p, offset, limit) =>
+        new RelationshipRepository(config.pgPool, p).findByTypesPaged(
+          [
+            RelationshipType.CALLS,
+            RelationshipType.REFERENCES,
+            RelationshipType.IMPORTS,
+            RelationshipType.EXTENDS,
+            RelationshipType.IMPLEMENTS,
+            RelationshipType.HANDLES,
+          ],
+          limit,
+          offset
+        ),
+      entityByStableId: (p, stableId) => new EntityRepository(config.pgPool, p).findByStableId(stableId),
+      entities: async (repoPath) => {
+        const repo = new EntityRepository(config.pgPool, repoPath);
+        const entities: Entity[] = [];
+        const limit = resolveBatchSize();
+        let offset = 0;
+        while (true) {
+          const batch = await repo.findAll(limit, offset);
+          entities.push(...batch);
+          if (batch.length < limit) break;
+          offset += limit;
+        }
+        return entities;
+      },
+      relationships: async (repoPath) => {
+        const repo = new RelationshipRepository(config.pgPool, repoPath);
+        const rels: Relationship[] = [];
+        const limit = resolveBatchSize();
+        let offset = 0;
+        while (true) {
+          const batch = await repo.findByTypesPaged(
+            [
+              RelationshipType.CALLS,
+              RelationshipType.REFERENCES,
+              RelationshipType.IMPORTS,
+              RelationshipType.EXTENDS,
+              RelationshipType.IMPLEMENTS,
+              RelationshipType.HANDLES,
+            ],
+            limit,
+            offset
+          );
+          rels.push(...batch);
+          if (batch.length < limit) break;
+          offset += limit;
+        }
+        return rels;
+      },
       lastCommitDate: (p) => new CommitRepository(config.pgPool, p).getLastCommitDate(p),
     });
 
   const changeAnalyzer = changeAnalyzerFor(config.repoPath);
+
+  // Request logging + metrics: capture method/path/status/duration and correlate
+  // logs via X-Request-Id. Runs first so it also measures CORS + static serving.
+  const isApiRequest = (path: string): boolean =>
+    path.startsWith('/api/') || path === '/health' || path === '/metrics';
+
+  app.use('*', async (c, next) => {
+    const requestId = c.req.header('x-request-id') || randomUUID();
+    c.header('X-Request-Id', requestId);
+
+    const start = performance.now();
+    await next();
+    const durationMs = performance.now() - start;
+    const status = c.res.status || 404;
+
+    metrics.inc('repo_memory_api_requests_total', {
+      method: c.req.method,
+      path: c.req.path,
+      status: String(status),
+    });
+    metrics.observe('repo_memory_api_request_duration_seconds', durationMs / 1000);
+
+    const fields = { requestId, method: c.req.method, path: c.req.path, status, durationMs };
+    if (isApiRequest(c.req.path)) {
+      log.info(fields, 'request completed');
+    } else {
+      log.debug(fields, 'request completed');
+    }
+  });
 
   // CORS for frontend
   app.use('*', async (c, next) => {
@@ -93,6 +160,16 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   app.get('/health', (c) => {
     return c.json({ status: 'ok', timestamp: new Date().toISOString() });
   });
+
+  // Prometheus metrics (disable with METRICS_ENABLED=false)
+  if ((process.env.METRICS_ENABLED ?? 'true') !== 'false') {
+    app.get('/metrics', (c) => {
+      registerDefaultMetrics();
+      return c.text(metrics.render(), 200, {
+        'Content-Type': 'text/plain; version=0.0.4; charset=utf-8',
+      });
+    });
+  }
 
   // Entity endpoints
   app.get('/api/entities', async (c) => {
@@ -395,26 +472,23 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     });
   });
 
-  // Dead code detection
+  // Dead code detection (streamed in windows; ?batchSize= tunes page size)
   app.get('/api/analysis/dead-code', async (c) => {
     const includeExported = c.req.query('includeExported') === 'true';
+    const batchSize = parseInt(c.req.query('batchSize') || String(resolveBatchSize()));
 
-    const entities: Entity[] = [];
-    const limit = 10000;
-    let offset = 0;
-    while (true) {
-      const batch = await entityRepo.findAll(limit, offset);
-      entities.push(...batch);
-      if (batch.length < limit) break;
-      offset += limit;
-    }
-
-    const relationships: Relationship[] = [];
-    for (const type of [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS]) {
-      relationships.push(...(await relationshipRepo.findByType(type)));
-    }
-
-    const report = detectDeadCode(entities, relationships);
+    const report = await streamDeadCode(
+      { page: (offset, limit) => entityRepo.findAll(limit, offset) },
+      {
+        page: (offset, limit) =>
+          relationshipRepo.findByTypesPaged(
+            [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS],
+            limit,
+            offset
+          ),
+      },
+      { batchSize }
+    );
     return c.json(includeExported ? report : { ...report, exportedButUnused: [] });
   });
 
@@ -446,22 +520,9 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     });
   });
 
-  // Architecture boundary validation
+  // Architecture boundary validation (streamed in windows; ?batchSize= tunes page size)
   app.get('/api/analysis/boundaries', async (c) => {
-    const entities: Entity[] = [];
-    const limit = 10000;
-    let offset = 0;
-    while (true) {
-      const batch = await entityRepo.findAll(limit, offset);
-      entities.push(...batch);
-      if (batch.length < limit) break;
-      offset += limit;
-    }
-
-    const relationships: Relationship[] = [];
-    for (const type of [RelationshipType.IMPORTS, RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS]) {
-      relationships.push(...(await relationshipRepo.findByType(type)));
-    }
+    const batchSize = parseInt(c.req.query('batchSize') || String(resolveBatchSize()));
 
     let domainConfig: DomainConfig | undefined;
     try {
@@ -471,7 +532,19 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
       domainConfig = undefined;
     }
 
-    const report = validateBoundaries(entities, relationships, domainConfig);
+    const report = await streamBoundaries(
+      { page: (offset, limit) => entityRepo.findAll(limit, offset) },
+      {
+        page: (offset, limit) =>
+          relationshipRepo.findByTypesPaged(
+            [RelationshipType.IMPORTS, RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS],
+            limit,
+            offset
+          ),
+      },
+      domainConfig,
+      { batchSize }
+    );
     return c.json(report);
   });
 
@@ -512,6 +585,46 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     }
     const answer = await qaService.ask(question);
     return c.json(answer);
+  });
+
+  // --- Reconciliation & repair jobs (5.4) -----------------------------------
+
+  app.get('/api/jobs', async (c) => {
+    const limit = parseInt(c.req.query('limit') || '50');
+    const type = c.req.query('type');
+    const jobs = type
+      ? await jobRepo.findByType(type as any, limit)
+      : await jobRepo.findAll(limit);
+    return c.json({ jobs });
+  });
+
+  app.get('/api/jobs/:id', async (c) => {
+    const job = await jobRepo.findById(c.req.param('id'));
+    if (!job) {
+      return c.json({ error: 'Job not found' }, 404);
+    }
+    return c.json(job);
+  });
+
+  // POST job endpoints run synchronously and return the completed job (its
+  // `result` carries the VerificationReport / RepairReport). Requires a wired
+  // `runJob` callback (the CLI's `serve` command provides one).
+  app.post('/api/jobs/verify', async (c) => {
+    if (!config.runJob) {
+      return c.json({ error: 'Job runner not available' }, 501);
+    }
+    const body: { repoPath?: string } = await c.req.json().catch(() => ({}));
+    const job = await config.runJob(JobType.VERIFY, body.repoPath || config.repoPath);
+    return c.json(job);
+  });
+
+  app.post('/api/jobs/repair', async (c) => {
+    if (!config.runJob) {
+      return c.json({ error: 'Job runner not available' }, 501);
+    }
+    const body: { repoPath?: string } = await c.req.json().catch(() => ({}));
+    const job = await config.runJob(JobType.REPAIR, body.repoPath || config.repoPath);
+    return c.json(job);
   });
 
   // --- Workspace (cross-repo) endpoints -------------------------------------
@@ -659,15 +772,16 @@ let graphClient: GraphClient;
 export function startServer(config: ApiConfig, webDir?: string): void {
   graphClient = config.graphClient;
   const app = createApp(config, webDir);
+  const log = config.logger || getLogger({ component: 'api', repoPath: config.repoPath });
 
   serve({
     fetch: app.fetch,
     port: config.port,
     hostname: config.host,
   }, (info) => {
-    console.log(`API server running at http://${config.host}:${info.port}`);
+    log.info({ url: `http://${config.host}:${info.port}` }, 'API server running');
     if (webDir) {
-      console.log(`Frontend available at http://${config.host}:${info.port}/`);
+      log.info({ url: `http://${config.host}:${info.port}/` }, 'Frontend available');
     }
   });
 }

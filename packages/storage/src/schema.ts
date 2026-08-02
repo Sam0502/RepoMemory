@@ -1,212 +1,24 @@
 import { Pool } from 'pg';
+import { MigrationRunner } from './migrations/runner.js';
+import { migrations } from './migrations/index.js';
+import type { MigrationResult } from './migrations/runner.js';
+import { getLogger } from '@repo-memory/shared';
 
-const SCHEMA_SQL = `
--- Enable UUID extension
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+const logger = getLogger({ component: 'storage' });
 
--- Enable pgvector extension
-CREATE EXTENSION IF NOT EXISTS vector;
-
--- Entities table
-CREATE TABLE IF NOT EXISTS entities (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  repo_path VARCHAR(1000) NOT NULL DEFAULT '',
-  stable_id VARCHAR(255) NOT NULL UNIQUE,
-  name VARCHAR(500) NOT NULL,
-  type VARCHAR(50) NOT NULL,
-  language VARCHAR(50) NOT NULL,
-  file_path VARCHAR(1000) NOT NULL,
-  start_line INTEGER NOT NULL,
-  end_line INTEGER NOT NULL,
-  start_column INTEGER NOT NULL,
-  end_column INTEGER NOT NULL,
-  signature TEXT,
-  docstring TEXT,
-  purpose TEXT,
-  responsibility TEXT,
-  domain VARCHAR(255),
-  architectural_role VARCHAR(255),
-  is_exported BOOLEAN DEFAULT FALSE,
-  is_test BOOLEAN DEFAULT FALSE,
-  confidence FLOAT DEFAULT 1.0,
-  first_seen_commit VARCHAR(40),
-  last_seen_commit VARCHAR(40),
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Relationships table
-CREATE TABLE IF NOT EXISTS relationships (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  repo_path VARCHAR(1000) NOT NULL DEFAULT '',
-  source_id VARCHAR(1000) NOT NULL,
-  target_id VARCHAR(1000) NOT NULL,
-  type VARCHAR(50) NOT NULL,
-  file_path VARCHAR(1000) NOT NULL,
-  line INTEGER,
-  confidence FLOAT DEFAULT 1.0,
-  metadata JSONB,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  UNIQUE(repo_path, source_id, target_id, type, file_path)
-);
-
--- Commits table
-CREATE TABLE IF NOT EXISTS commits (
-  hash VARCHAR(40) PRIMARY KEY,
-  repo_path VARCHAR(1000) NOT NULL DEFAULT '',
-  message TEXT NOT NULL,
-  author VARCHAR(255) NOT NULL,
-  date TIMESTAMP WITH TIME ZONE NOT NULL,
-  files_changed JSONB DEFAULT '[]'::JSONB,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- File changes table
-CREATE TABLE IF NOT EXISTS file_changes (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  commit_hash VARCHAR(40) NOT NULL REFERENCES commits(hash) ON DELETE CASCADE,
-  file_path VARCHAR(1000) NOT NULL,
-  additions INTEGER DEFAULT 0,
-  deletions INTEGER DEFAULT 0,
-  status VARCHAR(20) NOT NULL,
-  old_path VARCHAR(1000),
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Jobs table for tracking ingestion jobs
-CREATE TABLE IF NOT EXISTS jobs (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  type VARCHAR(50) NOT NULL,
-  status VARCHAR(20) NOT NULL DEFAULT 'pending',
-  repository_path VARCHAR(1000) NOT NULL,
-  commit_hash VARCHAR(40),
-  files_to_process JSONB DEFAULT '[]'::JSONB,
-  result JSONB,
-  error TEXT,
-  started_at TIMESTAMP WITH TIME ZONE,
-  completed_at TIMESTAMP WITH TIME ZONE,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Repo state table for tracking incremental scans
-CREATE TABLE IF NOT EXISTS repo_state (
-  repo_path VARCHAR(1000) PRIMARY KEY,
-  last_commit_hash VARCHAR(40),
-  last_scan_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Add repo_path column to existing installs (safe migration)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'entities' AND column_name = 'repo_path'
-  ) THEN
-    ALTER TABLE entities ADD COLUMN repo_path VARCHAR(1000) NOT NULL DEFAULT '';
-  END IF;
-END $$;
-
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'relationships' AND column_name = 'repo_path'
-  ) THEN
-    ALTER TABLE relationships ADD COLUMN repo_path VARCHAR(1000) NOT NULL DEFAULT '';
-  END IF;
-END $$;
-
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'commits' AND column_name = 'repo_path'
-  ) THEN
-    ALTER TABLE commits ADD COLUMN repo_path VARCHAR(1000) NOT NULL DEFAULT '';
-  END IF;
-END $$;
-
--- Replace old non-repo-scoped unique constraint on relationships with repo-scoped one
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conname = 'relationships_source_id_target_id_type_file_path_key'
-  ) THEN
-    ALTER TABLE relationships DROP CONSTRAINT relationships_source_id_target_id_type_file_path_key;
-  END IF;
-END $$;
-
--- Ensure repo-scoped unique constraint exists (used by ON CONFLICT upsert)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conname = 'relationships_repo_path_source_id_target_id_type_file_path_key'
-  ) THEN
-    ALTER TABLE relationships
-      ADD CONSTRAINT relationships_repo_path_source_id_target_id_type_file_path_key
-      UNIQUE (repo_path, source_id, target_id, type, file_path);
-  END IF;
-END $$;
-
--- Indexes
-CREATE INDEX IF NOT EXISTS idx_entities_stable_id ON entities(stable_id);
-CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
-CREATE INDEX IF NOT EXISTS idx_entities_language ON entities(language);
-CREATE INDEX IF NOT EXISTS idx_entities_file_path ON entities(file_path);
-CREATE INDEX IF NOT EXISTS idx_entities_repo_path ON entities(repo_path);
-CREATE INDEX IF NOT EXISTS idx_relationships_source ON relationships(source_id);
-CREATE INDEX IF NOT EXISTS idx_relationships_target ON relationships(target_id);
-CREATE INDEX IF NOT EXISTS idx_relationships_type ON relationships(type);
-CREATE INDEX IF NOT EXISTS idx_relationships_repo_path ON relationships(repo_path);
-CREATE INDEX IF NOT EXISTS idx_file_changes_commit ON file_changes(commit_hash);
-CREATE INDEX IF NOT EXISTS idx_file_changes_file ON file_changes(file_path);
-CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(type);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_file_changes_unique ON file_changes(commit_hash, file_path);
-
--- Add embedding column to existing entities table (safe for new installs)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'entities' AND column_name = 'embedding'
-  ) THEN
-    ALTER TABLE entities ADD COLUMN embedding vector(768);
-  END IF;
-END $$;
-
--- Increase relationship ID column sizes for existing installs (safe migration)
-DO $$
-BEGIN
-  -- Increase source_id and target_id to VARCHAR(1000) if currently smaller
-  IF EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'relationships' AND column_name = 'source_id'
-    AND character_maximum_length < 1000
-  ) THEN
-    ALTER TABLE relationships ALTER COLUMN source_id TYPE VARCHAR(1000);
-  END IF;
-  
-  IF EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'relationships' AND column_name = 'target_id'
-    AND character_maximum_length < 1000
-  ) THEN
-    ALTER TABLE relationships ALTER COLUMN target_id TYPE VARCHAR(1000);
-  END IF;
-END $$;
-
--- Embedding index (cosine similarity) - using hnsw for better performance
-CREATE INDEX IF NOT EXISTS idx_entities_embedding ON entities USING hnsw (embedding vector_cosine_ops);
-`;
-
-export async function migrate(pool: Pool): Promise<void> {
-  console.log('Running database migration...');
-  await pool.query(SCHEMA_SQL);
-  console.log('Database migration completed.');
+export async function migrate(pool: Pool): Promise<MigrationResult[]> {
+  logger.info('Running database migrations...');
+  const runner = new MigrationRunner(pool, migrations);
+  const applied = await runner.run();
+  if (applied.length === 0) {
+    logger.info('Database schema is up to date.');
+  } else {
+    for (const migration of applied) {
+      logger.info({ migration: `${migration.id}-${migration.name}` }, 'Applied migration');
+    }
+  }
+  logger.info('Database migration completed.');
+  return applied;
 }
 
 export async function createPool(config: {
@@ -217,15 +29,15 @@ export async function createPool(config: {
   password: string;
 }): Promise<Pool> {
   const pool = new Pool(config);
-  
+
   // Test connection
   try {
     await pool.query('SELECT 1');
-    console.log('Database connection successful.');
+    logger.info('Database connection successful.');
   } catch (error) {
-    console.error('Database connection failed:', error);
+    logger.error({ err: error }, 'Database connection failed');
     throw error;
   }
-  
+
   return pool;
 }

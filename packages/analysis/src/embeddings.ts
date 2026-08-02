@@ -6,6 +6,10 @@ import {
   PlaceholderEmbeddingProvider,
 } from './embedding/index.js';
 import { normalizeToDimensions, TARGET_DIMENSIONS } from './embedding/normalize.js';
+import { getLogger, metrics, registerDefaultMetrics } from '@repo-memory/shared';
+
+const logger = getLogger({ component: 'embeddings' });
+registerDefaultMetrics();
 
 let currentProvider: EmbeddingProvider | null = null;
 let fallbackProvider: EmbeddingProvider | null = null;
@@ -46,6 +50,7 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider {
 }
 
 export async function embed(text: string): Promise<number[]> {
+  metrics.inc('repo_memory_embedding_calls_total');
   if (!currentProvider) {
     currentProvider = new PlaceholderEmbeddingProvider();
   }
@@ -54,14 +59,14 @@ export async function embed(text: string): Promise<number[]> {
     const raw = await currentProvider.embed(text);
     return normalizeToDimensions(raw, TARGET_DIMENSIONS);
   } catch (error) {
-    console.warn(`Primary provider (${currentProvider.name}) failed:`, error);
+    logger.warn({ err: error, provider: currentProvider.name }, 'Primary embedding provider failed');
     if (fallbackProvider) {
-      console.log(`Falling back to ${fallbackProvider.name}...`);
+      logger.info({ provider: fallbackProvider.name }, 'Falling back to fallback embedding provider');
       try {
         const raw = await fallbackProvider.embed(text);
         return normalizeToDimensions(raw, TARGET_DIMENSIONS);
       } catch (fallbackError) {
-        console.warn(`Fallback (${fallbackProvider.name}) also failed:`, fallbackError);
+        logger.warn({ err: fallbackError, provider: fallbackProvider.name }, 'Fallback embedding provider also failed');
         throw error;
       }
     }
@@ -70,6 +75,7 @@ export async function embed(text: string): Promise<number[]> {
 }
 
 export async function embedBatch(texts: string[]): Promise<number[][]> {
+  metrics.inc('repo_memory_embedding_calls_total');
   if (!currentProvider) {
     currentProvider = new PlaceholderEmbeddingProvider();
   }
@@ -78,14 +84,14 @@ export async function embedBatch(texts: string[]): Promise<number[][]> {
     const raw = await currentProvider.embedBatch(texts);
     return raw.map(v => normalizeToDimensions(v, TARGET_DIMENSIONS));
   } catch (error) {
-    console.warn(`Primary provider (${currentProvider.name}) failed batch:`, error);
+    logger.warn({ err: error, provider: currentProvider.name }, 'Primary embedding provider failed batch');
     if (fallbackProvider) {
-      console.log(`Falling back to ${fallbackProvider.name}...`);
+      logger.info({ provider: fallbackProvider.name }, 'Falling back to fallback embedding provider');
       try {
         const raw = await fallbackProvider.embedBatch(texts);
         return raw.map(v => normalizeToDimensions(v, TARGET_DIMENSIONS));
       } catch (fallbackError) {
-        console.warn(`Fallback (${fallbackProvider.name}) also failed:`, fallbackError);
+        logger.warn({ err: fallbackError, provider: fallbackProvider.name }, 'Fallback embedding provider also failed');
         throw error;
       }
     }

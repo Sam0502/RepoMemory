@@ -15,7 +15,8 @@
     "build": "tsup src/index.ts --format esm --dts",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
-    "db:migrate": "node --loader ts-node/esm src/migrate.ts"
+    "test": "vitest run",
+    "db:migrate": "tsx src/migrate.ts"
   },
   "dependencies": {
     "@repo-memory/shared": "workspace:*",
@@ -25,6 +26,6 @@
     "@types/pg": "^8.11.0",
     "typescript": "^5.5.0",
     "tsup": "^8.0.0",
-    "ts-node": "^10.9.0"
+    "tsx": "^4.19.0"
   }
 }

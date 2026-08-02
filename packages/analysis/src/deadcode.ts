@@ -12,7 +12,7 @@ export interface DeadCodeReport {
   deadCount: number;
 }
 
-const RELEVANT_TYPES = new Set<RelationshipType>([
+export const RELEVANT_TYPES: ReadonlySet<RelationshipType> = new Set([
   RelationshipType.CALLS,
   RelationshipType.REFERENCES,
   RelationshipType.IMPORTS,
@@ -21,6 +21,19 @@ const RELEVANT_TYPES = new Set<RelationshipType>([
 ]);
 
 const ENTRYPOINT_PATTERNS = /^(index|main|cli|server|app|entry|bootstrap|start)$/i;
+
+// True when an entity is a reachability root: entrypoint files/functions,
+// test files, test entities, or entrypoint-named symbols.
+export function isDeadCodeRoot(entity: Entity): boolean {
+  if (entity.type === EntityType.FILE) {
+    const fileBase = (entity.filePath.split(/[\\/]/).pop() || '').replace(/\.[^.]+$/, '').toLowerCase();
+    return ENTRYPOINT_PATTERNS.test(fileBase);
+  }
+  if (entity.isTest || entity.type === EntityType.TEST || entity.type === EntityType.TEST_SUITE) {
+    return true;
+  }
+  return ENTRYPOINT_PATTERNS.test(entity.name);
+}
 
 // Detects dead code via reachability analysis from entrypoint and test roots over
 // resolved relationship edges. Requires symbol-resolved relationships (see resolver)
@@ -42,19 +55,7 @@ export function detectDeadCode(entities: Entity[], relationships: Relationship[]
   // Determine roots: entrypoint files/functions + test files + test entities
   const roots = new Set<string>();
   for (const entity of entities) {
-    if (entity.type === EntityType.FILE) {
-      const fileBase = (entity.filePath.split(/[\\/]/).pop() || '').replace(/\.[^.]+$/, '').toLowerCase();
-      if (ENTRYPOINT_PATTERNS.test(fileBase)) {
-        roots.add(entity.stableId);
-      }
-      continue;
-    }
-    if (entity.isTest || entity.type === EntityType.TEST || entity.type === EntityType.TEST_SUITE) {
-      roots.add(entity.stableId);
-    }
-    if (ENTRYPOINT_PATTERNS.test(entity.name)) {
-      roots.add(entity.stableId);
-    }
+    if (isDeadCodeRoot(entity)) roots.add(entity.stableId);
   }
 
   // BFS from roots over outgoing edges (an entity is reachable only if a reachable source references it)

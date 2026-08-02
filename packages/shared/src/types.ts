@@ -169,3 +169,101 @@ export interface ContextPack {
   };
   tokenCount: number;
 }
+
+export type ScanType = 'full' | 'incremental' | 'working-tree' | 'commit';
+
+export interface ScanPhaseReport {
+  name: string;
+  entityCount: number;
+  relationshipCount: number;
+  durationMs: number;
+}
+
+export interface ScanReport {
+  scanType: ScanType;
+  repoPath: string;
+  commit?: string;
+  filesDiscovered: number;
+  filesParsed: number;
+  entitiesExtracted: number;
+  relationshipsExtracted: number;
+  embeddingsGenerated: number;
+  entitiesStored: number;
+  relationshipsStored: number;
+  phases: ScanPhaseReport[];
+  totalDurationMs: number;
+  startedAt: string;
+  completedAt: string;
+}
+
+export const JobType = {
+  VERIFY: 'verify',
+  REPAIR: 'repair',
+} as const;
+
+export type JobType = (typeof JobType)[keyof typeof JobType];
+
+export const JobStatus = {
+  PENDING: 'pending',
+  RUNNING: 'running',
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+} as const;
+
+export type JobStatus = (typeof JobStatus)[keyof typeof JobStatus];
+
+export interface Job {
+  id: string;
+  type: JobType;
+  status: JobStatus;
+  repositoryPath: string;
+  commitHash?: string;
+  filesToProcess: string[];
+  result?: unknown;
+  error?: string;
+  startedAt?: Date;
+  completedAt?: Date;
+  createdAt: Date;
+}
+
+export interface TypeCountDelta {
+  type: string;
+  pgCount: number;
+  graphCount: number;
+  delta: number;
+}
+
+export interface CountDelta {
+  pg: number;
+  graph: number;
+  delta: number;
+}
+
+export interface VerificationReport {
+  repoPath: string;
+  ranAt: string;
+  entityCounts: TypeCountDelta[];
+  relationshipCounts: TypeCountDelta[];
+  entityTotal: CountDelta;
+  relationshipTotal: CountDelta;
+  duplicateGraphNodes: number;
+  missingInGraph: string[];
+  orphanGraphNodes: string[];
+  missingRelationshipCount: number;
+  missingRelationships: string[];
+  orphanRelationshipCount: number;
+  orphanRelationships: string[];
+  entitiesWithoutEmbedding: number;
+  ok: boolean;
+}
+
+export interface RepairReport {
+  repoPath: string;
+  ranAt: string;
+  entitiesUpserted: number;
+  relationshipsUpserted: number;
+  orphanNodesDeleted: number;
+  orphanRelationshipsDeleted: number;
+  embeddingsGenerated: number;
+  verifyAfter: VerificationReport;
+}

@@ -467,11 +467,105 @@ We ingest commit history + file changes + per-entity `firstSeenCommit`/`lastSeen
 - Build progressive exploration and architecture views
 - Add confidence scoring and provenance
 
-### Phase 5: Hardening
-- Improve performance on large repositories
-- Add reconciliation and repair jobs
-- Add observability, metrics, and quality gates
-- Validate against real-world repositories
+### Phase 5: Hardening & Observability
+
+**Start Date:** 2026-08-02
+**Completed:** TBD (5.1–5.5 complete)
+
+Phase 5 hardens the engine for real-world use: a real test suite (currently none exists), structured observability, versioned schema migrations, dual-store reconciliation with repair jobs, streaming analysis for repository scale, live file watching, and the deferred Go/Rust/Java parsers. It turns the monolithic scan into a monitored, repairable, quality-gated pipeline.
+
+**Current gaps this phase closes** (verified by codebase audit 2026-08-02):
+- No test files, no test framework, no CI, no ESLint (the `lint` script is `tsc --noEmit`) ✅ (5.1)
+- No structured logging/metrics — ~75 raw `console.log/error` call sites ✅ (5.3)
+- `migrate()` is one monolithic idempotent SQL blob, not versioned; `storage` `db:migrate` script points at a nonexistent `src/migrate.ts` ✅ (5.2)
+- `jobs` table exists in the schema but is never written to ✅ (5.4)
+- `FileWatcher` (chokidar) exists but is never wired into the orchestrator
+- Dead-code / risk / drift / boundaries load entire repo datasets into memory via paged loops ✅ (5.5)
+- No reconciliation or repair path for the dual-store (PostgreSQL + Neo4j) split ✅ (5.4)
+- Only TypeScript / JavaScript / Python parsers ship
+
+#### 5.1 Test Foundation & Quality Gates ✅
+- **Test framework**: add Vitest to the workspace (`pnpm -r` script `test`); root `pnpm test` runs all packages.
+- **Unit tests**:
+  - `packages/shared`: stable-ID generation and namespacing
+  - `packages/analysis/extractors`: TypeScript/JavaScript/Python fixture files → expected entities/relationships (functions, classes, interfaces, enums, methods, constructors, endpoints, tests, configs, models, CALLS/REFERENCES/CONTAINS/HANDLES/IMPORTS/EXPORTS)
+  - `packages/analysis/resolver`: `SymbolIndex.lookup` scope chain (same-file → import → global-unique → ambiguous), `resolveImportPath` (relative / package→index / unique-basename), `RelationshipResolver` metadata (`resolvedBy`, `resolutionHint`, `unresolvedTarget`)
+  - `packages/analysis`: `detectDeadCode`, `inferDomain`/`inferArchitecturalRole`/`applyDomainMetadata`/`parseDomainConfig`, `validateBoundaries` (strict vs imports-only, wildcards), `ChangeAnalyzer` churn/risk/drift scoring against synthetic rows
+  - `packages/api`: `QaService` intent classification + compound-question splitting; `ContextPackBuilder` token budgeting
+- **Integration tests** (require DBs via `db:up`): entity/relationship/commit repositories against PostgreSQL (repo-scoped + unfiltered modes), `GraphClient` upsert/traversal against Neo4j
+- **CI**: GitHub Actions workflow (`.github/workflows/ci.yml`): install → typecheck → build → test → self-scan smoke test against a small fixture repo
+- **Lint**: ESLint flat config + Prettier; wire into `pnpm lint` and CI
+- **Verify**: `pnpm -r run typecheck`, `pnpm -r run lint`, `pnpm test` green on a clean checkout
+
+#### 5.2 Versioned Schema Migrations ✅ COMPLETE
+- **Status:** Completed 2026-08-02. Verified end-to-end against Postgres: fresh `db:migrate` on a clean database produces the current schema (`entities` with `repo_path` + `embedding`, `relationships` with repo-scoped unique constraint and VARCHAR(1000) `source_id`/`target_id`, all indexes), re-running is a no-op, and `schema_migrations` records applied version + timestamp. Existing installs back-fill cleanly (the pre-migration DB was migrated in place with zero data loss).
+- **`MigrationRunner`** (`packages/storage/src/migrations/runner.ts`): creates the `schema_migrations` table (`id INTEGER PRIMARY KEY`, `name`, `applied_at`), reads the applied ledger, then runs pending migrations in ascending id order — each in its own transaction (`BEGIN`/`COMMIT`/`ROLLBACK` on failure) and inserts the ledger row in the same transaction so a failed migration leaves no partial record. Returns `MigrationResult[]` for the CLI to report.
+- **Numbered migrations** (`packages/storage/src/migrations/`):
+  - `001-init.ts` — extensions (`uuid-ossp`, `vector`), base tables (`entities`, `relationships`, `commits`, `file_changes`, `jobs`, `repo_state`) and base indexes (pre-repo-path, pre-embedding shape)
+  - `002-repo-path-scoping.ts` — `repo_path` columns, drop the old `relationships` unique constraint and add the repo-scoped `(repo_path, source_id, target_id, type, file_path)` one, repo-path indexes
+  - `003-embeddings.ts` — `entities.embedding vector(768)` + hnsw cosine index
+  - `004-id-lengths.ts` — widen `relationships.source_id`/`target_id` to VARCHAR(1000)
+  - Every migration is idempotent (`IF NOT EXISTS` / guarded `DO` blocks), so back-filling an already-migrated database is safe.
+- **Entrypoints**: `packages/storage/src/migrate.ts` is the real script target for `pnpm --filter @repo-memory/storage db:migrate` (now `tsx src/migrate.ts` instead of the broken `ts-node` loader; reads `PG_HOST`/`PG_PORT`/`PG_DATABASE`/`PG_USER`/`PG_PASSWORD`). `schema.ts` `migrate()` delegates to the runner (kept as the orchestrator's on-init migration call). New CLI surface `repo-memory db migrate` (env-aware DB config).
+- **Tests**: `packages/storage/test/migrations.test.ts` (registry ordering/contiguity + runner skip/apply logic against a mock pool) and `migrations-integration.test.ts` (fresh-database apply, schema-shape assertions, no-op re-run against a dedicated `repo_memory_test` database, skipped when Postgres is unreachable so `pnpm test` stays green without DBs).
+- **Verify**: `pnpm -r run typecheck`, `pnpm lint`, `pnpm test` green (98 tests); `pnpm --filter @repo-memory/storage db:migrate` and `node app/dist/cli.js db migrate` both report "0 pending migrations" on the already-migrated DB.
+
+#### 5.3 Observability & Metrics ✅ COMPLETE
+- **Status:** Completed 2026-08-02. Verified end-to-end: a full scan under `PINO_LOG_LEVEL=debug` emits structured per-phase JSON logs (`discover`/`parse`/`resolve`/`embed`/`persist` with counts + timing), the CLI prints a `ScanReport` summary with a phase table, and `curl /metrics` shows counters/histograms moving between requests (API counter 1 → 6, latency histogram count 1 → 6).
+- **`Logger`** (`packages/shared/src/logger.ts`): pino-based, `PINO_LOG_LEVEL` env (default `info`), writes JSON to stderr so CLI stdout stays machine-readable; supports `logger.info('msg')`, `logger.info({ field }, 'msg')`, `logger.error(err, 'msg')`, and `child()` bindings. All orchestrator/CLI/API/graph/storage/analysis `console.*` call sites (~75) converted to `logger.*` with contextual fields (`repoPath`, `commit`, `scanType`, `entityCount`, `durationMs`)
+- **Scan telemetry**: orchestrator `beginScan`/`endPhase`/`finishScan` track per-phase counts + timing; every scan entry point now returns `ScanReport` (`packages/shared` type) with `filesDiscovered`, `filesParsed`, `entitiesExtracted`, `relationshipsExtracted`, `embeddingsGenerated`, `entitiesStored`, `relationshipsStored`, `phases[]`, `totalDurationMs`; CLI `scan` prints it as a table. Full-scan pipeline split into `resolveResults()` + `persistResolved()` so resolve and persist are timed independently
+- **`MetricsRegistry`** (`packages/shared/src/metrics.ts`): counters/gauges/histograms with label support; `render()` emits Prometheus text format; `registerDefaultMetrics()` (idempotent) registers `repo_memory_entities_scanned_total`, `repo_memory_relationships_stored_total`, `repo_memory_embedding_calls_total`, `repo_memory_api_requests_total{method,path,status}`, `repo_memory_scan_duration_seconds`, `repo_memory_api_request_duration_seconds`, `repo_memory_queue_depth` (gauge; wired to the `jobs` table in 5.4), `repo_memory_last_scan_timestamp_seconds`
+- **`GET /metrics`** endpoint (Hono, `METRICS_ENABLED=false` disables): Prometheus text format; histogram buckets for scan + API latency
+- **Request logging middleware**: logs method/path/status/durationMs per request, echoes/generates `X-Request-Id` (correlation), feeds API request counters/histograms; API/health/metrics at `info`, static assets at `debug`
+- **Tests**: `packages/shared/test/logger.test.ts` + `metrics.test.ts` (15 tests) — structured JSON output, Error serialization, child bindings, level filtering, `PINO_LOG_LEVEL` default, counter/gauge/histogram rendering, label escaping/sorting, default metric registration
+- **Verify**: `pnpm -r run typecheck`, `pnpm lint`, `pnpm test` green (113 tests); full scan + `/metrics` verification above
+
+#### 5.4 Reconciliation & Repair Jobs ✅ COMPLETE
+- **Status:** Completed 2026-08-02. Verified end-to-end against the live dual store: deleted a Neo4j `Function` node manually → `jobs verify` reported it missing (entity delta 1, 6 relationships missing, `ok: false`) → `jobs repair` re-upserted the entity + 6 relationships and re-embedded 92 entities with null embeddings → a fresh `jobs verify` came back clean (`ok: true`, zero entity/relationship deltas, `entitiesWithoutEmbedding: 0`). All four API endpoints (`GET /api/jobs`, `GET /api/jobs/:id`, `POST /api/jobs/verify`, `POST /api/jobs/repair`) exercised against a live server, and the `repo_memory_queue_depth` gauge updates in `/metrics`.
+- **`JobRepository`** (`packages/storage/src/job-repository.ts`): writes to the previously-unused `jobs` table — `create` (pending), `markRunning`/`markCompleted`/`markFailed` (with `started_at`/`completed_at` and JSON `result`/`error`), `findById`/`findAll`/`findByType`, and `countActive()` (pending + running) that feeds the `repo_memory_queue_depth` gauge
+- **`verify` job** (`Orchestrator.verifyRepo`): compares PostgreSQL (source of truth) vs Neo4j and produces a `VerificationReport` (`packages/shared`): per-type entity/relationship counts, `missingInGraph` stable IDs, `orphanGraphNodes`, `missingRelationships`/`orphanRelationships`, `duplicateGraphNodes`, and `entitiesWithoutEmbedding`. A PG relationship only counts as "representable" when both endpoint stable IDs are real entities — PG rows whose `target_id` is unresolved expression text can never be graph edges and are excluded from the reconciliation contract (per-type raw counts still show them). Totals are derived from the reconciled key sets so the report is internally consistent; `ok` requires zero entity/relationship drift and zero orphans
+- **`repair` job** (`Orchestrator.repairRepo`): re-syncs Neo4j from PostgreSQL — upserts entities missing from the graph (paged), deletes orphan graph nodes/edges, upserts representable relationships missing from the graph, re-embeds entities with null embeddings via `generateEntityEmbedding`, then re-runs verify and embeds the result as `verifyAfter` in the returned `RepairReport`
+- **GraphClient additions** (`packages/graph/src/graph-client.ts`): `countEntities`/`countEntitiesByType`/`listEntityStableIds`, `countRelationships`/`countRelationshipsByType`/`listRelationshipKeys` (relationship type via `type(r)`, endpoints via node stable IDs), `deleteRelationship(sourceId, targetId, type, filePath)`; `upsertRelationship` now stamps `repoPath` on edges
+- **Repository additions**: `EntityRepository.countByType`/`findAllStableIds`/`countWithoutEmbedding`/`findWithoutEmbedding`; `RelationshipRepository.countByType`/`findAllKeys`/`findAll`
+- **Orchestrator job runner**: public `runJob(type, repoPath?)` creates the job row, persists status/result/error across the run, and keeps the queue-depth gauge in sync via `countActive()`; public `listScannedRepos()` returns every scanned repo path (for `--all-repos`)
+- **CLI**: `repo-memory jobs verify|repair --repo <path>` with `--all-repos` support (reuses the orchestrator; `serve` passes its orchestrator into the API as the wired job runner)
+- **API**: `GET /api/jobs` (`?type=`, `?limit=`), `GET /api/jobs/:id`, `POST /api/jobs/verify`, `POST /api/jobs/repair` — the POSTs run synchronously and return the completed job with its report (501 when no `runJob` callback is wired, keeping `@repo-memory/api` decoupled from the app orchestrator)
+- **Tests**: `packages/storage/test/job-repository.test.ts` (8 tests via mock pool) — create + row mapping, commit/files params, mark running/completed/failed, findById/findAll, active-queue count
+- **Verify**: `pnpm -r run typecheck`, `pnpm lint`, `pnpm test` green (121 tests); the delete-a-node → verify → repair → verify cycle above against real Postgres + Neo4j
+
+#### 5.5 Streaming Analysis for Repository Scale ✅ COMPLETE
+- **Status:** Completed 2026-08-02. Verified live against the monorepo (1524 entities, 4748 relationships): streaming dead-code/boundaries return byte-identical results to the in-memory versions (dead=66/exported=88, boundaries 844 edges / 195 violations), and `ANALYSIS_BATCH_SIZE` is a live memory knob — `pnpm bench --batch 1000` peaked at ~182MB RSS vs ~249MB at batch 5000, roughly flat as analysis runs sequentially. All analysis API endpoints stream and match CLI output.
+- **`streaming.ts`** (`packages/analysis/src/streaming.ts`): new bounded-window engine. `PagedSource<T>` contract (`page(offset, limit)`) + `forEachPage` (stops on a short page) + `resolveBatchSize` (reads `ANALYSIS_BATCH_SIZE`, default 5000). `streamDeadCode` (3 passes: compact entity index + roots → outgoing adjacency of bare stable IDs → re-stream entities emitting full objects only for dead symbols) and `streamBoundaries` (entity lookup maps → cross-domain edge stream) — only one window of each store is ever resident, and the report output is the only full-object retention
+- **`findByTypesPaged(types, limit, offset)`** (`packages/storage/src/relationship-repository.ts`): deterministic paged window over a relationship-type set ordered by `(source_id, id)`, backing every streaming analysis source
+- **`ChangeAnalyzer`** (`packages/analysis/src/change.ts`): `ChangeDataProvider` gained optional `entityPage`/`relationshipPage`/`entityByStableId`; `computeFileRisk` and `detectDrift` now run entirely over paged sources (dead-code + boundaries computed from the same streams), holding entities per-file as bare stable IDs; `computeEntityChange` uses `entityByStableId` when provided (falls back to a full load otherwise). Full-array providers are transparently sliced into pages, so existing array-based tests/consumers keep working
+- **Orchestrator**: `getDeadCodeReport()` and the new `getBoundariesReport()` stream via `findByTypesPaged`; the `ChangeAnalyzer` provider wires `entityPage`/`relationshipPage`/`entityByStableId`
+- **API**: `/api/analysis/dead-code`, `/api/analysis/boundaries` stream with an optional `?batchSize=` param; risk/drift/churn endpoints inherit the paged analyzer
+- **Benchmark harness**: `pnpm bench` (`app/src/bench.ts`, also root `bench` passthrough) — `--repo <path>` (default cwd), `--full` to time a full scan first, `--batch N`; prints per-analysis duration, result count, and RSS before→after plus peak
+- **Tests**: `packages/analysis/test/streaming.test.ts` (9 tests) — `forEachPage` windowing/short-page stop, `resolveBatchSize` env/arg precedence, streaming↔in-memory dead-code and boundaries parity, batch-size independence, non-entity endpoint exclusion; plus a paged-vs-array `computeFileRisk` parity test in `change.test.ts`
+- **Verify**: `pnpm -r run typecheck`, `pnpm lint`, `pnpm test` green (131 tests); live parity script + live server API checks above
+
+#### 5.6 Live File Watching
+- Wire the existing `FileWatcher` (chokidar) into the orchestrator: on `file:change`/`file:add`/`file:delete`, run the same path the incremental scan uses for a single file (`processChanges` single-file path, `handleFileDeletion`)
+- New CLI mode: `repo-memory watch --repo <path>` — starts a server + watcher, updates the graph on every edit (debounced)
+- API: `GET /api/status` returning watched repo + last scan time (frontend "live" indicator)
+- **Verify**: `watch` a small repo, edit a function, confirm the entity updates and dependents reflect the change without a manual scan
+
+#### 5.7 Multi-Language Parsers (Go, Rust, Java)
+- Add grammar entries for `go`, `rust`, `java` to `tree-sitter-init.ts` `PARSER_CONFIGS` (from `tree-sitter-wasms` bundle where available; verify ABI against pinned `web-tree-sitter@0.22.6`)
+- **`GoExtractor`** (`extractors/go.ts`): funcs, methods, structs, interfaces, imports, calls, packages (embed the existing `BaseExtractor` helpers)
+- **`RustExtractor`** (`extractors/rust.ts`): functions, structs, enums, traits, impls, modules, calls, imports
+- **`JavaExtractor`** (`extractors/java.ts`): classes, interfaces, enums, methods, constructors, annotations, imports, calls
+- Register all three via `registerLanguageExtractor`; extend `getLanguageFromFilePath`/`shouldParseFile`/`getGrammarKeyFromFilePath`
+- Add `Language.GO`/`LANGUAGE_RUST`/`LANGUAGE_JAVA` to `packages/shared`
+- **Verify**: parse fixture Go/Rust/Java projects; entity + relationship counts sane; unit tests from 5.1 extended to the new extractors
+
+**Execution Order:** 5.1 → 5.2 → 5.3 → 5.4 → 5.5 → 5.6 → 5.7
+
+**Dependencies/notes:**
+- 5.1 is foundational — every later milestone adds tests through the framework it establishes
+- 5.2 must land before 5.4 (repair jobs write schema-grounded data) and before any future migration
+- 5.3's structured logger is the substrate for 5.4 job status and 5.5 benchmark reporting
+- 5.7 is independent of 5.2–5.6 and can be parallelized against 5.5/5.6
 
 ## Non-Goals
 - Replacing the source code repository itself

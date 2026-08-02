@@ -1,5 +1,8 @@
 import { pipeline, env } from '@xenova/transformers';
 import { EmbeddingProvider } from './provider.js';
+import { getLogger } from '@repo-memory/shared';
+
+const logger = getLogger({ component: 'embeddings' });
 
 export class OnnxEmbeddingProvider implements EmbeddingProvider {
   private extractor: any = null;
@@ -17,13 +20,13 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
-    console.log(`Loading embedding model: ${this.modelId}...`);
+    logger.info({ modelId: this.modelId }, 'Loading embedding model');
     try {
       this.extractor = await pipeline('feature-extraction', this.modelId, {
         quantized: true,
       });
       this.initialized = true;
-      console.log('ONNX embedding model loaded successfully.');
+      logger.info({ modelId: this.modelId }, 'ONNX embedding model loaded successfully');
     } catch (error) {
       throw new Error(`Failed to load ONNX model: ${error}`);
     }

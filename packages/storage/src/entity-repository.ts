@@ -1,5 +1,5 @@
 import { Pool } from 'pg';
-import { Entity, Relationship, EntityType, RelationshipType, Language } from '@repo-memory/shared';
+import { Entity, EntityType, Language } from '@repo-memory/shared';
 
 export class EntityRepository {
   constructor(private pool: Pool, private repoPath: string = '') {}
@@ -192,6 +192,38 @@ export class EntityRepository {
       : 'SELECT COUNT(*) as count FROM entities';
     const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
     return parseInt(result.rows[0].count);
+  }
+
+  async countByType(): Promise<Array<{ type: EntityType; count: number }>> {
+    const query = this.repoPath
+      ? 'SELECT type, COUNT(*) as count FROM entities WHERE repo_path = $1 GROUP BY type ORDER BY type'
+      : 'SELECT type, COUNT(*) as count FROM entities GROUP BY type ORDER BY type';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
+    return result.rows.map((row) => ({ type: row.type as EntityType, count: parseInt(row.count) }));
+  }
+
+  async findAllStableIds(): Promise<string[]> {
+    const query = this.repoPath
+      ? 'SELECT stable_id FROM entities WHERE repo_path = $1'
+      : 'SELECT stable_id FROM entities';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
+    return result.rows.map((row) => row.stable_id);
+  }
+
+  async countWithoutEmbedding(): Promise<number> {
+    const query = this.repoPath
+      ? 'SELECT COUNT(*) as count FROM entities WHERE repo_path = $1 AND embedding IS NULL'
+      : 'SELECT COUNT(*) as count FROM entities WHERE embedding IS NULL';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
+    return parseInt(result.rows[0].count);
+  }
+
+  async findWithoutEmbedding(limit: number = 1000, offset: number = 0): Promise<Entity[]> {
+    const query = this.repoPath
+      ? 'SELECT * FROM entities WHERE repo_path = $1 AND embedding IS NULL ORDER BY name LIMIT $2 OFFSET $3'
+      : 'SELECT * FROM entities WHERE embedding IS NULL ORDER BY name LIMIT $1 OFFSET $2';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath, limit, offset] : [limit, offset]);
+    return result.rows.map(this.mapRowToEntity);
   }
 
   async deleteByFilePath(filePath: string): Promise<void> {

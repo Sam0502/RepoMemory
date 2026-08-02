@@ -221,7 +221,7 @@ export class PythonExtractor extends BaseExtractor {
         c.type === 'keyword_argument' && c.children?.[0]?.text === 'methods'
       );
       if (methodArg) {
-        const methodsValue = methodArg.children?.[2]?.text?.replace(/[\[\]'"]/g, '');
+        const methodsValue = methodArg.children?.[2]?.text?.replace(/[\]'"[]/g, '');
         if (methodsValue) {
           method = methodsValue.split(',')[0].trim().toUpperCase();
         }
@@ -410,7 +410,7 @@ export class PythonExtractor extends BaseExtractor {
         c.type === 'keyword_argument' && c.children?.[0]?.text === 'methods'
       );
       if (methodArg) {
-        const methodsValue = methodArg.children?.[2]?.text?.replace(/[\[\]'"]/g, '');
+        const methodsValue = methodArg.children?.[2]?.text?.replace(/[\]'"[]/g, '');
         if (methodsValue) {
           method = methodsValue.split(',')[0].trim().toUpperCase();
         }
@@ -440,7 +440,7 @@ export class PythonExtractor extends BaseExtractor {
     return !name.startsWith('_');
   }
 
-  private extractDocstring(node: any, entity: Entity, ctx: ExtractorContext): void {
+  private extractDocstring(node: any, entity: Entity, _ctx: ExtractorContext): void {
     // Extract docstring from function/class body
     const body = this.findChildByType(node, 'block') || node.childForFieldName('body');
     if (!body) return;

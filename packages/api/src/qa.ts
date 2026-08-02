@@ -414,10 +414,10 @@ export class QaService {
   }
 
   private async findEndpointCandidates(question: string): Promise<Entity[]> {
-    const match = question.match(/\b(?:POST|GET|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+\/[\w\/:.\-_{}<>]*/i);
+    const match = question.match(/\b(?:POST|GET|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+\/[\w/:.\-_{}<>]*/i);
     if (!match) return [];
     const target = match[0].replace(/\s+/g, ' ').trim();
-    const pathToken = target.split(/\s+/)[1].replace(/[\/:{}<>]/g, ' ').trim().split(/\s+/)[0];
+    const pathToken = target.split(/\s+/)[1].replace(/[/:{}<>]/g, ' ').trim().split(/\s+/)[0];
     const candidates = await this.entityRepo.search(pathToken || 'route');
     const verb = target.split(/\s+/)[0].toUpperCase();
     const exact = candidates.filter(c => c.type === 'ApiEndpoint' && c.name.toLowerCase() === target.toLowerCase());
@@ -428,7 +428,7 @@ export class QaService {
   }
 
   private async findFileCandidates(question: string): Promise<Entity[]> {
-    const tokens = question.match(/[A-Za-z0-9_][\w.\/\\-]*\.(ts|tsx|js|jsx|py|json|css|html|md|go|rs|java|sql)/gi) || [];
+    const tokens = question.match(/[A-Za-z0-9_][\w./\\-]*\.(ts|tsx|js|jsx|py|json|css|html|md|go|rs|java|sql)/gi) || [];
     const results: Entity[] = [];
     const seen = new Set<string>();
     for (const token of tokens) {
@@ -487,7 +487,7 @@ export class QaService {
   }
 
   private async findSecondEntity(question: string, first: Entity): Promise<Entity | null> {
-    const tokens = question.match(/[A-Za-z0-9_][\w.\/\\-]*\.(ts|tsx|js|jsx|py|json|css|html|md|go|rs|java|sql)/gi) || [];
+    const tokens = question.match(/[A-Za-z0-9_][\w./\\-]*\.(ts|tsx|js|jsx|py|json|css|html|md|go|rs|java|sql)/gi) || [];
     for (const token of tokens) {
       const normalized = token.replace(/\\/g, '/');
       const candidates = await this.entityRepo.search(token.replace(/[\\/.]/g, ' ').trim().split(/\s+/)[0]);

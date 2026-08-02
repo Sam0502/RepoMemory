@@ -21,11 +21,13 @@ export type { LanguageExtractor, ExtractorContext } from './extractors/index.js'
 export { BaseExtractor, TypeScriptExtractor, JavaScriptExtractor, PythonExtractor } from './extractors/index.js';
 export { SymbolIndex, RelationshipResolver, generateEntityStableId, generateFileStableId, createFileEntity, resolveImportPath } from './resolver/index.js';
 export type { SymbolDefinition, ResolvedSymbol } from './resolver/index.js';
-export { detectDeadCode } from './deadcode.js';
+export { detectDeadCode, isDeadCodeRoot, RELEVANT_TYPES } from './deadcode.js';
 export type { DeadCodeReport, DeadCodeItem } from './deadcode.js';
 export { inferDomain, inferArchitecturalRole, applyDomainMetadata, parseDomainConfig } from './domain.js';
 export type { DomainConfig, DomainConfigDomain } from './domain.js';
 export { validateBoundaries } from './boundaries.js';
 export type { BoundaryReport, BoundaryViolation, BoundaryEndpoint, DomainSummary } from './boundaries.js';
+export { streamDeadCode, streamBoundaries, forEachPage, resolveBatchSize, DEFAULT_BATCH_SIZE } from './streaming.js';
+export type { PagedSource, StreamOptions } from './streaming.js';
 export { ChangeAnalyzer } from './change.js';
 export type { ChangeDataProvider, FileChurn, FileRisk, RiskBreakdown, EntityChangeInfo, DriftReport, DriftSignal } from './change.js';

@@ -83,6 +83,24 @@ export class RelationshipRepository {
     return result.rows.map(this.mapRowToRelationship);
   }
 
+  // Paged window over a set of relationship types, ordered by the stable
+  // (source_id, id) key so pagination is deterministic across calls. Used by
+  // the streaming analysis paths so only one window is in memory at a time.
+  async findByTypesPaged(types: RelationshipType[], limit: number = 100, offset: number = 0): Promise<Relationship[]> {
+    if (types.length === 0) return [];
+    const placeholders = types.map((_, i) => `$${i + 1}`).join(', ');
+    const values: unknown[] = [...types];
+    let query = `SELECT * FROM relationships WHERE type IN (${placeholders})`;
+    if (this.repoPath) {
+      values.push(this.repoPath);
+      query += ` AND repo_path = $${values.length}`;
+    }
+    values.push(limit, offset);
+    query += ` ORDER BY source_id, id LIMIT $${values.length - 1} OFFSET $${values.length}`;
+    const result = await this.pool.query(query, values);
+    return result.rows.map(this.mapRowToRelationship);
+  }
+
   async findByFilePath(filePath: string): Promise<Relationship[]> {
     const query = this.repoPath
       ? 'SELECT * FROM relationships WHERE file_path = $1 AND repo_path = $2 ORDER BY type'
@@ -143,6 +161,37 @@ export class RelationshipRepository {
       : 'SELECT COUNT(*) as count FROM relationships';
     const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
     return parseInt(result.rows[0].count);
+  }
+
+  async countByType(): Promise<Array<{ type: RelationshipType; count: number }>> {
+    const query = this.repoPath
+      ? 'SELECT type, COUNT(*) as count FROM relationships WHERE repo_path = $1 GROUP BY type ORDER BY type'
+      : 'SELECT type, COUNT(*) as count FROM relationships GROUP BY type ORDER BY type';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
+    return result.rows.map((row) => ({ type: row.type as RelationshipType, count: parseInt(row.count) }));
+  }
+
+  // Reconciliation keys: the tuple that uniquely identifies a relationship in
+  // both stores (matching the repo-scoped unique constraint).
+  async findAllKeys(): Promise<Array<{ sourceId: string; targetId: string; type: RelationshipType; filePath: string }>> {
+    const query = this.repoPath
+      ? 'SELECT source_id, target_id, type, file_path FROM relationships WHERE repo_path = $1'
+      : 'SELECT source_id, target_id, type, file_path FROM relationships';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
+    return result.rows.map((row) => ({
+      sourceId: row.source_id,
+      targetId: row.target_id,
+      type: row.type as RelationshipType,
+      filePath: row.file_path,
+    }));
+  }
+
+  async findAll(limit: number = 100, offset: number = 0): Promise<Relationship[]> {
+    const query = this.repoPath
+      ? 'SELECT * FROM relationships WHERE repo_path = $1 ORDER BY source_id LIMIT $2 OFFSET $3'
+      : 'SELECT * FROM relationships ORDER BY source_id LIMIT $1 OFFSET $2';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath, limit, offset] : [limit, offset]);
+    return result.rows.map(this.mapRowToRelationship);
   }
 
   private mapRowToRelationship(row: any): Relationship {

@@ -33,8 +33,6 @@ export function createFileEntity(filePath: string, repoPath: string = ''): Entit
   };
 }
 
-const SOURCE_EXTENSIONS = ['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'pyw'];
-
 function stripExtension(path: string): string {
   return path.replace(/\.(ts|tsx|js|jsx|mjs|cjs|py|pyw)$/, '');
 }

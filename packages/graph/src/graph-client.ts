@@ -1,5 +1,7 @@
-import neo4j, { Driver, Session } from 'neo4j-driver';
-import { Entity, Relationship, EntityType, RelationshipType, Language } from '@repo-memory/shared';
+import neo4j, { Driver } from 'neo4j-driver';
+import { Entity, Relationship, EntityType, RelationshipType, Language, getLogger } from '@repo-memory/shared';
+
+const logger = getLogger({ component: 'graph' });
 
 export class GraphClient {
   private driver: Driver;
@@ -15,9 +17,9 @@ export class GraphClient {
   async verifyConnectivity(): Promise<void> {
     try {
       await this.driver.verifyConnectivity();
-      console.log('Neo4j connection successful.');
+      logger.info('Neo4j connection successful.');
     } catch (error) {
-      console.error('Neo4j connection failed:', error);
+      logger.error({ err: error }, 'Neo4j connection failed');
       throw error;
     }
   }
@@ -52,7 +54,7 @@ export class GraphClient {
         FOR (e:Entity) ON EACH [e.name, e.purpose, e.responsibility]
       `);
 
-      console.log('Neo4j schema created successfully.');
+      logger.debug('Neo4j schema created successfully.');
     } finally {
       await session.close();
     }
@@ -115,7 +117,7 @@ export class GraphClient {
     }
   }
 
-  async upsertRelationship(relationship: Relationship): Promise<void> {
+  async upsertRelationship(relationship: Relationship, repoPath: string = ''): Promise<void> {
     const session = this.driver.session();
     try {
       const query = `
@@ -125,6 +127,7 @@ export class GraphClient {
         SET r.line = $line,
             r.confidence = $confidence,
             r.metadata = $metadata,
+            r.repoPath = $repoPath,
             r.updatedAt = datetime()
         RETURN r
       `;
@@ -136,6 +139,7 @@ export class GraphClient {
         line: relationship.line || null,
         confidence: relationship.confidence,
         metadata: JSON.stringify(relationship.metadata || {}),
+        repoPath: repoPath || null,
       });
     } finally {
       await session.close();
@@ -335,6 +339,18 @@ export class GraphClient {
     }
   }
 
+  async deleteRelationship(sourceId: string, targetId: string, type: string, filePath: string): Promise<void> {
+    const session = this.driver.session();
+    try {
+      await session.run(
+        `MATCH (a {stableId: $sourceId})-[r:${type} {filePath: $filePath}]->(b {stableId: $targetId}) DELETE r`,
+        { sourceId, targetId, filePath }
+      );
+    } finally {
+      await session.close();
+    }
+  }
+
   async deleteEntitiesByFilePath(filePath: string, repoPath?: string): Promise<void> {
     const session = this.driver.session();
     try {
@@ -361,6 +377,97 @@ export class GraphClient {
         'MATCH (e) WHERE e.repoPath = $repoPath DETACH DELETE e',
         { repoPath }
       );
+    } finally {
+      await session.close();
+    }
+  }
+
+  // --- Reconciliation (verify / repair) helpers ----------------------------
+
+  async countEntities(repoPath: string): Promise<number> {
+    const session = this.driver.session();
+    try {
+      const result = await session.run(
+        'MATCH (e) WHERE e.repoPath = $repoPath RETURN count(e) AS count',
+        { repoPath }
+      );
+      return result.records[0].get('count').toNumber();
+    } finally {
+      await session.close();
+    }
+  }
+
+  async countEntitiesByType(repoPath: string): Promise<Array<{ type: string; count: number }>> {
+    const session = this.driver.session();
+    try {
+      const result = await session.run(
+        'MATCH (e) WHERE e.repoPath = $repoPath RETURN coalesce(e.type, "Unknown") AS type, count(e) AS count ORDER BY type',
+        { repoPath }
+      );
+      return result.records.map((record) => ({
+        type: record.get('type'),
+        count: record.get('count').toNumber(),
+      }));
+    } finally {
+      await session.close();
+    }
+  }
+
+  async listEntityStableIds(repoPath: string): Promise<string[]> {
+    const session = this.driver.session();
+    try {
+      const result = await session.run(
+        'MATCH (e) WHERE e.repoPath = $repoPath RETURN e.stableId AS stableId',
+        { repoPath }
+      );
+      return result.records.map((record) => record.get('stableId'));
+    } finally {
+      await session.close();
+    }
+  }
+
+  async countRelationships(repoPath: string): Promise<number> {
+    const session = this.driver.session();
+    try {
+      const result = await session.run(
+        'MATCH (a {repoPath: $repoPath})-[r]->(b) RETURN count(r) AS count',
+        { repoPath }
+      );
+      return result.records[0].get('count').toNumber();
+    } finally {
+      await session.close();
+    }
+  }
+
+  async countRelationshipsByType(repoPath: string): Promise<Array<{ type: string; count: number }>> {
+    const session = this.driver.session();
+    try {
+      const result = await session.run(
+        'MATCH (a {repoPath: $repoPath})-[r]->(b) RETURN type(r) AS type, count(r) AS count ORDER BY type',
+        { repoPath }
+      );
+      return result.records.map((record) => ({
+        type: record.get('type'),
+        count: record.get('count').toNumber(),
+      }));
+    } finally {
+      await session.close();
+    }
+  }
+
+  async listRelationshipKeys(repoPath: string): Promise<Array<{ sourceId: string; targetId: string; type: string; filePath: string }>> {
+    const session = this.driver.session();
+    try {
+      const result = await session.run(
+        'MATCH (a {repoPath: $repoPath})-[r]->(b) RETURN a.stableId AS sourceId, b.stableId AS targetId, type(r) AS type, r.filePath AS filePath',
+        { repoPath }
+      );
+      return result.records.map((record) => ({
+        sourceId: record.get('sourceId'),
+        targetId: record.get('targetId'),
+        type: record.get('type'),
+        filePath: record.get('filePath'),
+      }));
     } finally {
       await session.close();
     }

@@ -7,12 +7,23 @@
     "build": "pnpm -r run build",
     "dev": "pnpm --filter @repo-memory/app dev",
     "start": "pnpm --filter @repo-memory/app start",
-    "lint": "pnpm -r run lint",
+    "lint": "eslint .",
     "typecheck": "pnpm -r run typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "pnpm --filter @repo-memory/app bench",
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
     "db:reset": "docker compose down -v && docker compose up -d",
     "download-model": "pnpm --filter @repo-memory/analysis download-model"
+  },
+  "devDependencies": {
+    "eslint": "^9",
+    "eslint-config-prettier": "^9",
+    "globals": "^15",
+    "prettier": "^3",
+    "typescript-eslint": "^8",
+    "vitest": "^2.1.0"
   },
   "engines": {
     "node": ">=20"

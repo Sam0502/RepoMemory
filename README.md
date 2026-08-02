@@ -20,6 +20,9 @@ RepoMemory parses your codebase, builds a knowledge graph of entities (classes, 
 - **Ownership & domain inference** - per-file authors, domain/architectural-role classification, boundary validation
 - **Change analytics** - churn, risk, and architectural drift scoring from commit history
 - **Workspace queries** - cross-repo search, QA, and reporting across all scanned repositories
+- **Structured logging & metrics** - pino JSON logs with `PINO_LOG_LEVEL`, per-phase scan telemetry, and a Prometheus `/metrics` endpoint
+- **Reconciliation & repair jobs** - `verify`/`repair` dual-store (PostgreSQL vs Neo4j) consistency jobs via CLI and API, persisted to the `jobs` table
+- **Streaming analysis** - dead-code, boundaries, risk, and drift run over bounded paged windows (`ANALYSIS_BATCH_SIZE`) instead of loading whole repos, with a `pnpm bench` harness
 - **CLI and HTTP API** - query from command line or integrate with tools
 
 ## Prerequisites
@@ -92,6 +95,9 @@ node app/dist/cli.js scan --repo /path/to/repo --incremental
 # Scan working tree changes only
 node app/dist/cli.js scan --repo /path/to/repo --working-tree
 
+# Scan from a specific commit
+node app/dist/cli.js scan --repo /path/to/repo --commit <hash>
+
 # Start API server with frontend
 node app/dist/cli.js serve --repo /path/to/repo --port 3000
 
@@ -120,8 +126,15 @@ node app/dist/cli.js query dead-code --all-repos
 # List all scanned repositories
 node app/dist/cli.js workspace repos
 
+# Run pending database migrations (versioned, idempotent)
+node app/dist/cli.js db migrate
+
 # Show repository stats
 node app/dist/cli.js stats --repo /path/to/repo
+
+# Reconciliation & repair jobs (PostgreSQL vs Neo4j; also accept --all-repos)
+node app/dist/cli.js jobs verify --repo /path/to/repo
+node app/dist/cli.js jobs repair --repo /path/to/repo
 ```
 
 ## API Endpoints
@@ -145,19 +158,25 @@ node app/dist/cli.js stats --repo /path/to/repo
 | GET | `/api/commits/:hash` | Get commit details + file changes |
 | GET | `/api/context-pack/:stableId` | Generate context pack for AI |
 | GET | `/api/analysis/impact/:stableId` | Impact analysis |
-| GET | `/api/analysis/dead-code` | Dead code report (`?includeExported=true`) |
+| GET | `/api/analysis/dead-code` | Dead code report (`?includeExported=true`, `?batchSize=`) |
 | GET | `/api/analysis/ownership` | Per-file dominant author report |
-| GET | `/api/analysis/boundaries` | Domain boundaries + violations |
+| GET | `/api/analysis/boundaries` | Domain boundaries + violations (`?batchSize=`) |
 | GET | `/api/analysis/churn` | Top changed files with churn scores (`?limit=`) |
 | GET | `/api/analysis/risk` | Repo-level risk with explainable breakdown |
 | GET | `/api/analysis/risk/:stableId` | Entity-level change/risk info |
 | GET | `/api/analysis/drift` | Architecture drift signals with evidence |
 | POST | `/api/qa/ask` | Natural-language QA (`{"question": "..."}`) |
+| GET | `/api/jobs` | List reconciliation/repair jobs (`?type=`, `?limit=`) |
+| GET | `/api/jobs/:id` | Get a job + its report |
+| POST | `/api/jobs/verify` | Verify PostgreSQL vs Neo4j (`{"repoPath": "..."}`) |
+| POST | `/api/jobs/repair` | Repair: re-sync Neo4j from PostgreSQL |
 | GET | `/api/workspace/repos` | List all scanned repositories + stats |
 | GET | `/api/workspace/entities` | Cross-repo entity list |
 | GET | `/api/workspace/entities/search/:query` | Cross-repo search |
 | GET | `/api/workspace/entities/type/:type` | Cross-repo type listing |
+| GET | `/api/workspace/entities/:stableId` | Cross-repo entity lookup by ID |
 | POST | `/api/workspace/qa/ask` | Cross-repo QA (answers name their repo) |
+| GET | `/metrics` | Prometheus metrics (disable with `METRICS_ENABLED=false`) |
 
 All non-workspace endpoints are scoped to the repository passed to `serve --repo`. Workspace endpoints always read across every scanned repository.
 
@@ -204,6 +223,15 @@ GEMINI_API_KEY=your-key
 
 # Embedding model cache directory
 EMBEDDING_CACHE_DIR=./models
+
+# Analysis page size for streaming dead-code/boundaries/risk/drift (default 5000)
+ANALYSIS_BATCH_SIZE=5000
+
+# Structured logging level for the pino logger (fatal/error/warn/info/debug/trace)
+PINO_LOG_LEVEL=info
+
+# Expose the /metrics Prometheus endpoint (set to 'false' to disable)
+METRICS_ENABLED=true
 ```
 
 ## Development
@@ -217,6 +245,15 @@ pnpm build
 
 # Type check
 pnpm typecheck
+
+# Lint (ESLint)
+pnpm lint
+
+# Run tests (Vitest)
+pnpm test
+
+# Benchmark streaming analysis on a scanned repo (optionally --full to scan first)
+pnpm bench --repo /path/to/repo
 
 # Start databases
 pnpm db:up
@@ -241,6 +278,7 @@ pnpm db:down
 - **Domain inference**: per-file domain + architectural role + optional `.repomemory/boundaries.json`
 - **Boundary validation**: cross-domain edge reports against domain rules
 - **Change analysis**: `ChangeAnalyzer` computes churn, file risk, entity change info, and drift signals
+- **Streaming analysis**: dead-code/boundaries/risk/drift run over bounded paged windows (`ANALYSIS_BATCH_SIZE`) so peak memory stays O(working-set) regardless of repo size
 - Multi-provider embeddings (ONNX local, Gemini API, placeholder fallback)
 
 ### Storage Layer
@@ -298,7 +336,7 @@ pnpm db:down
 - CALLS, REFERENCES, and CONTAINS relationship detection
 - Parser caching for better performance
 
-**Phase 4 Complete** (v0.5.0–v0.6.0, M1–M9):
+**Phase 4 Complete** (v0.5.0–v0.7.0, M1–M9):
 - Cross-file symbol resolution (`SymbolIndex` + `RelationshipResolver`)
 - Dead code detection (reachability analysis)
 - Ownership & domain inference with `.repomemory/boundaries.json` config
@@ -309,10 +347,14 @@ pnpm db:down
 - Workspace-wide cross-repo workflows (workspace API, CLI `--all-repos`, frontend repo dropdown)
 - Entity-change correlation (churn, risk, drift scoring)
 
-**Next (Phase 4 deferrals / Phase 5):**
-- Multi-language parser support (Go, Rust, Java, etc.)
-- Performance hardening and reconciliation/repair jobs
-- Observability, metrics, and quality gates
+**Next (Phase 5: Hardening & Observability):**
+- ✅ Test foundation & quality gates (Vitest, ESLint, CI) — unit tests across 12 files, `pnpm lint`/`pnpm typecheck`/`pnpm test` green
+- ✅ Versioned schema migrations (replacing the monolithic `SCHEMA_SQL`; `schema_migrations` ledger + `repo-memory db migrate`)
+- ✅ Structured logging (`pino` + `Logger`), scan telemetry (`ScanReport` with per-phase timings), `/metrics` Prometheus endpoint, request logging + `X-Request-Id`
+- ✅ Reconciliation & repair jobs over the dual PG/Neo4j store (`repo-memory jobs verify|repair`, `jobs` API)
+- ✅ Streaming analysis for repository scale (`ANALYSIS_BATCH_SIZE` paged dead-code/boundaries/risk/drift) + `pnpm bench` benchmark harness
+- Live file watching (`repo-memory watch`)
+- Multi-language parsers (Go, Rust, Java)
 
 ## License
 

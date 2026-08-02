@@ -1,6 +1,6 @@
 import { Entity, Relationship, EntityType, FileChurnRow } from '@repo-memory/shared';
-import { detectDeadCode } from './deadcode.js';
-import { validateBoundaries } from './boundaries.js';
+import { streamDeadCode, streamBoundaries, forEachPage, resolveBatchSize } from './streaming.js';
+import type { PagedSource } from './streaming.js';
 
 export interface FileChurn {
   filePath: string;
@@ -54,11 +54,17 @@ export interface DriftReport {
 
 // Minimal data access contract so the analysis package stays free of
 // pg/storage/graph dependencies. The API/orchestrator layers implement it.
+// Paged methods are preferred by the streaming analysis paths; when absent the
+// full-array `entities`/`relationships` methods are sliced into pages instead
+// (identical results, larger peak memory).
 export interface ChangeDataProvider {
   fileChurnRows(repoPath: string, days?: number): Promise<FileChurnRow[]>;
   entities(repoPath: string): Promise<Entity[]>;
   relationships(repoPath: string): Promise<Relationship[]>;
   lastCommitDate(repoPath: string): Promise<Date | null>;
+  entityPage?(repoPath: string, offset: number, limit: number): Promise<Entity[]>;
+  relationshipPage?(repoPath: string, offset: number, limit: number): Promise<Relationship[]>;
+  entityByStableId?(repoPath: string, stableId: string): Promise<Entity | null>;
 }
 
 const DELETE_WEIGHT = 2;
@@ -71,8 +77,32 @@ function daysBetween(from: Date, to: Date): number {
   return Math.max(0, (to.getTime() - from.getTime()) / 86400000);
 }
 
+function lazyPageSource<T>(load: () => Promise<T[]>): PagedSource<T> {
+  let cache: T[] | null = null;
+  return {
+    page: async (offset: number, limit: number) => {
+      cache ??= await load();
+      return cache.slice(offset, offset + limit);
+    },
+  };
+}
+
 export class ChangeAnalyzer {
   constructor(private provider: ChangeDataProvider) {}
+
+  private entitySource(repoPath: string): PagedSource<Entity> {
+    if (this.provider.entityPage) {
+      return { page: (offset, limit) => this.provider.entityPage!(repoPath, offset, limit) };
+    }
+    return lazyPageSource(() => this.provider.entities(repoPath));
+  }
+
+  private relationshipSource(repoPath: string): PagedSource<Relationship> {
+    if (this.provider.relationshipPage) {
+      return { page: (offset, limit) => this.provider.relationshipPage!(repoPath, offset, limit) };
+    }
+    return lazyPageSource(() => this.provider.relationships(repoPath));
+  }
 
   async computeFileChurn(repoPath: string, limit: number = 50, days?: number): Promise<FileChurn[]> {
     const rows = await this.provider.fileChurnRows(repoPath, days);
@@ -95,39 +125,49 @@ export class ChangeAnalyzer {
   }
 
   async computeFileRisk(repoPath: string): Promise<FileRisk[]> {
-    const [churnList, entities, relationships] = await Promise.all([
-      this.computeFileChurn(repoPath, 1000),
-      this.provider.entities(repoPath),
-      this.provider.relationships(repoPath),
+    const batchSize = resolveBatchSize();
+    const entities = this.entitySource(repoPath);
+    const relationships = this.relationshipSource(repoPath);
+
+    // Dead code + boundary reports are computed over the same paged streams the
+    // rest of the analysis uses, so only one window of each store is resident at
+    // a time regardless of repo size.
+    const churnList = await this.computeFileChurn(repoPath, 1000);
+    const [dead, boundary] = await Promise.all([
+      streamDeadCode(entities, relationships, { batchSize }),
+      streamBoundaries(entities, relationships, undefined, { batchSize }),
     ]);
-
-    const dead = detectDeadCode(entities, relationships);
     const deadIds = new Set(dead.deadCode.map(i => i.entity.stableId));
-    const boundary = validateBoundaries(entities, relationships);
 
-    // Entities grouped by file (excluding File nodes themselves)
-    const entitiesByFile = new Map<string, Entity[]>();
+    // Entities grouped by file (excluding File nodes themselves), stored as
+    // bare stable IDs so we never hold the full entity objects in memory.
+    const entitiesByFile = new Map<string, string[]>();
     const targetFileOf = new Map<string, string>();
-    for (const entity of entities) {
-      if (entity.type === EntityType.FILE) continue;
-      const key = normalizePath(entity.filePath);
-      if (!entitiesByFile.has(key)) entitiesByFile.set(key, []);
-      entitiesByFile.get(key)!.push(entity);
-      targetFileOf.set(entity.stableId, key);
-    }
+    await forEachPage(entities, batchSize, (rows) => {
+      for (const entity of rows) {
+        if (entity.type === EntityType.FILE) continue;
+        const key = normalizePath(entity.filePath);
+        const list = entitiesByFile.get(key);
+        if (list) list.push(entity.stableId);
+        else entitiesByFile.set(key, [entity.stableId]);
+        targetFileOf.set(entity.stableId, key);
+      }
+    });
 
-    // Inbound fan-out per file: count relationships whose target is in that file
+    // Inbound fan-out per file: count relationships whose target is in that file.
     const fanoutByFile = new Map<string, number>();
-    for (const rel of relationships) {
-      const targetFile = targetFileOf.get(rel.targetId);
-      if (targetFile) fanoutByFile.set(targetFile, (fanoutByFile.get(targetFile) || 0) + 1);
-    }
+    await forEachPage(relationships, batchSize, (rows) => {
+      for (const rel of rows) {
+        const targetFile = targetFileOf.get(rel.targetId);
+        if (targetFile) fanoutByFile.set(targetFile, (fanoutByFile.get(targetFile) || 0) + 1);
+      }
+    });
 
     const maxChurn = Math.max(1, ...churnList.map(c => c.churnScore));
 
     const risks: FileRisk[] = [];
     for (const churn of churnList) {
-      const fileEntities = entitiesByFile.get(churn.filePath) || [];
+      const fileStableIds = entitiesByFile.get(churn.filePath) || [];
       const churnRisk = Math.round((churn.churnScore / maxChurn) * 100);
       const fanout = fanoutByFile.get(churn.filePath) || 0;
       const fanoutRisk = Math.min(100, fanout * 10);
@@ -135,7 +175,7 @@ export class ChangeAnalyzer {
         v => normalizePath(v.source.filePath) === churn.filePath || normalizePath(v.target.filePath) === churn.filePath
       );
       const boundaryRisk = Math.min(100, violations.length * 25);
-      const deadCount = fileEntities.filter(e => deadIds.has(e.stableId)).length;
+      const deadCount = fileStableIds.filter(id => deadIds.has(id)).length;
       const deadCodeRisk = Math.min(100, deadCount * 25);
       const stalenessRisk = Math.min(100, (churn.daysSinceLastChange / 365) * 100);
 
@@ -162,8 +202,9 @@ export class ChangeAnalyzer {
   }
 
   async computeEntityChange(repoPath: string, stableId: string): Promise<EntityChangeInfo | null> {
-    const entities = await this.provider.entities(repoPath);
-    const entity = entities.find(e => e.stableId === stableId);
+    const entity = this.provider.entityByStableId
+      ? await this.provider.entityByStableId(repoPath, stableId)
+      : (await this.provider.entities(repoPath)).find(e => e.stableId === stableId);
     if (!entity) return null;
 
     const churn = await this.computeFileChurn(repoPath, 100000);
@@ -184,15 +225,33 @@ export class ChangeAnalyzer {
 
   async detectDrift(repoPath: string): Promise<DriftReport> {
     const WINDOW_DAYS = 90;
-    const [recent, all, entities, relationships] = await Promise.all([
+    const batchSize = resolveBatchSize();
+    const entities = this.entitySource(repoPath);
+    const relationships = this.relationshipSource(repoPath);
+
+    const [recent, all] = await Promise.all([
       this.computeFileChurn(repoPath, 200, WINDOW_DAYS),
       this.computeFileChurn(repoPath, 2000),
-      this.provider.entities(repoPath),
-      this.provider.relationships(repoPath),
     ]);
 
     const recentByFile = new Map(recent.map(c => [c.filePath, c]));
-    const fileNames = new Set(entities.map(e => normalizePath(e.filePath)));
+
+    // Stream entities to collect the file-path universe and per-file exported
+    // symbol counts; neither needs the full entity objects retained.
+    const fileNames = new Set<string>();
+    const exportedByFile = new Map<string, number>();
+    await forEachPage(entities, batchSize, (rows) => {
+      for (const entity of rows) {
+        const key = normalizePath(entity.filePath);
+        fileNames.add(key);
+        if (entity.isExported) {
+          exportedByFile.set(key, (exportedByFile.get(key) || 0) + 1);
+        }
+      }
+    });
+
+    const boundary = await streamBoundaries(entities, relationships, undefined, { batchSize });
+
     const signals: DriftSignal[] = [];
 
     const isTestPath = (p: string) => /(test|tests|__tests__|spec)/i.test(p) && /\.(test|spec)\.|test_|_test/.test(p);
@@ -222,7 +281,6 @@ export class ChangeAnalyzer {
     }
 
     // Boundary violations involving files that changed recently
-    const boundary = validateBoundaries(entities, relationships);
     const violatingRecent = boundary.violations.filter(
       v => recentByFile.has(normalizePath(v.source.filePath)) || recentByFile.has(normalizePath(v.target.filePath))
     );
@@ -238,13 +296,6 @@ export class ChangeAnalyzer {
     }
 
     // Unstable public surfaces: exported symbols in files touched by many commits
-    const exportedByFile = new Map<string, number>();
-    for (const entity of entities) {
-      if (entity.isExported) {
-        const key = normalizePath(entity.filePath);
-        exportedByFile.set(key, (exportedByFile.get(key) || 0) + 1);
-      }
-    }
     for (const churn of all) {
       const exported = exportedByFile.get(churn.filePath) || 0;
       if (exported > 0 && churn.commits >= 5) {

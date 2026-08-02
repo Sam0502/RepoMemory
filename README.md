@@ -23,6 +23,7 @@ RepoMemory parses your codebase, builds a knowledge graph of entities (classes, 
 - **Structured logging & metrics** - pino JSON logs with `PINO_LOG_LEVEL`, per-phase scan telemetry, and a Prometheus `/metrics` endpoint
 - **Reconciliation & repair jobs** - `verify`/`repair` dual-store (PostgreSQL vs Neo4j) consistency jobs via CLI and API, persisted to the `jobs` table
 - **Streaming analysis** - dead-code, boundaries, risk, and drift run over bounded paged windows (`ANALYSIS_BATCH_SIZE`) instead of loading whole repos, with a `pnpm bench` harness
+- **Live file watching** - `repo-memory watch` re-scans changed files on every edit (debounced) via the incremental path, with a live status indicator in the frontend
 - **CLI and HTTP API** - query from command line or integrate with tools
 
 ## Prerequisites
@@ -101,6 +102,9 @@ node app/dist/cli.js scan --repo /path/to/repo --commit <hash>
 # Start API server with frontend
 node app/dist/cli.js serve --repo /path/to/repo --port 3000
 
+# Watch a repo live — re-scans changed files on every edit (debounced)
+node app/dist/cli.js watch --repo /path/to/repo --port 3000
+
 # Query entities
 node app/dist/cli.js query search "GraphClient"
 
@@ -142,6 +146,7 @@ node app/dist/cli.js jobs repair --repo /path/to/repo
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
+| GET | `/api/status` | Live watch status (`watching`, `lastScanAt`, `pendingChanges`) |
 | GET | `/api/entities` | List all entities |
 | GET | `/api/entities/:id` | Get entity by ID |
 | GET | `/api/entities/search/:query` | Search entities |
@@ -353,7 +358,8 @@ pnpm db:down
 - ✅ Structured logging (`pino` + `Logger`), scan telemetry (`ScanReport` with per-phase timings), `/metrics` Prometheus endpoint, request logging + `X-Request-Id`
 - ✅ Reconciliation & repair jobs over the dual PG/Neo4j store (`repo-memory jobs verify|repair`, `jobs` API)
 - ✅ Streaming analysis for repository scale (`ANALYSIS_BATCH_SIZE` paged dead-code/boundaries/risk/drift) + `pnpm bench` benchmark harness
-- Live file watching (`repo-memory watch`)
+- ✅ Live file watching (`repo-memory watch`, `GET /api/status`, frontend live indicator)
+- Multi-language parsers (Go, Rust, Java)
 - Multi-language parsers (Go, Rust, Java)
 
 ## License

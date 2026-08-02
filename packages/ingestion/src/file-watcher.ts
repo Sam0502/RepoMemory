@@ -101,9 +101,12 @@ export class FileWatcher extends EventEmitter {
   }
 
   private getRelativePath(absolutePath: string): string {
+    let relative = absolutePath;
     if (absolutePath.startsWith(this.repoPath)) {
-      return absolutePath.slice(this.repoPath.length + 1);
+      relative = absolutePath.slice(this.repoPath.length + 1);
     }
-    return absolutePath;
+    // Normalize to forward slashes so watcher paths match the git-derived
+    // relative paths stored in the database on all platforms.
+    return relative.replace(/\\/g, '/');
   }
 }

@@ -971,7 +971,36 @@ function renderQaAnswer(ans) {
   if (entEl) entEl.addEventListener('click', () => selectEntity(entEl.dataset.stableId));
 }
 
+// --- Live watch indicator (5.6) ---
+const liveIndicator = document.getElementById('liveIndicator');
+const liveLabel = document.getElementById('liveLabel');
+
+function renderLiveStatus(status) {
+  if (!liveIndicator) return;
+  if (status && status.watching) {
+    liveIndicator.classList.remove('hidden', 'not-watching');
+    const pending = status.pendingChanges > 0 ? ` · ${status.pendingChanges} pending` : '';
+    liveLabel.textContent = status.lastScanAt
+      ? `Live · synced ${timeAgo(status.lastScanAt)}${pending}`
+      : `Live${pending}`;
+    liveIndicator.title = `${status.repoPath}\nLast scan: ${status.lastScanAt || 'n/a'}\nPending: ${status.pendingChanges}`;
+  } else {
+    liveIndicator.classList.add('hidden', 'not-watching');
+  }
+}
+
+async function pollLiveStatus() {
+  try {
+    const status = await api('/api/status');
+    renderLiveStatus(status);
+  } catch {
+    renderLiveStatus(null);
+  }
+}
+
 // --- Init ---
 Promise.all([loadRepos(), loadEntities(), loadArchitectureGraph()]).catch(err => {
   entityListContent.innerHTML = `<div class="empty-state">Failed to connect<br><small>${escHtml(err.message)}</small></div>`;
 });
+pollLiveStatus();
+setInterval(pollLiveStatus, 5000);

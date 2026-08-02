@@ -470,7 +470,7 @@ We ingest commit history + file changes + per-entity `firstSeenCommit`/`lastSeen
 ### Phase 5: Hardening & Observability
 
 **Start Date:** 2026-08-02
-**Completed:** TBD (5.1–5.5 complete)
+**Completed:** TBD (5.1–5.6 complete)
 
 Phase 5 hardens the engine for real-world use: a real test suite (currently none exists), structured observability, versioned schema migrations, dual-store reconciliation with repair jobs, streaming analysis for repository scale, live file watching, and the deferred Go/Rust/Java parsers. It turns the monolithic scan into a monitored, repairable, quality-gated pipeline.
 
@@ -479,7 +479,7 @@ Phase 5 hardens the engine for real-world use: a real test suite (currently none
 - No structured logging/metrics — ~75 raw `console.log/error` call sites ✅ (5.3)
 - `migrate()` is one monolithic idempotent SQL blob, not versioned; `storage` `db:migrate` script points at a nonexistent `src/migrate.ts` ✅ (5.2)
 - `jobs` table exists in the schema but is never written to ✅ (5.4)
-- `FileWatcher` (chokidar) exists but is never wired into the orchestrator
+- `FileWatcher` (chokidar) exists but is never wired into the orchestrator ✅ (5.6)
 - Dead-code / risk / drift / boundaries load entire repo datasets into memory via paged loops ✅ (5.5)
 - No reconciliation or repair path for the dual-store (PostgreSQL + Neo4j) split ✅ (5.4)
 - Only TypeScript / JavaScript / Python parsers ship
@@ -544,11 +544,15 @@ Phase 5 hardens the engine for real-world use: a real test suite (currently none
 - **Tests**: `packages/analysis/test/streaming.test.ts` (9 tests) — `forEachPage` windowing/short-page stop, `resolveBatchSize` env/arg precedence, streaming↔in-memory dead-code and boundaries parity, batch-size independence, non-entity endpoint exclusion; plus a paged-vs-array `computeFileRisk` parity test in `change.test.ts`
 - **Verify**: `pnpm -r run typecheck`, `pnpm lint`, `pnpm test` green (131 tests); live parity script + live server API checks above
 
-#### 5.6 Live File Watching
-- Wire the existing `FileWatcher` (chokidar) into the orchestrator: on `file:change`/`file:add`/`file:delete`, run the same path the incremental scan uses for a single file (`processChanges` single-file path, `handleFileDeletion`)
-- New CLI mode: `repo-memory watch --repo <path>` — starts a server + watcher, updates the graph on every edit (debounced)
-- API: `GET /api/status` returning watched repo + last scan time (frontend "live" indicator)
-- **Verify**: `watch` a small repo, edit a function, confirm the entity updates and dependents reflect the change without a manual scan
+#### 5.6 Live File Watching ✅ COMPLETE
+- **Status:** Completed 2026-08-02. Verified live: watched a scratch repo and added a function (`div`) to a `.ts` file — the entity appeared via `GET /api/entities` with no manual scan; editing an importer and deleting a file (`main.ts`) both propagated to the graph on the next debounce window (~500ms), `repo_state.last_scan_at` updated each time, and `GET /api/status` reported `watching: true` throughout.
+- **Orchestrator** (`app/src/orchestrator.ts`): `startWatching({ debounceMs? })` / `stopWatching()` create and own a `FileWatcher`; each `file:change`/`file:add`/`file:delete` event is queued and flushed on a debounce window through `processWatchChanges`, which reuses the exact incremental single-file path (`processChanges` + `handleFileDeletion`) but skips commit recording (the working tree is not a commit). `touchRepoState()` updates `last_scan_at` so the status reflects live edits. `close()` now stops the watcher
+- **Path normalization**: `FileWatcher.getRelativePath` now returns forward-slash relative paths so watcher events match the git-derived paths already in the database (fixes path mismatch on Windows)
+- **API**: `GET /api/status` returns `{ repoPath, watching, lastScanAt, pendingChanges }` via an optional `getStatus` provider on `ApiConfig` (defaults to `watching: false` when unwired) — powers the frontend "live" indicator
+- **CLI**: `repo-memory watch --repo <path> [--port] [--host] [--debounce <ms>]` — seeds the graph with a full scan on first watch (when no entity data exists), starts the watcher, then serves the API with status wired. Graceful SIGINT/SIGTERM shutdown
+- **Frontend**: a header "live" dot indicator (`#liveIndicator`) polls `/api/status` every 5s, showing "Live · synced <timeAgo>" plus a pending-changes count while watching
+- **Tests**: `packages/ingestion/test/file-watcher.test.ts` (2 tests, real chokidar temp-dir integration: add/change/delete events + relative-path normalization) and `packages/api/test/status.test.ts` (2 tests: default `watching:false` payload and provider passthrough)
+- **Verify**: `pnpm -r run typecheck`, `pnpm lint`, `pnpm test` green (135 tests)
 
 #### 5.7 Multi-Language Parsers (Go, Rust, Java)
 - Add grammar entries for `go`, `rust`, `java` to `tree-sitter-init.ts` `PARSER_CONFIGS` (from `tree-sitter-wasms` bundle where available; verify ABI against pinned `web-tree-sitter@0.22.6`)

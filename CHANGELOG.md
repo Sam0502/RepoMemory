@@ -2,6 +2,18 @@
 
 All notable changes to RepoMemory will be documented in this file.
 
+## [0.12.0] - 2026-08-02
+
+### Added (M15) - Live File Watching (5.6)
+- **Orchestrator watch mode** (`app/src/orchestrator.ts`): `startWatching({ debounceMs? })` / `stopWatching()` create and own the existing `FileWatcher` (chokidar). Each `file:change`/`file:add`/`file:delete` event is queued and flushed on a debounce window through `processWatchChanges`, which reuses the exact incremental single-file path (`processChanges` + `handleFileDeletion`) but skips commit recording (the working tree is not a commit). `touchRepoState()` bumps `repo_state.last_scan_at` so live status reflects edits; `close()` now stops the watcher
+- **Path normalization**: `FileWatcher.getRelativePath` now returns forward-slash relative paths, matching the git-derived paths stored in the database (fixes mismatch on Windows where chokidar emitted backslash paths)
+- **API**: `GET /api/status` returns `{ repoPath, watching, lastScanAt, pendingChanges }` via an optional `getStatus` provider on `ApiConfig` (defaults to `watching: false` when unwired) — `RepoStatus` added to `packages/shared`
+- **CLI**: `repo-memory watch --repo <path> [--port] [--host] [--debounce <ms>]` — seeds the graph with a full scan on first watch (when no entity data exists), starts the watcher, then serves the API with status wired. Graceful SIGINT/SIGTERM shutdown
+- **Frontend**: header "live" dot indicator (`#liveIndicator`) polls `/api/status` every 5s, showing "Live · synced <timeAgo>" plus a pending-changes count while watching
+- **Tests**: `packages/ingestion/test/file-watcher.test.ts` (2 tests, real chokidar temp-dir integration: add/change/delete events + relative-path normalization) and `packages/api/test/status.test.ts` (2 tests: default `watching:false` payload and provider passthrough) — 4 new tests
+- **Verified end-to-end**: watched a scratch repo; adding a function (`div`) to a `.ts` file appeared via `GET /api/entities` with no manual scan; editing an importer and deleting `main.ts` both propagated to the graph within the ~500ms debounce window; `lastScanAt` updated on each watch scan
+- `pnpm typecheck`, `pnpm lint`, and `pnpm test` are green (135 tests)
+
 ## [0.11.0] - 2026-08-02
 
 ### Added (M14) - Streaming Analysis for Repository Scale (5.5)

@@ -6,7 +6,7 @@ import { EntityRepository, RelationshipRepository, CommitRepository, JobReposito
 import { parseDomainConfig, ChangeAnalyzer, streamDeadCode, streamBoundaries, resolveBatchSize } from '@repo-memory/analysis';
 import type { DomainConfig } from '@repo-memory/analysis';
 import { Entity, Relationship, RelationshipType, JobType, getLogger, metrics, registerDefaultMetrics } from '@repo-memory/shared';
-import type { Logger, Job } from '@repo-memory/shared';
+import type { Logger, Job, RepoStatus } from '@repo-memory/shared';
 import { Pool } from 'pg';
 import { readFileSync } from 'fs';
 import { join } from 'path';
@@ -24,6 +24,9 @@ export interface ApiConfig {
   // Optional job runner (wired from the CLI's initialized orchestrator). When
   // absent, the POST job endpoints respond 501 but job history stays readable.
   runJob?: (type: JobType, repoPath?: string) => Promise<Job>;
+  // Optional live-status provider (wired from the CLI's `watch` mode). When
+  // absent, `GET /api/status` reports the repo as not being watched.
+  getStatus?: () => Promise<RepoStatus>;
 }
 
 export function createApp(config: ApiConfig, webDir?: string): Hono {
@@ -159,6 +162,14 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   // Health check
   app.get('/health', (c) => {
     return c.json({ status: 'ok', timestamp: new Date().toISOString() });
+  });
+
+  // Live status (watch mode): watched repo + last scan time for the "live" indicator
+  app.get('/api/status', async (c) => {
+    const status = config.getStatus
+      ? await config.getStatus()
+      : { repoPath: config.repoPath, watching: false, lastScanAt: null, pendingChanges: 0 };
+    return c.json(status);
   });
 
   // Prometheus metrics (disable with METRICS_ENABLED=false)

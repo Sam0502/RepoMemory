@@ -344,6 +344,65 @@ program
   });
 
 program
+  .command('watch')
+  .description('Watch the repository and update the graph on every edit (debounced)')
+  .option('-r, --repo <path>', 'Repository path', process.cwd())
+  .option('-p, --port <port>', 'Server port', '3000')
+  .option('-h, --host <host>', 'Server host', 'localhost')
+  .option('-d, --debounce <ms>', 'Watch debounce in milliseconds', '500')
+  .action(async (options) => {
+    const repoPath = resolve(options.repo);
+    const port = parseInt(options.port);
+    const host = options.host;
+    const debounceMs = parseInt(options.debounce);
+
+    logger.info({ repoPath, debounceMs }, 'Starting watch mode');
+
+    const orchestrator = new Orchestrator({ repoPath, embeddings: getEmbeddingConfig() });
+    await orchestrator.initialize();
+
+    // Seed the graph on first watch (full scan if nothing is stored yet).
+    const hasData = await orchestrator.hasStoredData();
+    if (!hasData) {
+      logger.info('No prior scan found — running initial full scan');
+      printScanReport(await orchestrator.scanFullRepository());
+    }
+
+    await orchestrator.startWatching({ debounceMs });
+
+    // Start API server (with live status wired to the watcher)
+    const graphClient = new GraphClient();
+    const pgPool = await createPool({
+      host: 'localhost',
+      port: 5433,
+      database: 'repo_memory',
+      user: 'repo_memory',
+      password: 'repo-memory-password',
+    });
+
+    startServer({
+      port,
+      host,
+      repoPath,
+      graphClient,
+      pgPool,
+      logger,
+      runJob: (type, repoPath) => orchestrator.runJob(type, repoPath),
+      getStatus: () => orchestrator.getStatus(),
+    }, resolve(process.cwd(), 'web'));
+
+    // Keep the process alive; clean up the watcher on shutdown.
+    const shutdown = async () => {
+      logger.info('Shutting down watch mode');
+      await orchestrator.stopWatching();
+      await orchestrator.close();
+      process.exit(0);
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+  });
+
+program
   .command('jobs')
   .description('Run reconciliation & repair jobs (verify / repair)')
   .argument('<action>', 'Job: verify, repair')

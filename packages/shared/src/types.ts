@@ -196,6 +196,15 @@ export interface ScanReport {
   completedAt: string;
 }
 
+// Live status of a watched repository (5.6) — surfaced by `GET /api/status`
+// and used by the frontend "live" indicator.
+export interface RepoStatus {
+  repoPath: string;
+  watching: boolean;
+  lastScanAt: string | null;
+  pendingChanges: number;
+}
+
 export const JobType = {
   VERIFY: 'verify',
   REPAIR: 'repair',

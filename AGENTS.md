@@ -139,13 +139,16 @@ node app/dist/cli.js query search "createUser" --all-repos
 node app/dist/cli.js query dead-code --all-repos
 ```
 
-### Workspace / Serve / Stats
+### Workspace / Serve / Watch / Stats
 ```bash
 # List all scanned repositories with entity/commit counts
 node app/dist/cli.js workspace repos
 
 # Start API server
 node app/dist/cli.js serve --repo /path/to/repo --port 3000
+
+# Watch a repo live — re-scans changed files on every edit (debounced), serves API
+node app/dist/cli.js watch --repo /path/to/repo --port 3000 --debounce 500
 
 # Show stats
 node app/dist/cli.js stats --repo /path/to/repo
@@ -176,6 +179,7 @@ pnpm --filter @repo-memory/storage db:migrate
 
 ## API Endpoints
 - `GET /health` - Health check
+- `GET /api/status` - Live watch status (`watching`, `lastScanAt`, `pendingChanges`)
 - `GET /api/entities` - List entities
 - `GET /api/entities/:id` - Get entity by ID
 - `GET /api/entities/search/:query` - Search entities

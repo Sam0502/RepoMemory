@@ -110,6 +110,37 @@ header h1 {
   white-space: nowrap;
 }
 
+.live-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #8b949e;
+  white-space: nowrap;
+  margin-left: 8px;
+}
+
+.live-indicator .live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #3fb950;
+  box-shadow: 0 0 6px rgba(63, 185, 80, 0.6);
+  animation: livePulse 2s infinite;
+}
+
+.live-indicator.not-watching .live-dot {
+  background: #8b949e;
+  box-shadow: none;
+  animation: none;
+}
+
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+
 main {
   flex: 1;
   display: flex;

@@ -1,7 +1,7 @@
 import { Pool } from 'pg';
 import { GraphClient } from '@repo-memory/graph';
 import { EntityRepository, RelationshipRepository, CommitRepository, JobRepository, migrate, createPool } from '@repo-memory/storage';
-import { GitOperations } from '@repo-memory/ingestion';
+import { GitOperations, FileWatcher } from '@repo-memory/ingestion';
 import {
   TreeSitterParser, getLanguageFromFilePath, shouldParseFile, isConfigFilePath,
   configureEmbeddings, generateEntityEmbedding, getProviderName,
@@ -12,7 +12,7 @@ import {
 import type { EmbeddingConfig, DeadCodeReport, DomainConfig, BoundaryReport } from '@repo-memory/analysis';
 import { Language, RelationshipType, getLogger, metrics, registerDefaultMetrics } from '@repo-memory/shared';
 import type { Logger } from '@repo-memory/shared';
-import type { Entity, Relationship, ParseResult, ScanReport, ScanPhaseReport, ScanType, Job, JobType, VerificationReport, RepairReport, TypeCountDelta } from '@repo-memory/shared';
+import type { Entity, Relationship, ParseResult, ScanReport, ScanPhaseReport, ScanType, Job, JobType, VerificationReport, RepairReport, TypeCountDelta, RepoStatus, FileChange } from '@repo-memory/shared';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
@@ -61,6 +61,12 @@ export class Orchestrator {
   private domainConfig: DomainConfig | null = null;
   private changeAnalyzer: ChangeAnalyzer | null = null;
   private scanState: ScanState | null = null;
+  private watcher: FileWatcher | null = null;
+  private watchQueue: Array<{ filePath: string; status: string }> = [];
+  private watchDebounceMs = 500;
+  private watchTimer: NodeJS.Timeout | null = null;
+  private watchProcessing = false;
+  private lastWatchScanAt: Date | null = null;
 
   constructor(config: OrchestratorConfig) {
     this.config = config;
@@ -484,6 +490,159 @@ export class Orchestrator {
     await this.annotateEntitiesWithCommits();
 
     return this.finishScan(changes.length, stats.filesParsed, stats.entitiesExtracted, stats.relationshipsExtracted, stats.embeddingsGenerated, stats.entitiesStored, stats.relationshipsStored);
+  }
+
+  // --- Live file watching (5.6) ---------------------------------------------
+  //
+  // Watches the working tree with chokidar (via FileWatcher) and replays each
+  // file:change / file:add / file:delete through the same incremental-scan path
+  // (processChanges single-file path / handleFileDeletion). Events are queued
+  // and flushed on a debounce window so a burst of edits coalesces into one
+  // incremental scan.
+
+  async startWatching(options: { debounceMs?: number } = {}): Promise<void> {
+    if (this.watcher) return;
+    this.watchDebounceMs = options.debounceMs ?? 500;
+    this.lastWatchScanAt = null;
+
+    this.watcher = new FileWatcher(this.config.repoPath, { ignoreInitial: true });
+    this.watcher.on('file:change', (change) => this.queueWatchChange(change));
+    this.watcher.on('file:add', (change) => this.queueWatchChange(change));
+    this.watcher.on('file:delete', (change) => this.queueWatchChange(change));
+    this.watcher.on('error', (err) => this.logger.error({ err }, 'File watcher error'));
+    this.watcher.start();
+
+    this.logger.info({ repoPath: this.config.repoPath, debounceMs: this.watchDebounceMs }, 'Watching repository for changes');
+  }
+
+  async stopWatching(): Promise<void> {
+    if (this.watchTimer) {
+      clearTimeout(this.watchTimer);
+      this.watchTimer = null;
+    }
+    if (this.watcher) {
+      await this.watcher.stop();
+      this.watcher = null;
+    }
+    this.logger.info('Stopped watching repository');
+  }
+
+  private queueWatchChange(change: FileChange): void {
+    // Normalize to forward slashes so watcher paths match the git-derived
+    // relative paths stored in the database on all platforms.
+    const normalize = (p: string): string => p.replace(/\\/g, '/');
+    if (change.status === 'renamed') {
+      // A rename is a delete of the old path plus an add of the new path.
+      if (change.oldPath) {
+        this.watchQueue.push({ filePath: normalize(change.oldPath), status: 'deleted' });
+      }
+      this.watchQueue.push({ filePath: normalize(change.filePath), status: 'added' });
+    } else {
+      this.watchQueue.push({ filePath: normalize(change.filePath), status: change.status });
+    }
+
+    if (!this.watchTimer) {
+      this.watchTimer = setTimeout(() => {
+        this.watchTimer = null;
+        void this.flushWatchQueue();
+      }, this.watchDebounceMs);
+    }
+  }
+
+  private async flushWatchQueue(): Promise<void> {
+    if (this.watchProcessing) return;
+    if (this.watchQueue.length === 0) return;
+
+    this.watchProcessing = true;
+    const changes = this.watchQueue;
+    this.watchQueue = [];
+    try {
+      this.logger.info({ files: changes.length }, 'Applying watched file changes');
+      const report = await this.processWatchChanges(changes);
+      this.lastWatchScanAt = new Date();
+      this.logger.info(
+        { files: changes.length, entitiesStored: report.entitiesStored, relationshipsStored: report.relationshipsStored, durationMs: report.totalDurationMs },
+        'Watched changes applied'
+      );
+    } catch (error) {
+      this.logger.error({ err: error, files: changes.map(c => c.filePath) }, 'Failed to apply watched changes');
+    } finally {
+      this.watchProcessing = false;
+      // Re-schedule if new changes arrived while we were processing.
+      if (this.watchQueue.length > 0) {
+        this.watchTimer = setTimeout(() => {
+          this.watchTimer = null;
+          void this.flushWatchQueue();
+        }, this.watchDebounceMs);
+      }
+    }
+  }
+
+  // Runs the incremental single-file path for a set of watched changes without
+  // recording a new commit (the working tree is not a commit).
+  private async processWatchChanges(changes: Array<{ filePath: string; status: string }>): Promise<ScanReport> {
+    this.beginScan('working-tree');
+    const stats = await this.processChanges(changes);
+    await this.touchRepoState();
+    return this.finishScan(
+      changes.length,
+      stats.filesParsed,
+      stats.entitiesExtracted,
+      stats.relationshipsExtracted,
+      stats.embeddingsGenerated,
+      stats.entitiesStored,
+      stats.relationshipsStored,
+    );
+  }
+
+  // Record that a watch-driven scan happened (no commit hash involved) so
+  // `GET /api/status` reflects live edits.
+  private async touchRepoState(): Promise<void> {
+    try {
+      await this.pgPool.query(
+        `INSERT INTO repo_state (repo_path, last_scan_at)
+         VALUES ($1, NOW())
+         ON CONFLICT (repo_path) DO UPDATE SET last_scan_at = NOW()`,
+        [this.config.repoPath]
+      );
+    } catch (error) {
+      this.logger.error({ err: error }, 'Failed to update watch scan time');
+    }
+  }
+
+  // Live watch status for the API/frontend. Falls back to the last commit-based
+  // scan timestamp when no watch-driven scan has happened yet.
+  async getStatus(): Promise<RepoStatus> {
+    let lastScanAt: string | null = null;
+    try {
+      const result = await this.pgPool.query(
+        'SELECT last_scan_at FROM repo_state WHERE repo_path = $1',
+        [this.config.repoPath]
+      );
+      if (result.rows[0]?.last_scan_at) {
+        lastScanAt = new Date(result.rows[0].last_scan_at).toISOString();
+      }
+    } catch {
+      // Ignore — fall back to the in-memory watch timestamp.
+    }
+    return {
+      repoPath: this.config.repoPath,
+      watching: this.watcher !== null,
+      lastScanAt: lastScanAt ?? (this.lastWatchScanAt ? this.lastWatchScanAt.toISOString() : null),
+      pendingChanges: this.watchQueue.length,
+    };
+  }
+
+  // True when the repo already has stored entity data (used by `watch` to decide
+  // whether to run an initial full scan before watching).
+  async hasStoredData(): Promise<boolean> {
+    try {
+      const count = await this.entityRepo.count();
+      return count > 0;
+    } catch (error) {
+      this.logger.error({ err: error }, 'Failed to check for stored data');
+      return false;
+    }
   }
 
   // Parse, resolve, and persist a batch of changed files. For incremental scans the
@@ -1241,6 +1400,7 @@ export class Orchestrator {
   }
 
   async close(): Promise<void> {
+    await this.stopWatching();
     await this.graphClient.close();
     await this.pgPool.end();
   }

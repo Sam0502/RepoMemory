@@ -140,6 +140,27 @@ header h1 {
   50% { opacity: 0.4; }
 }
 
+.app-footer {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 20px;
+  background: #161b22;
+  border-top: 1px solid #30363d;
+  font-size: 11px;
+  color: #8b949e;
+}
+
+.app-footer a {
+  color: #58a6ff;
+  text-decoration: none;
+}
+
+.app-footer a:hover {
+  text-decoration: underline;
+}
+
 
 main {
   flex: 1;

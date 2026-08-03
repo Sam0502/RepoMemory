@@ -70,6 +70,12 @@ const graphLoading = document.getElementById('graphLoading');
 const tooltipEl = document.getElementById('tooltip');
 const analysisPanel = document.getElementById('analysisPanel');
 const analysisContent = document.getElementById('analysisContent');
+const jobsPanel = document.getElementById('jobsPanel');
+const jobsVerifyBtn = document.getElementById('jobsVerifyBtn');
+const jobsRepairBtn = document.getElementById('jobsRepairBtn');
+const jobsRefreshBtn = document.getElementById('jobsRefreshBtn');
+const jobsDetail = document.getElementById('jobsDetail');
+const jobsListContent = document.getElementById('jobsListContent');
 const qaPanel = document.getElementById('qaPanel');
 const qaInput = document.getElementById('qaInput');
 const qaBtn = document.getElementById('qaBtn');
@@ -80,6 +86,19 @@ const qaSuggestions = document.getElementById('qaSuggestions');
 async function api(path) {
   const res = await fetch(`${API_BASE}${path}`);
   if (!res.ok) throw new Error(`API ${res.status}`);
+  return res.json();
+}
+
+async function apiPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : '{}',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `API ${res.status}`);
+  }
   return res.json();
 }
 
@@ -143,13 +162,23 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
       entityPanel.classList.add('hidden');
       commitPanel.classList.add('hidden');
       analysisPanel.classList.remove('hidden');
+      jobsPanel.classList.add('hidden');
       qaPanel.classList.add('hidden');
       currentView = 'analysis';
       loadAnalysis(activeAnalysisReport);
+    } else if (view === 'jobs') {
+      entityPanel.classList.add('hidden');
+      commitPanel.classList.add('hidden');
+      analysisPanel.classList.add('hidden');
+      jobsPanel.classList.remove('hidden');
+      qaPanel.classList.add('hidden');
+      currentView = 'jobs';
+      loadJobs();
     } else if (view === 'ask') {
       entityPanel.classList.add('hidden');
       commitPanel.classList.add('hidden');
       analysisPanel.classList.add('hidden');
+      jobsPanel.classList.add('hidden');
       qaPanel.classList.remove('hidden');
       currentView = 'ask';
     }
@@ -180,6 +209,8 @@ repoFilter.addEventListener('change', () => {
     loadCommits();
   } else if (currentView === 'analysis') {
     loadAnalysis(activeAnalysisReport);
+  } else if (currentView === 'jobs') {
+    loadJobs();
   }
 });
 
@@ -908,6 +939,101 @@ function renderBoundaries(data) {
   }
   analysisContent.innerHTML = html;
 }
+
+// --- Reconciliation jobs tab (5.4) ---
+async function loadJobs() {
+  jobsListContent.innerHTML = '<div class="loading-text">Loading...</div>';
+  try {
+    const data = await api('/api/jobs?limit=50');
+    renderJobs(data.jobs || []);
+  } catch (err) {
+    jobsListContent.innerHTML = `<div class="empty-state">Failed to load<br><small>${escHtml(err.message)}</small></div>`;
+  }
+}
+
+function renderJobs(jobs) {
+  if (!jobs.length) {
+    jobsListContent.innerHTML = '<div class="empty-state">No jobs yet &mdash; run Verify or Repair</div>';
+    return;
+  }
+  jobsListContent.innerHTML = jobs.map(j => {
+    const statusCls = j.status === 'completed' ? 'low' : j.status === 'failed' ? 'high' : 'med';
+    return `
+      <div class="report-item job-item" data-job-id="${escHtml(j.id)}">
+        <div class="report-main"><span class="job-status status-${statusCls}">${escHtml(j.status)}</span> <strong>${escHtml(j.type)}</strong></div>
+        <div class="report-sub">${escHtml(j.repositoryPath)}</div>
+        <div class="report-sub">${escHtml(shortPath(j.repositoryPath))} &middot; ${j.completedAt ? timeAgo(j.completedAt) : 'in progress'}</div>
+      </div>
+    `;
+  }).join('');
+  jobsListContent.querySelectorAll('.job-item').forEach(item => {
+    item.addEventListener('click', () => loadJobDetail(item.dataset.jobId));
+  });
+}
+
+async function loadJobDetail(jobId) {
+  jobsDetail.innerHTML = '<div class="loading-text">Loading...</div>';
+  try {
+    const job = await api(`/api/jobs/${jobId}`);
+    renderJobDetail(job);
+  } catch (err) {
+    jobsDetail.innerHTML = `<div class="empty-state">Failed to load job<br><small>${escHtml(err.message)}</small></div>`;
+  }
+}
+
+function renderJobDetail(job) {
+  if (!job.result) {
+    jobsDetail.innerHTML = `<div class="report-summary">${escHtml(job.type)} &middot; ${escHtml(job.status)}${job.error ? ` &middot; <span class="del">${escHtml(job.error)}</span>` : ''}</div>`;
+    return;
+  }
+  const r = job.result;
+  if (job.type === 'verify') {
+    const pctOk = r.entityTotal && r.relationshipTotal
+      ? Math.max(r.entityTotal.pg, r.relationshipTotal.pg) === 0 ? 100 : Math.round(((r.entityTotal.pg + r.relationshipTotal.pg) - Math.abs(r.entityTotal.delta) - Math.abs(r.relationshipTotal.delta)) / (r.entityTotal.pg + r.relationshipTotal.pg) * 100)
+      : 0;
+    jobsDetail.innerHTML = `
+      <div class="report-summary">${r.ok ? '<span class="add">OK</span>' : '<span class="del">Drift detected</span>'} &middot; entities ${r.entityTotal.pg}/${r.entityTotal.graph} (Δ${r.entityTotal.delta}) &middot; relationships ${r.relationshipTotal.pg}/${r.relationshipTotal.graph} (Δ${r.relationshipTotal.delta}) &middot; match ~${pctOk}%</div>
+      <div class="report-sub evidence">
+        <div>&bull; duplicate graph nodes: ${r.duplicateGraphNodes}</div>
+        <div>&bull; missing in graph: ${r.missingInGraph.length} / orphan graph nodes: ${r.orphanGraphNodes.length}</div>
+        <div>&bull; missing relationships: ${r.missingRelationshipCount} / orphan relationships: ${r.orphanRelationshipCount}</div>
+        <div>&bull; entities without embedding: ${r.entitiesWithoutEmbedding}</div>
+      </div>
+    `;
+  } else if (job.type === 'repair') {
+    const va = r.verifyAfter || {};
+    jobsDetail.innerHTML = `
+      <div class="report-summary"><span class="add">Repaired</span> &middot; entities upserted ${r.entitiesUpserted} &middot; relationships upserted ${r.relationshipsUpserted} &middot; orphan nodes deleted ${r.orphanNodesDeleted} &middot; orphan relationships deleted ${r.orphanRelationshipsDeleted} &middot; embeddings generated ${r.embeddingsGenerated}</div>
+      <div class="report-sub evidence">
+        <div>&bull; post-repair: entities ${va.entityTotal ? `${va.entityTotal.pg}/${va.entityTotal.graph}` : 'n/a'} &middot; relationships ${va.relationshipTotal ? `${va.relationshipTotal.pg}/${va.relationshipTotal.graph}` : 'n/a'}</div>
+        <div>&bull; remaining missing in graph: ${va.missingInGraph ? va.missingInGraph.length : 'n/a'}</div>
+        <div>&bull; remaining entities without embedding: ${va.entitiesWithoutEmbedding !== undefined ? va.entitiesWithoutEmbedding : 'n/a'}</div>
+      </div>
+    `;
+  } else {
+    jobsDetail.innerHTML = `<div class="report-summary">${escHtml(job.type)} &middot; ${escHtml(job.status)}</div>`;
+  }
+}
+
+async function runJob(type) {
+  const endpoint = type === 'verify' ? '/api/jobs/verify' : '/api/jobs/repair';
+  const repoParam = currentRepo !== 'all' ? { repoPath: currentRepo } : undefined;
+  jobsDetail.innerHTML = '<div class="loading-text">Running... (this may take a while for large repos)</div>';
+  try {
+    const job = await apiPost(endpoint, repoParam);
+    renderJobDetail(job);
+    loadJobs();
+  } catch (err) {
+    jobsDetail.innerHTML = `<div class="empty-state">Failed to run ${type}<br><small>${escHtml(err.message)}</small></div>`;
+  }
+}
+
+jobsVerifyBtn.addEventListener('click', () => runJob('verify'));
+jobsRepairBtn.addEventListener('click', () => runJob('repair'));
+jobsRefreshBtn.addEventListener('click', () => {
+  jobsDetail.innerHTML = '';
+  loadJobs();
+});
 
 // --- QA tab ---
 const QA_SUGGESTIONS = [

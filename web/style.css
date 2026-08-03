@@ -727,6 +727,44 @@ main {
 .chip-med { background: #d2992222; color: #d29922; }
 .chip-high { background: #f8514922; color: #f85149; }
 
+/* Reconciliation jobs (5.4) */
+.jobs-toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #21262d;
+}
+.job-btn {
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.job-btn:hover { background: #30363d; }
+.job-btn.repair { border-color: #d2992266; color: #d29922; }
+.job-btn.repair:hover { background: #d2992222; }
+
+.jobs-detail {
+  padding: 10px 12px;
+  border-bottom: 1px solid #21262d;
+  background: #161b22;
+}
+.job-item { cursor: pointer; }
+.job-item:hover { background: #1c2128; }
+.job-status {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 8px;
+}
+.status-low { background: #23863622; color: #3fb950; }
+.status-med { background: #d2992222; color: #d29922; }
+.status-high { background: #f8514922; color: #f85149; }
+
 .severity {
   font-size: 9px;
   font-weight: 700;

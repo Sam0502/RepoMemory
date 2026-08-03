@@ -14,6 +14,7 @@
       <button class="nav-btn active" data-view="architecture">Architecture</button>
       <button class="nav-btn" data-view="commits">Commits</button>
       <button class="nav-btn" data-view="analysis">Analysis</button>
+      <button class="nav-btn" data-view="jobs">Jobs</button>
       <button class="nav-btn" data-view="ask">Ask</button>
     </nav>
     <div class="search-bar">
@@ -74,6 +75,19 @@
           <button class="analysis-tab" data-report="boundaries">Bounds</button>
         </div>
         <div id="analysisContent" class="scroll-area"></div>
+      </div>
+      <div id="jobsPanel" class="hidden">
+        <div class="panel-header">
+          <h2>Reconciliation Jobs</h2>
+          <span class="panel-note" title="Compare and re-sync PostgreSQL with Neo4j">&#9432;</span>
+        </div>
+        <div class="jobs-toolbar">
+          <button id="jobsVerifyBtn" class="job-btn" title="Compare PostgreSQL vs Neo4j: per-type counts, missing/orphan entities + relationships, duplicate graph nodes, embedding nulls">Verify</button>
+          <button id="jobsRepairBtn" class="job-btn repair" title="Re-sync Neo4j from PostgreSQL: upsert missing entities/relationships, delete orphan graph nodes/edges, re-embed entities with null embeddings">Repair</button>
+          <button id="jobsRefreshBtn" class="icon-btn" title="Refresh list">&#x21bb;</button>
+        </div>
+        <div id="jobsDetail" class="jobs-detail"></div>
+        <div id="jobsListContent" class="scroll-area"></div>
       </div>
       <div id="qaPanel" class="hidden">
         <div class="panel-header">

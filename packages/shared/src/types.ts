@@ -170,6 +170,57 @@ export interface ContextPack {
   tokenCount: number;
 }
 
+export interface TaskContextFile {
+  filePath: string;
+  domain?: string;
+  entityCount: number;
+}
+
+export interface TaskContextRisk {
+  files: Array<{
+    filePath: string;
+    commitCount: number;
+    churnScore: number;
+    daysSinceLastChange: number | null;
+    riskScore: number;
+  }>;
+  entityStaleness: Array<{
+    stableId: string;
+    name: string;
+    filePath: string;
+    commitCount: number;
+    stalenessDays: number | null;
+  }>;
+}
+
+export interface TaskContextBoundary {
+  source: string;
+  target: string;
+  type: string;
+  message: string;
+}
+
+export interface TaskContextPack {
+  task: string;
+  repoPath?: string;
+  focalEntities: Entity[];
+  files: TaskContextFile[];
+  relationships: Relationship[];
+  recentChanges: Commit[];
+  risk: TaskContextRisk;
+  boundaries: {
+    domains: string[];
+    violations: TaskContextBoundary[];
+  };
+  metadata: {
+    entityCount: number;
+    fileCount: number;
+    relationshipCount: number;
+    rankingStrategy: string;
+  };
+  tokenCount: number;
+}
+
 export type ScanType = 'full' | 'incremental' | 'working-tree' | 'commit';
 
 export interface ScanPhaseReport {

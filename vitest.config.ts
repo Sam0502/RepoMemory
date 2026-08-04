@@ -15,6 +15,7 @@ export default defineConfig({
       '@repo-memory/shared': r('packages/shared/src/index.ts'),
       '@repo-memory/analysis': r('packages/analysis/src/index.ts'),
       '@repo-memory/api': r('packages/api/src/index.ts'),
+      '@repo-memory/services': r('packages/services/src/index.ts'),
       '@repo-memory/storage': r('packages/storage/src/index.ts'),
       '@repo-memory/graph': r('packages/graph/src/index.ts'),
       '@repo-memory/ingestion': r('packages/ingestion/src/index.ts'),

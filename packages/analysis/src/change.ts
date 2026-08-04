@@ -104,9 +104,8 @@ export class ChangeAnalyzer {
     return lazyPageSource(() => this.provider.relationships(repoPath));
   }
 
-  async computeFileChurn(repoPath: string, limit: number = 50, days?: number): Promise<FileChurn[]> {
+  async computeFileChurn(repoPath: string, limit: number = 50, days?: number, now: Date = new Date()): Promise<FileChurn[]> {
     const rows = await this.provider.fileChurnRows(repoPath, days);
-    const now = new Date();
     return rows
       .map(row => {
         const lastChanged = new Date(row.lastChanged);

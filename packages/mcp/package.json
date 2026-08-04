@@ -1,5 +1,5 @@
 {
-  "name": "@repo-memory/api",
+  "name": "@repo-memory/mcp",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -23,8 +23,9 @@
     "@repo-memory/graph": "workspace:*",
     "@repo-memory/storage": "workspace:*",
     "@repo-memory/services": "workspace:*",
-    "hono": "^4.6.0",
-    "@hono/node-server": "^1.13.0"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "pg": "^8.13.0",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

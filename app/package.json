@@ -28,6 +28,7 @@
     "@repo-memory/ingestion": "workspace:*",
     "@repo-memory/analysis": "workspace:*",
     "@repo-memory/api": "workspace:*",
+    "@repo-memory/mcp": "workspace:*",
     "commander": "^12.0.0"
   },
   "devDependencies": {

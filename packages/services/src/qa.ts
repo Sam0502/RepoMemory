@@ -27,7 +27,7 @@ const STOP_WORDS = new Set([
 ]);
 
 export class QaService {
-  private deadCodeCache: { dead: Set<string>; exportedButUnused: Set<string> } | null = null;
+  private deadCodeCache: { dead: Set<string>; exportedButUnused: Set<string>; computedAt: number } | null = null;
   private changeAnalyzer: ChangeAnalyzer | null = null;
 
   constructor(
@@ -39,6 +39,17 @@ export class QaService {
     private workspace: boolean = false,
     private repoPath: string = ''
   ) {}
+
+  private get graphScope(): string | undefined {
+    return this.workspace ? undefined : this.repoPath;
+  }
+
+  // Drop computed caches so the next question re-derives them from fresh data.
+  // Called by the server after data-changing operations (verify/repair jobs).
+  invalidateCache(): void {
+    this.deadCodeCache = null;
+    this.changeAnalyzer = null;
+  }
 
   async ask(question: string): Promise<QaAnswer> {
     if (this.workspace) {
@@ -134,7 +145,7 @@ export class QaService {
     let answer: string;
     switch (intent) {
       case 'dependencies': {
-        const deps = await this.graphClient.findDependencies(entity.stableId);
+        const deps = await this.graphClient.findDependencies(entity.stableId, this.graphScope);
         const depEntities = deps.map(d => d.entity);
         if (entity.type === 'File') {
           const imports = deps.filter(d => d.relationship.type === RelationshipType.IMPORTS);
@@ -154,7 +165,7 @@ export class QaService {
         break;
       }
       case 'dependents': {
-        const deps = await this.graphClient.findDependents(entity.stableId);
+        const deps = await this.graphClient.findDependents(entity.stableId, this.graphScope);
         const depEntities = deps.map(d => d.entity);
         answer = depEntities.length
           ? `${entity.name} is used by: ${depEntities.map(d => `${d.name} (${this.entityPath(d)})`).join(', ')}`
@@ -206,8 +217,8 @@ export class QaService {
         break;
       }
       case 'impact': {
-        const direct = await this.graphClient.findDependents(entity.stableId);
-        const indirect = await this.graphClient.findTransitiveDependents(entity.stableId, 3);
+        const direct = await this.graphClient.findDependents(entity.stableId, this.graphScope);
+        const indirect = await this.graphClient.findTransitiveDependents(entity.stableId, 3, this.graphScope);
         const affectedFiles = new Set<string>();
         direct.forEach(d => affectedFiles.add(d.entity.filePath));
         indirect.forEach(e => affectedFiles.add(e.filePath));
@@ -256,7 +267,7 @@ export class QaService {
         break;
       }
       case 'file-deps': {
-        const deps = await this.graphClient.findDependencies(entity.stableId);
+        const deps = await this.graphClient.findDependencies(entity.stableId, this.graphScope);
         const imports = deps.filter(d => d.relationship.type === RelationshipType.IMPORTS);
         const calls = deps.filter(d => d.relationship.type !== RelationshipType.IMPORTS);
         answer = `${entity.name} imports ${imports.length} module(s) and references ${calls.length} symbol(s).`;
@@ -284,7 +295,7 @@ export class QaService {
   }
 
   private async findTestsFor(entity: Entity): Promise<Entity[]> {
-    const candidates = await this.graphClient.findDependents(entity.stableId);
+    const candidates = await this.graphClient.findDependents(entity.stableId, this.graphScope);
     let tests = candidates.map(d => d.entity).filter(e => e.isTest);
 
     // Endpoints: also include tests that cover their handlers
@@ -293,7 +304,7 @@ export class QaService {
       for (const rel of handlerRels.filter(r => r.type === RelationshipType.HANDLES)) {
         const handler = await this.entityRepo.findByStableId(rel.targetId);
         if (handler) {
-          const handlerDeps = await this.graphClient.findDependents(handler.stableId);
+          const handlerDeps = await this.graphClient.findDependents(handler.stableId, this.graphScope);
           tests = handlerDeps.map(d => d.entity).filter(e => e.isTest);
           if (tests.length) break;
         }
@@ -304,7 +315,7 @@ export class QaService {
     if (tests.length === 0) {
       const fileEntity = (await this.entityRepo.findByFilePath(entity.filePath)).find(e => e.type === 'File');
       if (fileEntity) {
-        const fileDeps = await this.graphClient.findDependents(fileEntity.stableId);
+        const fileDeps = await this.graphClient.findDependents(fileEntity.stableId, this.graphScope);
         tests = fileDeps.map(d => d.entity).filter(e => e.isTest);
       }
     }
@@ -618,8 +629,15 @@ export class QaService {
     return { question, intent, answer: '', evidence };
   }
 
+  // Dead-code computation is expensive, so it's cached; a short TTL bounds how
+  // stale the answer can be between scans (the server also invalidates on
+  // verify/repair jobs).
+  private static readonly DEAD_CODE_CACHE_TTL_MS = 60_000;
+
   private async getDeadCode(): Promise<{ dead: Set<string>; exportedButUnused: Set<string> }> {
-    if (this.deadCodeCache) return this.deadCodeCache;
+    if (this.deadCodeCache && Date.now() - this.deadCodeCache.computedAt < QaService.DEAD_CODE_CACHE_TTL_MS) {
+      return this.deadCodeCache;
+    }
 
     const entities: Entity[] = [];
     const limit = 10000;
@@ -640,6 +658,7 @@ export class QaService {
     this.deadCodeCache = {
       dead: new Set(report.deadCode.map(i => i.entity.stableId)),
       exportedButUnused: new Set(report.exportedButUnused.map(i => i.entity.stableId)),
+      computedAt: Date.now(),
     };
     return this.deadCodeCache;
   }

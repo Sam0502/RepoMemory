@@ -47,7 +47,7 @@ describe('ChangeAnalyzer.computeFileChurn', () => {
       fileChurnRows: async () => [churnRow('a.ts', 1, 0, 0, 3)],
     });
     const analyzer = new ChangeAnalyzer(provider);
-    const [row] = await analyzer.computeFileChurn('/repo');
+    const [row] = await analyzer.computeFileChurn('/repo', 50, undefined, NOW);
     expect(row.daysSinceLastChange).toBe(3);
   });
 });

@@ -2,10 +2,13 @@
 
 import { Command } from 'commander';
 import { Orchestrator } from './orchestrator.js';
+import type { OrchestratorConfig } from './orchestrator.js';
 import { startServer } from '@repo-memory/api';
+import { serveStdio } from '@repo-memory/mcp';
 import { GraphClient } from '@repo-memory/graph';
 import { createPool, EntityRepository, RelationshipRepository, migrate } from '@repo-memory/storage';
-import { streamDeadCode } from '@repo-memory/analysis';
+import { streamDeadCode, createEmbeddingProvider } from '@repo-memory/analysis';
+import type { EmbeddingProvider } from '@repo-memory/analysis';
 import { RelationshipType, getLogger } from '@repo-memory/shared';
 import type { ScanReport } from '@repo-memory/shared';
 import { resolve } from 'path';
@@ -13,13 +16,17 @@ import type { EmbeddingConfig } from '@repo-memory/analysis';
 
 const logger = getLogger({ component: 'cli' });
 
-const DB_CONFIG = {
-  host: 'localhost',
-  port: 5433,
-  database: 'repo_memory',
-  user: 'repo_memory',
-  password: 'repo-memory-password',
-};
+// PostgreSQL config comes from the standard PG_* environment variables, with
+// the same defaults used everywhere else in the project.
+function getDbConfig(): { host: string; port: number; database: string; user: string; password: string } {
+  return {
+    host: process.env.PG_HOST || 'localhost',
+    port: parseInt(process.env.PG_PORT || '5433', 10),
+    database: process.env.PG_DATABASE || 'repo_memory',
+    user: process.env.PG_USER || 'repo_memory',
+    password: process.env.PG_PASSWORD || 'repo-memory-password',
+  };
+}
 
 function getEmbeddingConfig(): EmbeddingConfig {
   const provider = process.env.EMBEDDING_PROVIDER || 'onnx';
@@ -35,6 +42,50 @@ function getEmbeddingConfig(): EmbeddingConfig {
       ? { apiKey: process.env.GEMINI_API_KEY, model: process.env.EMBEDDING_MODEL }
       : undefined,
   };
+}
+
+function makeOrchestrator(repoPath: string): Orchestrator {
+  const db = getDbConfig();
+  const config: OrchestratorConfig = {
+    repoPath,
+    embeddings: getEmbeddingConfig(),
+    pgHost: db.host,
+    pgPort: db.port,
+    pgDatabase: db.database,
+    pgUser: db.user,
+    pgPassword: db.password,
+  };
+  return new Orchestrator(config);
+}
+
+// Best-effort embedding provider for semantic task-pack seeding. Constructing
+// the provider is lazy (the model loads on first embed), so this is safe even
+// when the ONNX model isn't downloaded; task packs fall back to keyword.
+function makeEmbedder(): EmbeddingProvider | undefined {
+  try {
+    return createEmbeddingProvider(getEmbeddingConfig());
+  } catch (error) {
+    logger.warn({ err: error }, 'Embedding provider unavailable; task packs fall back to keyword search');
+    return undefined;
+  }
+}
+
+// Parse a bounded integer CLI argument. On invalid input, logs the problem,
+// sets the process exit code, and returns null so callers can bail early
+// instead of crashing with an unhandled error.
+function parseIntArg(value: string | undefined, name: string, min: number, max: number): number | null {
+  if (value === undefined || value === '') {
+    logger.error(`Missing required ${name}`);
+    process.exitCode = 1;
+    return null;
+  }
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min || n > max) {
+    logger.error(`Invalid ${name}: '${value}' (expected an integer in [${min}, ${max}])`);
+    process.exitCode = 1;
+    return null;
+  }
+  return n;
 }
 
 const program = new Command();
@@ -53,10 +104,7 @@ program
   .option('-c, --commit <hash>', 'Scan from a specific commit')
   .option('-w, --working-tree', 'Scan only working tree changes', false)
   .action(async (options) => {
-    const orchestrator = new Orchestrator({
-      repoPath: resolve(options.repo),
-      embeddings: getEmbeddingConfig(),
-    });
+    const orchestrator = makeOrchestrator(resolve(options.repo));
 
     try {
       await orchestrator.initialize();
@@ -76,7 +124,7 @@ program
       printScanReport(report);
     } catch (error) {
       logger.error({ err: error }, 'Scan failed');
-      process.exit(1);
+      process.exitCode = 1;
     } finally {
       await orchestrator.close();
     }
@@ -119,7 +167,7 @@ program
     const crossRepo = options.allRepos && (type === 'search' || type === 'dead-code');
 
     if (crossRepo) {
-      const pool = await createPool(DB_CONFIG);
+      const pool = await createPool(getDbConfig());
       try {
         const entityRepo = new EntityRepository(pool, '');
         const relationshipRepo = new RelationshipRepository(pool, '');
@@ -142,17 +190,14 @@ program
         }
       } catch (error) {
         logger.error({ err: error }, 'Workspace query failed');
-        process.exit(1);
+        process.exitCode = 1;
       } finally {
         await pool.end();
       }
       return;
     }
 
-    const orchestrator = new Orchestrator({
-      repoPath: resolve(options.repo),
-      embeddings: getEmbeddingConfig(),
-    });
+    const orchestrator = makeOrchestrator(resolve(options.repo));
 
     try {
       await orchestrator.initialize();
@@ -189,7 +234,7 @@ program
         case 'impact': {
           const id = args[0];
           const directImpact = await orchestrator.getDependents(id);
-          const indirectImpact = await orchestrator.getTransitiveDependencies(id, 3);
+          const indirectImpact = await orchestrator.getTransitiveDependents(id, 3);
           console.log(JSON.stringify({ directImpact, indirectImpact }, null, 2));
           break;
         }
@@ -199,7 +244,8 @@ program
           break;
         }
         case 'churn': {
-          const limit = args[0] ? parseInt(args[0]) : 50;
+          const limit = args[0] !== undefined ? parseIntArg(args[0], 'limit', 1, 100000) : 50;
+          if (limit === null) return;
           const churn = await orchestrator.getChurn(limit);
           console.log(JSON.stringify(churn, null, 2));
           break;
@@ -208,7 +254,8 @@ program
           const id = args[0];
           if (!id) {
             logger.error('Usage: repo-memory query risk <stableId>');
-            process.exit(1);
+            process.exitCode = 1;
+            return;
           }
           const risk = await orchestrator.getRisk(id);
           console.log(JSON.stringify(risk, null, 2));
@@ -216,11 +263,11 @@ program
         }
         default:
           logger.error(`Unknown query type: ${type}`);
-          process.exit(1);
+          process.exitCode = 1;
       }
     } catch (error) {
       logger.error({ err: error }, 'Query failed');
-      process.exit(1);
+      process.exitCode = 1;
     } finally {
       await orchestrator.close();
     }
@@ -233,10 +280,11 @@ program
   .action(async (type) => {
     if (type !== 'repos') {
       logger.error(`Unknown workspace query type: ${type}`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
-    const pool = await createPool(DB_CONFIG);
+    const pool = await createPool(getDbConfig());
     try {
       const result = await pool.query(
         `SELECT e.repo_path AS repo_path,
@@ -264,7 +312,7 @@ program
       }
     } catch (error) {
       logger.error({ err: error }, 'Workspace query failed');
-      process.exit(1);
+      process.exitCode = 1;
     } finally {
       await pool.end();
     }
@@ -277,16 +325,11 @@ program
   .action(async (action) => {
     if (action !== 'migrate') {
       logger.error(`Unknown db action: ${action}. Available: migrate`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
-    const pool = await createPool({
-      host: process.env.PG_HOST || 'localhost',
-      port: parseInt(process.env.PG_PORT || '5433', 10),
-      database: process.env.PG_DATABASE || 'repo_memory',
-      user: process.env.PG_USER || 'repo_memory',
-      password: process.env.PG_PASSWORD || 'repo-memory-password',
-    });
+    const pool = await createPool(getDbConfig());
     try {
       const applied = await migrate(pool);
       if (applied.length === 0) {
@@ -299,7 +342,7 @@ program
       }
     } catch (error) {
       logger.error({ err: error }, 'Migration failed');
-      process.exit(1);
+      process.exitCode = 1;
     } finally {
       await pool.end();
     }
@@ -310,37 +353,43 @@ program
   .description('Start the API server')
   .option('-r, --repo <path>', 'Repository path', process.cwd())
   .option('-p, --port <port>', 'Server port', '3000')
-  .option('-h, --host <host>', 'Server host', 'localhost')
+  .option('-h, --host <host>', 'Server host', '127.0.0.1')
   .action(async (options) => {
+    const port = parseIntArg(options.port, 'port', 1, 65535);
+    if (port === null) return;
     const repoPath = resolve(options.repo);
-    const port = parseInt(options.port);
     const host = options.host;
 
     logger.info({ repoPath }, 'Starting API server');
 
     // Initialize orchestrator for database connections
-    const orchestrator = new Orchestrator({ repoPath, embeddings: getEmbeddingConfig() });
+    const orchestrator = makeOrchestrator(repoPath);
     await orchestrator.initialize();
 
     // Start API server
     const graphClient = new GraphClient();
-    const pgPool = await createPool({
-      host: 'localhost',
-      port: 5433,
-      database: 'repo_memory',
-      user: 'repo_memory',
-      password: 'repo-memory-password',
-    });
+    const pgPool = await createPool(getDbConfig());
 
-    startServer({
+    const server = startServer({
       port,
       host,
       repoPath,
       graphClient,
       pgPool,
       logger,
+      embedder: makeEmbedder(),
       runJob: (type, repoPath) => orchestrator.runJob(type, repoPath),
     }, resolve(process.cwd(), 'web'));
+
+    // Graceful shutdown: stop accepting requests and release resources.
+    const shutdown = async () => {
+      logger.info('Shutting down API server');
+      server.close();
+      await orchestrator.close();
+      process.exit(0);
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   });
 
 program
@@ -348,17 +397,19 @@ program
   .description('Watch the repository and update the graph on every edit (debounced)')
   .option('-r, --repo <path>', 'Repository path', process.cwd())
   .option('-p, --port <port>', 'Server port', '3000')
-  .option('-h, --host <host>', 'Server host', 'localhost')
+  .option('-h, --host <host>', 'Server host', '127.0.0.1')
   .option('-d, --debounce <ms>', 'Watch debounce in milliseconds', '500')
   .action(async (options) => {
+    const port = parseIntArg(options.port, 'port', 1, 65535);
+    if (port === null) return;
+    const debounceMs = parseIntArg(options.debounce, 'debounce (ms)', 1, 3600000);
+    if (debounceMs === null) return;
     const repoPath = resolve(options.repo);
-    const port = parseInt(options.port);
     const host = options.host;
-    const debounceMs = parseInt(options.debounce);
 
     logger.info({ repoPath, debounceMs }, 'Starting watch mode');
 
-    const orchestrator = new Orchestrator({ repoPath, embeddings: getEmbeddingConfig() });
+    const orchestrator = makeOrchestrator(repoPath);
     await orchestrator.initialize();
 
     // Seed the graph on first watch (full scan if nothing is stored yet).
@@ -372,28 +423,24 @@ program
 
     // Start API server (with live status wired to the watcher)
     const graphClient = new GraphClient();
-    const pgPool = await createPool({
-      host: 'localhost',
-      port: 5433,
-      database: 'repo_memory',
-      user: 'repo_memory',
-      password: 'repo-memory-password',
-    });
+    const pgPool = await createPool(getDbConfig());
 
-    startServer({
+    const server = startServer({
       port,
       host,
       repoPath,
       graphClient,
       pgPool,
       logger,
+      embedder: makeEmbedder(),
       runJob: (type, repoPath) => orchestrator.runJob(type, repoPath),
       getStatus: () => orchestrator.getStatus(),
     }, resolve(process.cwd(), 'web'));
 
-    // Keep the process alive; clean up the watcher on shutdown.
+    // Keep the process alive; clean up the watcher + server on shutdown.
     const shutdown = async () => {
       logger.info('Shutting down watch mode');
+      server.close();
       await orchestrator.stopWatching();
       await orchestrator.close();
       process.exit(0);
@@ -411,13 +458,11 @@ program
   .action(async (action, options) => {
     if (action !== 'verify' && action !== 'repair') {
       logger.error(`Unknown job: ${action}. Available: verify, repair`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
-    const orchestrator = new Orchestrator({
-      repoPath: resolve(options.repo),
-      embeddings: getEmbeddingConfig(),
-    });
+    const orchestrator = makeOrchestrator(resolve(options.repo));
 
     try {
       await orchestrator.initialize();
@@ -437,7 +482,7 @@ program
       }
     } catch (error) {
       logger.error({ err: error }, 'Job failed');
-      process.exit(1);
+      process.exitCode = 1;
     } finally {
       await orchestrator.close();
     }
@@ -448,10 +493,7 @@ program
   .description('Show repository statistics')
   .option('-r, --repo <path>', 'Repository path', process.cwd())
   .action(async (options) => {
-    const orchestrator = new Orchestrator({
-      repoPath: resolve(options.repo),
-      embeddings: getEmbeddingConfig(),
-    });
+    const orchestrator = makeOrchestrator(resolve(options.repo));
 
     try {
       await orchestrator.initialize();
@@ -465,10 +507,35 @@ program
       console.log(`  Repository path: ${options.repo}`);
     } catch (error) {
       logger.error({ err: error }, 'Failed to get stats');
-      process.exit(1);
+      process.exitCode = 1;
     } finally {
       await orchestrator.close();
     }
+  });
+
+program
+  .command('mcp')
+  .description('Serve repository memory as an MCP server over stdio (for AI agents)')
+  .option('-r, --repo <path>', 'Repository path', process.cwd())
+  .action(async (options) => {
+    const repoPath = resolve(options.repo);
+
+    logger.info({ repoPath }, 'Starting MCP server (stdio)');
+
+    const graphClient = new GraphClient();
+    const pgPool = await createPool(getDbConfig());
+
+    const server = await serveStdio({ repoPath, graphClient, pgPool, embedder: makeEmbedder() });
+
+    const shutdown = async () => {
+      logger.info('Shutting down MCP server');
+      await server.close();
+      await pgPool.end();
+      await graphClient.close();
+      process.exit(0);
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   });
 
 program.parse();

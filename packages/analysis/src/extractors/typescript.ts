@@ -39,9 +39,6 @@ export class TypeScriptExtractor extends BaseExtractor {
       case 'import_statement':
         this.extractImport(node, ctx, relationships);
         break;
-      case 'import_require_clause':
-        this.extractRequire(node, ctx, relationships);
-        break;
       case 'expression_statement':
         this.extractExpressionStatement(node, ctx, entities, relationships);
         break;
@@ -338,7 +335,8 @@ export class TypeScriptExtractor extends BaseExtractor {
     if (importClause) {
       const namedImports = this.descendantsOfType(importClause, 'import_specifier');
       for (const spec of namedImports) {
-        const nameNode = this.findChildByType(spec, 'identifier') || spec.childForFieldName('name');
+        // Use the local alias when present: `import { helper as h }` binds `h`.
+        const nameNode = spec.childForFieldName('alias') ?? spec.childForFieldName('name');
         if (!nameNode) continue;
         const symbol = nameNode.text;
         relationships.push(this.createImportSymbolRel(ctx.filePath, symbol, importPath, node));
@@ -380,6 +378,16 @@ export class TypeScriptExtractor extends BaseExtractor {
     const expression = node.children?.[0];
     if (!expression) return;
 
+    // CommonJS requires: `require('fs')` / `const x = require('pkg')`.
+    // tree-sitter parses these as call_expression (no import_require_clause).
+    if (expression.type === 'call_expression') {
+      const callee = expression.children?.[0];
+      if (callee && callee.type === 'identifier' && callee.text === 'require') {
+        this.extractRequire(expression, ctx, relationships);
+        return;
+      }
+    }
+
     // Check for test blocks: describe(), it(), test()
     if (expression.type === 'call_expression') {
       const callee = expression.children?.[0];
@@ -399,7 +407,7 @@ export class TypeScriptExtractor extends BaseExtractor {
         }
 
         // Detect API endpoints (app.get, router.post, etc.)
-        if (this.isApiEndpoint(calleeName)) {
+        if (this.isApiEndpoint(callee)) {
           this.extractApiEndpoint(expression, ctx, entities, relationships);
           return;
         }
@@ -407,13 +415,31 @@ export class TypeScriptExtractor extends BaseExtractor {
     }
   }
 
-  private isApiEndpoint(calleeName: string): boolean {
-    // Express/Koa/Fastify route patterns
-    const routePatterns = [
-      /\.(get|post|put|patch|delete|all|use|route)\s*\(/,
-      /\.(get|post|put|patch|delete|all|use|route)$/,
-    ];
-    return routePatterns.some(pattern => pattern.test(calleeName));
+  // Route registrations are only meaningful when called on a known router
+  // object. Without this, any `x.get('key')`/`config.use(...)` would be
+  // misclassified as an HTTP endpoint.
+  private isApiEndpoint(callee: any): boolean {
+    if (!callee || callee.type !== 'member_expression') return false;
+
+    const children = callee.children || [];
+    const receiver = children[0];
+    const property = children[children.length - 1];
+    if (!receiver || !property) return false;
+
+    const method = property.type === 'property_identifier' || property.type === 'identifier'
+      ? property.text
+      : null;
+    if (!method || !/^(get|post|put|patch|delete|all|use|route)$/.test(method)) return false;
+
+    const receiverName = receiver.type === 'identifier' ? receiver.text : null;
+    if (!receiverName) return false;
+
+    const ROUTER_OBJECTS = new Set([
+      'app', 'router', 'server', 'route', 'api', 'bp', 'blueprint',
+      'express', 'fastify', 'koa', 'hono', 'namespace', 'endpoint',
+      'this', 'routes', 'routerApp', 'authRouter', 'mainRouter', 'appRouter', 'apiRouter',
+    ]);
+    return ROUTER_OBJECTS.has(receiverName);
   }
 
   private extractApiEndpoint(
@@ -506,10 +532,11 @@ export class TypeScriptExtractor extends BaseExtractor {
     relationships: Relationship[],
     entityType: EntityType
   ): void {
-    // Get the test name from the first string argument
-    const args = node.children?.filter((c: any) => c.type !== 'identifier' && c.type !== 'arrow_function' && c.type !== 'function') || [];
+    // The name string lives inside an `arguments` child of the call_expression.
+    const argsNode = (node.children || []).find((c: any) => c.type === 'arguments');
+    const args = argsNode ? argsNode.children : (node.children || []);
     const nameNode = args.find((c: any) => c.type === 'string' || c.type === 'template_string');
-    
+
     if (!nameNode) return;
     
     const name = nameNode.text.replace(/['"]/g, '');

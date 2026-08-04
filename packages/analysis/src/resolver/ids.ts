@@ -2,8 +2,8 @@ import { Entity, EntityType } from '@repo-memory/shared';
 import { createHash } from 'crypto';
 import { getLanguageFromFilePath } from '../parser.js';
 
-export function generateEntityStableId(repoPath: string, filePath: string, name: string): string {
-  const input = `${repoPath}:${filePath}:${name}`;
+export function generateEntityStableId(repoPath: string, filePath: string, name: string, type?: string): string {
+  const input = `${repoPath}:${filePath}:${type ?? ''}:${name}`;
   return createHash('md5').update(input).digest('hex');
 }
 
@@ -12,7 +12,7 @@ export function generateFileStableId(repoPath: string, filePath: string): string
 }
 
 export function createFileEntity(filePath: string, repoPath: string = ''): Entity {
-  const name = filePath.split('/').pop() || filePath.split('\\').pop() || filePath;
+  const name = filePath.split(/[\\/]/).pop() || filePath;
   const stableId = generateFileStableId(repoPath, filePath);
   return {
     id: stableId,

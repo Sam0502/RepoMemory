@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { Relationship, RelationshipType } from '@repo-memory/shared';
 
 export class RelationshipRepository {
@@ -21,7 +21,7 @@ export class RelationshipRepository {
     return this.mapRowToRelationship(result.rows[0]);
   }
 
-  async upsert(relationship: Omit<Relationship, 'id' | 'createdAt' | 'updatedAt'>): Promise<Relationship> {
+  async upsert(relationship: Omit<Relationship, 'id' | 'createdAt' | 'updatedAt'>, client?: PoolClient): Promise<Relationship> {
     const query = `
       INSERT INTO relationships (repo_path, source_id, target_id, type, file_path, line, confidence, metadata)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -39,7 +39,7 @@ export class RelationshipRepository {
       JSON.stringify(relationship.metadata)
     ];
     
-    const result = await this.pool.query(query, values);
+    const result = await (client ?? this.pool).query(query, values);
     return this.mapRowToRelationship(result.rows[0]);
   }
 
@@ -148,11 +148,11 @@ export class RelationshipRepository {
     await this.pool.query(query, this.repoPath ? [filePath, this.repoPath] : [filePath]);
   }
 
-  async deleteAll(): Promise<void> {
+  async deleteAll(client?: PoolClient): Promise<void> {
     const query = this.repoPath
       ? 'DELETE FROM relationships WHERE repo_path = $1'
       : 'DELETE FROM relationships';
-    await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
+    await (client ?? this.pool).query(query, this.repoPath ? [this.repoPath] : []);
   }
 
   async count(): Promise<number> {

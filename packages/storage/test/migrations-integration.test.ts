@@ -43,7 +43,7 @@ describe.skipIf(!available)('schema migrations (integration)', () => {
     const runner = new MigrationRunner(pool!, migrations);
     const applied = await runner.run();
 
-    expect(applied.map((m) => m.id)).toEqual([1, 2, 3, 4]);
+    expect(applied.map((m) => m.id)).toEqual([1, 2, 3, 4, 5]);
 
     const { rows: ledger } = await pool!.query(
       'SELECT id, name FROM schema_migrations ORDER BY id'
@@ -53,6 +53,7 @@ describe.skipIf(!available)('schema migrations (integration)', () => {
       { id: 2, name: 'repo-path-scoping' },
       { id: 3, name: 'embeddings' },
       { id: 4, name: 'id-lengths' },
+      { id: 5, name: 'commit-repo-scoping' },
     ]);
 
     const { rows: tables } = await pool!.query(

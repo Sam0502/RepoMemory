@@ -1,9 +1,8 @@
 import {
   EmbeddingProvider,
   EmbeddingConfig,
-  OnnxEmbeddingProvider,
-  GeminiEmbeddingProvider,
   PlaceholderEmbeddingProvider,
+  createEmbeddingProvider,
 } from './embedding/index.js';
 import { normalizeToDimensions, TARGET_DIMENSIONS } from './embedding/normalize.js';
 import { getLogger, metrics, registerDefaultMetrics } from '@repo-memory/shared';
@@ -15,37 +14,16 @@ let currentProvider: EmbeddingProvider | null = null;
 let fallbackProvider: EmbeddingProvider | null = null;
 
 export function configureEmbeddings(config: EmbeddingConfig, fallback?: EmbeddingConfig): void {
-  currentProvider = createProvider(config);
+  currentProvider = createEmbeddingProvider(config);
 
   if (fallback && fallback.provider !== config.provider) {
     try {
-      fallbackProvider = createProvider(fallback);
+      fallbackProvider = createEmbeddingProvider(fallback);
     } catch {
       fallbackProvider = null;
     }
   } else {
     fallbackProvider = null;
-  }
-}
-
-function createProvider(config: EmbeddingConfig): EmbeddingProvider {
-  switch (config.provider) {
-    case 'onnx':
-      return new OnnxEmbeddingProvider(
-        config.onnx?.modelId || 'Xenova/all-MiniLM-L6-v2',
-        config.onnx?.cacheDir
-      );
-    case 'gemini':
-      if (!config.gemini?.apiKey) {
-        throw new Error('Gemini API key required');
-      }
-      return new GeminiEmbeddingProvider({
-        apiKey: config.gemini.apiKey,
-        model: config.gemini.model,
-      });
-    case 'placeholder':
-    default:
-      return new PlaceholderEmbeddingProvider();
   }
 }
 
@@ -103,6 +81,15 @@ export function getProviderName(): string {
   return currentProvider?.name || 'placeholder';
 }
 
+export async function initializeEmbeddings(): Promise<void> {
+  if (currentProvider?.initialize) {
+    await currentProvider.initialize();
+  }
+  if (fallbackProvider?.initialize) {
+    await fallbackProvider.initialize();
+  }
+}
+
 export function getEmbeddingDimensions(): number {
   return TARGET_DIMENSIONS;
 }
@@ -114,4 +101,12 @@ export function generateEntityEmbedding(
 ): Promise<number[]> {
   const text = `${type}:${name}:${filePath}`;
   return embed(text);
+}
+
+export async function generateEntityEmbeddings(
+  entities: Array<{ name: string; type: string; filePath: string }>
+): Promise<number[][]> {
+  if (entities.length === 0) return [];
+  const texts = entities.map(({ name, type, filePath }) => `${type}:${name}:${filePath}`);
+  return embedBatch(texts);
 }

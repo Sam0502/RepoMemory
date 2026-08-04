@@ -44,10 +44,14 @@ export class TreeSitterParser {
   private extractor: LanguageExtractor;
   private tsParser: any = null;
 
-  constructor(language: Language) {
+  constructor(language: Language, grammarKey?: string) {
     this.language = language;
-    this.grammarKey = this.resolveGrammarKey(language);
+    this.grammarKey = grammarKey || this.resolveGrammarKey(language);
     this.extractor = this.createExtractor(language);
+  }
+
+  getGrammarKey(): string {
+    return this.grammarKey;
   }
 
   private resolveGrammarKey(language: Language): string {
@@ -115,9 +119,15 @@ export class TreeSitterParser {
         return { filePath, language: this.language, entities, relationships, errors };
       }
 
-      const rootNode = tree.rootNode;
-      const ctx: ExtractorContext = { filePath, content, language: this.language, repoPath };
-      this.extractor.extractNodes(rootNode, ctx, entities, relationships);
+      try {
+        const rootNode = tree.rootNode;
+        const ctx: ExtractorContext = { filePath, content, language: this.language, repoPath };
+        this.extractor.extractNodes(rootNode, ctx, entities, relationships);
+      } finally {
+        // Free the WASM-allocated tree to avoid an unbounded leak in long-lived
+        // watch/serve processes.
+        tree.delete();
+      }
     } catch (error) {
       errors.push({
         filePath,
@@ -135,8 +145,8 @@ export class TreeSitterParser {
   }
 
   private createConfigEntity(filePath: string, repoPath: string = ''): Entity | null {
-    const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || filePath;
-    const name = fileName.replace(/\.[^.]+$/, '');
+    const fileName = filePath.split(/[\\/]/).pop() || filePath;
+    const name = fileName.replace(/\.[^.]+$/, '') || fileName;
     
     const stableId = createHash('md5').update(`config:${repoPath}:${filePath}:${name}`).digest('hex');
     
@@ -180,8 +190,21 @@ export function getLanguageFromFilePath(filePath: string): Language {
   }
 }
 
-export function getGrammarKeyFromFilePath(filePath: string): string {
-  const ext = filePath.split('.').pop()?.toLowerCase();
+export function languageFromGrammarKey(grammarKey: string): Language {
+  switch (grammarKey) {
+    case 'javascript':
+    case 'jsx':
+      return Language.JAVASCRIPT;
+    case 'python':
+      return Language.PYTHON;
+    case 'typescript':
+    case 'tsx':
+    default:
+      return Language.TYPESCRIPT;
+  }
+}
+
+export function getGrammarKeyFromFilePath(filePath: string): string {  const ext = filePath.split('.').pop()?.toLowerCase();
 
   switch (ext) {
     case 'ts':

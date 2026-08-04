@@ -1,20 +1,21 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { GraphClient } from '@repo-memory/graph';
 import { EntityRepository, RelationshipRepository, CommitRepository, JobRepository, migrate, createPool } from '@repo-memory/storage';
 import { GitOperations, FileWatcher } from '@repo-memory/ingestion';
 import {
-  TreeSitterParser, getLanguageFromFilePath, shouldParseFile, isConfigFilePath,
-  configureEmbeddings, generateEntityEmbedding, getProviderName,
+  TreeSitterParser, getGrammarKeyFromFilePath, languageFromGrammarKey,
+  shouldParseFile, isConfigFilePath,
+  configureEmbeddings, initializeEmbeddings, generateEntityEmbedding, generateEntityEmbeddings, getProviderName,
   SymbolIndex, RelationshipResolver, createFileEntity,
   applyDomainMetadata, parseDomainConfig, ChangeAnalyzer,
   streamDeadCode, streamBoundaries, resolveBatchSize
 } from '@repo-memory/analysis';
 import type { EmbeddingConfig, DeadCodeReport, DomainConfig, BoundaryReport } from '@repo-memory/analysis';
-import { Language, RelationshipType, getLogger, metrics, registerDefaultMetrics } from '@repo-memory/shared';
+import { RelationshipType, getLogger, metrics, registerDefaultMetrics } from '@repo-memory/shared';
 import type { Logger } from '@repo-memory/shared';
 import type { Entity, Relationship, ParseResult, ScanReport, ScanPhaseReport, ScanType, Job, JobType, VerificationReport, RepairReport, TypeCountDelta, RepoStatus, FileChange } from '@repo-memory/shared';
 import { readFileSync } from 'fs';
-import { join } from 'path';
+import { join, relative } from 'path';
 
 export interface OrchestratorConfig {
   repoPath: string;
@@ -28,6 +29,33 @@ export interface OrchestratorConfig {
   pgPassword?: string;
   embeddings?: EmbeddingConfig;
 }
+
+// Directories that are never source code (vendored deps, virtualenvs, build
+// output, caches). Recursively skipped during file discovery. Keeping this
+// list broad prevents whole repositories (e.g. a Python .venv with tens of
+// thousands of .py files) from being parsed as project source.
+const SKIPPED_DIRECTORIES = new Set([
+  'node_modules',
+  '.git',
+  'dist',
+  'build',
+  'out',
+  '.next',
+  'coverage',
+  '.venv',
+  'venv',
+  '.tox',
+  '__pycache__',
+  '.pytest_cache',
+  '.mypy_cache',
+  '.ruff_cache',
+  '.eggs',
+  'site-packages',
+  '.idea',
+  '.vscode',
+  '.turbo',
+  '.cache',
+]);
 
 interface ProcessStats {
   filesParsed: number;
@@ -57,7 +85,7 @@ export class Orchestrator {
   private jobRepo!: JobRepository;
   private gitOps: GitOperations;
   private config: OrchestratorConfig;
-  private parserCache: Map<Language, TreeSitterParser> = new Map();
+  private parserCache: Map<string, TreeSitterParser> = new Map();
   private domainConfig: DomainConfig | null = null;
   private changeAnalyzer: ChangeAnalyzer | null = null;
   private scanState: ScanState | null = null;
@@ -67,6 +95,9 @@ export class Orchestrator {
   private watchTimer: NodeJS.Timeout | null = null;
   private watchProcessing = false;
   private lastWatchScanAt: Date | null = null;
+  // Persisted across watch flush windows so edits don't reload the whole
+  // database symbol index on every debounce.
+  private watchIndex: SymbolIndex | null = null;
 
   constructor(config: OrchestratorConfig) {
     this.config = config;
@@ -110,6 +141,9 @@ export class Orchestrator {
         : undefined;
       configureEmbeddings(this.config.embeddings, fallback);
       this.logger.info({ provider: getProviderName() }, 'Embeddings initialized');
+      // Eagerly load the model (e.g. ONNX download) so the first scan isn't
+      // stalled by model initialization on its first embed call.
+      await initializeEmbeddings();
     }
 
     // Pre-initialize parsers for supported languages
@@ -134,22 +168,22 @@ export class Orchestrator {
   }
 
   private async initializeParsers(): Promise<void> {
-    const supportedLanguages = [Language.TYPESCRIPT, Language.JAVASCRIPT, Language.PYTHON];
+    const supportedGrammarKeys = ['typescript', 'tsx', 'javascript', 'python'];
 
-    for (const lang of supportedLanguages) {
-      const parser = new TreeSitterParser(lang);
+    for (const grammarKey of supportedGrammarKeys) {
+      const parser = new TreeSitterParser(languageFromGrammarKey(grammarKey), grammarKey);
       await parser.initialize();
-      this.parserCache.set(lang, parser);
-      this.logger.debug({ language: lang }, 'Initialized parser');
+      this.parserCache.set(grammarKey, parser);
+      this.logger.debug({ grammarKey }, 'Initialized parser');
     }
   }
 
-  private async getParser(language: Language): Promise<TreeSitterParser> {
-    let parser = this.parserCache.get(language);
+  private async getParser(grammarKey: string): Promise<TreeSitterParser> {
+    let parser = this.parserCache.get(grammarKey);
     if (!parser) {
-      parser = new TreeSitterParser(language);
+      parser = new TreeSitterParser(languageFromGrammarKey(grammarKey), grammarKey);
       await parser.initialize();
-      this.parserCache.set(language, parser);
+      this.parserCache.set(grammarKey, parser);
     }
     return parser;
   }
@@ -232,79 +266,159 @@ export class Orchestrator {
     const discoverMs = performance.now() - discoverStart;
     this.logger.info({ filesDiscovered: files.length }, 'Discovered source files');
 
-    // parse
-    const results: ParseResult[] = [];
-    let parseMs = 0;
-    let filesParsed = 0;
-    let entityCount = 0;
-    let relCount = 0;
-
-    for (const file of files) {
-      try {
-        const parseStart = performance.now();
-        const result = await this.parseFile(file);
-        parseMs += performance.now() - parseStart;
-        if (!result) continue;
-        results.push(result);
-        filesParsed++;
-        entityCount += result.entities.length;
-        relCount += result.relationships.length;
-      } catch (error) {
-        this.logger.error({ err: error, file }, 'Error processing file');
-      }
-    }
-
-    // resolve
-    const resolveStart = performance.now();
-    const { fileEntities, resolvedByFile } = await this.resolveResults(results);
-    const resolveMs = performance.now() - resolveStart;
-
-    // embed
-    const embeddings = new Map<string, number[]>();
-    let embedMs = 0;
-    let embedCount = 0;
-    for (const result of results) {
-      const embedStart = performance.now();
-      const embs = await this.generateEmbeddings(result);
-      embedMs += performance.now() - embedStart;
-      embedCount += embs.size;
-      embs.forEach((embedding, stableId) => embeddings.set(stableId, embedding));
-    }
-
-    // Fresh full scan: clear previous data for this repo before repopulating
-    await this.entityRepo.deleteAll();
-    await this.relationshipRepo.deleteAll();
+    // Fresh full scan: replace this repo's data atomically. Parse/resolve/embed
+    // must succeed before the destructive step (delete + re-insert) runs; that
+    // happens inside one PostgreSQL transaction so a mid-persist failure rolls
+    // back to the previous snapshot. The graph is cleared first (it can't join
+    // the transaction); graph upserts inside the transaction rebuild it, and any
+    // residual Neo4j gaps are reconciled by the repair job.
+    //
+    // Memory stays bounded regardless of repo size: files are processed in
+    // windows. Entities + their CONTAINS edges are persisted as each window is
+    // parsed (both endpoints of a CONTAINS edge live in the same file), so the
+    // heavy per-file data (entities, embeddings) is freed between windows. Only
+    // the lightweight raw relationships are buffered across windows, because
+    // cross-file resolution requires the complete repo symbol index and Neo4j
+    // relationship upserts require both endpoint nodes to already exist.
     await this.graphClient.deleteAll(this.config.repoPath);
+    const client = await this.pgPool.connect();
+    let entitiesStored = 0;
+    let relationshipsStored = 0;
+    try {
+      await client.query('BEGIN');
+      await this.entityRepo.deleteAll(client);
+      await this.relationshipRepo.deleteAll(client);
 
-    // persist
-    const persistStart = performance.now();
-    const { entitiesStored, relationshipsStored } = await this.persistResolved(results, fileEntities, resolvedByFile, embeddings);
-    const persistMs = performance.now() - persistStart;
+      // Repo-wide symbol index built incrementally across all windows.
+      const index = new SymbolIndex(this.config.repoPath);
+      const resolver = new RelationshipResolver(index, this.config.repoPath);
+      // Raw relationships buffered until the whole repo is indexed; keyed by
+      // file path so the resolver can look up each file's entities.
+      const pendingRelationships = new Map<string, Relationship[]>();
 
-    this.endPhase('discover', 0, 0, discoverMs);
-    this.endPhase('parse', entityCount, relCount, parseMs);
-    this.endPhase('resolve', 0, relCount, resolveMs);
-    this.endPhase('embed', embedCount, 0, embedMs);
-    this.endPhase('persist', entitiesStored, relationshipsStored, persistMs);
+      const WINDOW = 500;
+      let filesParsed = 0;
+      let entityCount = 0;
+      let relCount = 0;
+      let embedCount = 0;
+      let parseMs = 0;
+      let embedMs = 0;
+      let resolveMs = 0;
 
-    // Record the latest commit after full scan
-    await this.recordCurrentCommit();
+      for (let i = 0; i < files.length; i += WINDOW) {
+        const window = files.slice(i, i + WINDOW);
 
-    // Ingest commit history so ownership/domain reports have data
-    await this.recordCommitHistory(100);
+        // Parse this window.
+        const results: ParseResult[] = [];
+        for (const file of window) {
+          try {
+            const parseStart = performance.now();
+            const result = await this.parseFile(file);
+            parseMs += performance.now() - parseStart;
+            if (!result) continue;
+            results.push(result);
+            filesParsed++;
+            entityCount += result.entities.length;
+            relCount += result.relationships.length;
+          } catch (error) {
+            this.logger.error({ err: error, file }, 'Error processing file');
+          }
+        }
 
-    // Back-fill first/last seen commit hashes onto entities from history
-    await this.annotateEntitiesWithCommits();
+        // Register window entities + imports into the repo-wide symbol index.
+        for (const result of results) {
+          index.addFile(result.filePath);
+          index.addEntity(createFileEntity(result.filePath, this.config.repoPath));
+          index.addEntities(result.entities);
+        }
+        for (const result of results) {
+          index.registerRelationships(result.relationships);
+        }
 
-    return this.finishScan(
-      files.length,
-      filesParsed,
-      entityCount,
-      relCount,
-      embedCount,
-      entitiesStored,
-      relationshipsStored,
-    );
+        // Embed + persist this window's entities and their CONTAINS edges.
+        const embeddings = new Map<string, number[]>();
+        for (const result of results) {
+          const embedStart = performance.now();
+          const embs = await this.generateEmbeddings(result);
+          embedMs += performance.now() - embedStart;
+          embedCount += embs.size;
+          embs.forEach((embedding, stableId) => embeddings.set(stableId, embedding));
+        }
+
+        for (const result of results) {
+          const fileEntity = createFileEntity(result.filePath, this.config.repoPath);
+          entitiesStored += await this.persistFileEntities(result, fileEntity, embeddings, client);
+          // CONTAINS edges reference only same-file entities, so they can be
+          // persisted now; other relationships wait for the full index.
+          const containsEdges = result.entities.map((entity) => ({
+            id: `contains:${fileEntity.stableId}:${entity.stableId}`,
+            sourceId: fileEntity.stableId,
+            targetId: entity.stableId,
+            type: RelationshipType.CONTAINS,
+            filePath: result.filePath,
+            line: entity.startLine,
+            confidence: 1.0,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          }));
+          relationshipsStored += await this.persistRelationships(containsEdges, client);
+        }
+
+        // Keep raw relationships so they can be resolved against the full index.
+        for (const result of results) {
+          pendingRelationships.set(result.filePath, result.relationships);
+        }
+      }
+
+      // Resolve + persist every file's relationships against the now-complete
+      // index. All entity nodes already exist in both stores (entities are
+      // persisted per-window; Neo4j relationships are written after the final
+      // window so their endpoints always exist).
+      const resolveStart = performance.now();
+      for (const [filePath, relationships] of pendingRelationships) {
+        const fileEntity = createFileEntity(filePath, this.config.repoPath);
+        const resolved = resolver.resolveRelationships(relationships).map((rel) =>
+          // EXPORTS / module-level IMPORTS use the raw file path as sourceId;
+          // re-anchor to the file entity.
+          rel.sourceId === filePath ? { ...rel, sourceId: fileEntity.stableId } : rel
+        );
+        relationshipsStored += await this.persistRelationships(resolved, client);
+      }
+      resolveMs = performance.now() - resolveStart;
+
+      await client.query('COMMIT');
+
+      this.endPhase('discover', 0, 0, discoverMs);
+      this.endPhase('parse', entityCount, relCount, parseMs);
+      this.endPhase('resolve', 0, relCount, resolveMs);
+      this.endPhase('embed', embedCount, 0, embedMs);
+      this.endPhase('persist', entitiesStored, relationshipsStored);
+
+      // Record the latest commit after full scan
+      await this.recordCurrentCommit();
+
+      // Ingest commit history so ownership/domain reports have data
+      await this.recordCommitHistory(100);
+
+      // Back-fill first/last seen commit hashes onto entities from history
+      await this.annotateEntitiesWithCommits();
+
+      return this.finishScan(
+        files.length,
+        filesParsed,
+        entityCount,
+        relCount,
+        embedCount,
+        entitiesStored,
+        relationshipsStored,
+      );
+    } catch (error) {
+      await client.query('ROLLBACK');
+      this.logger.error({ err: error }, 'Full scan persist failed; transaction rolled back');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   private async recordCurrentCommit(): Promise<void> {
@@ -362,21 +476,28 @@ export class Orchestrator {
         lastSeen.set(key, row.hash);
       }
 
-      for (const [fileKey, hash] of firstSeen) {
+      // Bulk update instead of one query per file (large repos touch thousands).
+      const firstKeys = [...firstSeen.keys()];
+      if (firstKeys.length > 0) {
         await this.pgPool.query(
           `UPDATE entities
-           SET first_seen_commit = $1, updated_at = NOW()
-           WHERE repo_path = $2 AND REPLACE(file_path, '\\', '/') = $3
-             AND first_seen_commit IS NULL`,
-          [hash, this.config.repoPath, fileKey]
+           SET first_seen_commit = src.hash, updated_at = NOW()
+           FROM (SELECT unnest($1::text[]) AS file_key, unnest($2::text[]) AS hash) AS src
+           WHERE entities.repo_path = $3
+             AND REPLACE(entities.file_path, '\\', '/') = src.file_key
+             AND entities.first_seen_commit IS NULL`,
+          [firstKeys, firstKeys.map((k) => firstSeen.get(k)!), this.config.repoPath]
         );
       }
-      for (const [fileKey, hash] of lastSeen) {
+      const lastKeys = [...lastSeen.keys()];
+      if (lastKeys.length > 0) {
         await this.pgPool.query(
           `UPDATE entities
-           SET last_seen_commit = $1, updated_at = NOW()
-           WHERE repo_path = $2 AND REPLACE(file_path, '\\', '/') = $3`,
-          [hash, this.config.repoPath, fileKey]
+           SET last_seen_commit = src.hash, updated_at = NOW()
+           FROM (SELECT unnest($1::text[]) AS file_key, unnest($2::text[]) AS hash) AS src
+           WHERE entities.repo_path = $3
+             AND REPLACE(entities.file_path, '\\', '/') = src.file_key`,
+          [lastKeys, lastKeys.map((k) => lastSeen.get(k)!), this.config.repoPath]
         );
       }
 
@@ -504,6 +625,7 @@ export class Orchestrator {
     if (this.watcher) return;
     this.watchDebounceMs = options.debounceMs ?? 500;
     this.lastWatchScanAt = null;
+    this.watchIndex = null;
 
     this.watcher = new FileWatcher(this.config.repoPath, { ignoreInitial: true });
     this.watcher.on('file:change', (change) => this.queueWatchChange(change));
@@ -520,6 +642,7 @@ export class Orchestrator {
       clearTimeout(this.watchTimer);
       this.watchTimer = null;
     }
+    this.watchIndex = null;
     if (this.watcher) {
       await this.watcher.stop();
       this.watcher = null;
@@ -582,7 +705,13 @@ export class Orchestrator {
   // recording a new commit (the working tree is not a commit).
   private async processWatchChanges(changes: Array<{ filePath: string; status: string }>): Promise<ScanReport> {
     this.beginScan('working-tree');
-    const stats = await this.processChanges(changes);
+    // Reuse the in-memory symbol index across flush windows instead of
+    // reloading the whole database on every edit. Rebuild only on the first
+    // flush or when a deletion occurred (SymbolIndex has no remove path).
+    if (!this.watchIndex || changes.some((c) => c.status === 'deleted')) {
+      this.watchIndex = await this.loadSymbolIndex();
+    }
+    const stats = await this.processChanges(changes, this.watchIndex);
     await this.touchRepoState();
     return this.finishScan(
       changes.length,
@@ -649,7 +778,10 @@ export class Orchestrator {
   // repo-wide symbol index is loaded from the database so relationships still resolve
   // against definitions in files that were not re-parsed. Records per-phase telemetry
   // into the active scan state.
-  private async processChanges(changes: Array<{ filePath: string; status: string }>): Promise<ProcessStats> {
+  private async processChanges(
+    changes: Array<{ filePath: string; status: string }>,
+    indexParam?: SymbolIndex,
+  ): Promise<ProcessStats> {
     let parseMs = 0;
     let embedMs = 0;
     let filesParsed = 0;
@@ -658,7 +790,7 @@ export class Orchestrator {
     let embedCount = 0;
 
     const resolveStart = performance.now();
-    const index = await this.loadSymbolIndex();
+    const index = indexParam ?? await this.loadSymbolIndex();
     const resolveMs = performance.now() - resolveStart;
 
     const results: ParseResult[] = [];
@@ -747,7 +879,7 @@ export class Orchestrator {
       return null;
     }
 
-    const relativePath = filePath.replace(this.config.repoPath, '').replace(/^[/\\]/, '');
+    const relativePath = relative(this.config.repoPath, filePath).replace(/\\/g, '/');
 
     // Read file content
     let content: string;
@@ -758,9 +890,9 @@ export class Orchestrator {
       return null;
     }
 
-    // Parse file using cached parser
-    const language = getLanguageFromFilePath(filePath);
-    const parser = await this.getParser(language);
+    // Parse file using cached parser (grammar keyed so .tsx uses the JSX grammar)
+    const grammarKey = getGrammarKeyFromFilePath(filePath);
+    const parser = await this.getParser(grammarKey);
 
     const result = await parser.parse(relativePath, content, this.config.repoPath);
 
@@ -773,86 +905,59 @@ export class Orchestrator {
 
   private async generateEmbeddings(result: ParseResult): Promise<Map<string, number[]>> {
     const embeddings = new Map<string, number[]>();
-    for (const entity of result.entities) {
-      try {
-        const embedding = await generateEntityEmbedding(entity.name, entity.type, entity.filePath);
-        embeddings.set(entity.stableId, embedding);
-      } catch (error) {
-        this.logger.error({ err: error, entity: entity.name }, 'Failed to generate embedding');
-      }
+    if (result.entities.length === 0) return embeddings;
+    try {
+      const vectors = await generateEntityEmbeddings(
+        result.entities.map((entity) => ({
+          name: entity.name,
+          type: entity.type,
+          filePath: entity.filePath,
+        }))
+      );
+      result.entities.forEach((entity, i) => {
+        if (vectors[i]) embeddings.set(entity.stableId, vectors[i]);
+      });
+    } catch (error) {
+      this.logger.error({ err: error, file: result.filePath }, 'Failed to generate embeddings');
     }
     return embeddings;
   }
 
   // Build the symbol index and resolve every file's relationships against it.
   // Split from persistence so scans can time the resolve phase independently.
-  private async resolveResults(results: ParseResult[]): Promise<{
-    fileEntities: Map<string, Entity>;
-    resolvedByFile: Map<string, Relationship[]>;
-  }> {
-    const index = new SymbolIndex(this.config.repoPath);
-    const fileEntities = new Map<string, Entity>();
-
-    for (const result of results) {
-      index.addFile(result.filePath);
-    }
-    for (const result of results) {
-      const fileEntity = createFileEntity(result.filePath, this.config.repoPath);
-      fileEntities.set(result.filePath, fileEntity);
-    }
-    for (const result of results) {
-      index.addEntities(result.entities);
-    }
-    for (const fileEntity of fileEntities.values()) {
-      index.addEntity(fileEntity);
-    }
-    for (const result of results) {
-      index.registerRelationships(result.relationships);
-    }
-
-    const resolver = new RelationshipResolver(index, this.config.repoPath);
-    const resolvedByFile = new Map<string, Relationship[]>();
-
-    for (const result of results) {
-      const resolved = resolver.resolveRelationships(result.relationships);
-      resolvedByFile.set(result.filePath, resolved);
-    }
-
-    return { fileEntities, resolvedByFile };
-  }
+  // (Full scans build the index incrementally across parse windows instead.)
 
   // Persist entities + relationships for a full scan. Entities are stored before
-  // any relationship (graph upserts require both endpoints to exist).
-  private async persistResolved(
-    results: ParseResult[],
-    fileEntities: Map<string, Entity>,
-    resolvedByFile: Map<string, Relationship[]>,
-    embeddings: Map<string, number[]>,
-  ): Promise<{ entitiesStored: number; relationshipsStored: number }> {
-    let entitiesStored = 0;
-    let relationshipsStored = 0;
+  // any relationship (graph upserts require both endpoints to exist). Full scans
+  // persist per-window instead of buffering the whole repo.
 
-    for (const result of results) {
-      const fileEntity = fileEntities.get(result.filePath)!;
-      entitiesStored += await this.persistFileEntities(result, fileEntity, embeddings);
+  // Store a batch of relationships in both databases. Used by the full scan to
+  // persist CONTAINS edges per-window and resolved relationships once the whole
+  // repo symbol index is built; the incremental path uses persistFileRelationships
+  // (which additionally cleans up stale rows for the file).
+  private async persistRelationships(
+    relationships: Relationship[],
+    client?: PoolClient,
+  ): Promise<number> {
+    let stored = 0;
+    for (const relationship of relationships) {
+      try {
+        await this.relationshipRepo.upsert(relationship, client);
+        await this.graphClient.upsertRelationship(relationship, this.config.repoPath);
+        stored++;
+      } catch (error) {
+        this.logger.error({ err: error, filePath: relationship.filePath }, 'Failed to store relationship');
+      }
     }
-
-    // Store relationships after all entity nodes exist (graph upserts require both endpoints)
-    for (const result of results) {
-      relationshipsStored += await this.persistFileRelationships(
-        result,
-        fileEntities.get(result.filePath)!,
-        resolvedByFile.get(result.filePath)!
-      );
-    }
-
-    return { entitiesStored, relationshipsStored };
+    metrics.inc('repo_memory_relationships_stored_total', undefined, stored);
+    return stored;
   }
 
   private async persistFileEntities(
     result: ParseResult,
     fileEntity: Entity,
     embeddings: Map<string, number[]>,
+    client?: PoolClient,
   ): Promise<number> {
     // Populate domain / architecturalRole metadata
     applyDomainMetadata(result.entities, this.domainConfig || undefined);
@@ -863,11 +968,11 @@ export class Orchestrator {
     let stored = 0;
     for (const entity of entities) {
       try {
-        await this.entityRepo.upsert(entity);
+        await this.entityRepo.upsert(entity, client);
         await this.graphClient.upsertEntity(entity, this.config.repoPath);
         const embedding = embeddings.get(entity.stableId);
         if (embedding) {
-          await this.entityRepo.updateEmbedding(entity.stableId, embedding);
+          await this.entityRepo.updateEmbedding(entity.stableId, embedding, client);
         }
         stored++;
       } catch (error) {
@@ -882,6 +987,7 @@ export class Orchestrator {
     result: ParseResult,
     fileEntity: Entity,
     resolvedRelationships: Relationship[],
+    client?: PoolClient,
   ): Promise<number> {
     // Remove stale relationships for this file (e.g. previously unresolved targets)
     await this.relationshipRepo.deleteByFilePath(result.filePath);
@@ -911,7 +1017,7 @@ export class Orchestrator {
     let stored = 0;
     for (const relationship of rels) {
       try {
-        await this.relationshipRepo.upsert(relationship);
+        await this.relationshipRepo.upsert(relationship, client);
         await this.graphClient.upsertRelationship(relationship, this.config.repoPath);
         stored++;
       } catch (error) {
@@ -947,8 +1053,8 @@ export class Orchestrator {
       const fullPath = path.join(dir, entry.name);
 
       if (entry.isDirectory()) {
-        // Skip node_modules, .git, dist, etc.
-        if (['node_modules', '.git', 'dist', 'build', '.next', 'coverage'].includes(entry.name)) {
+        // Skip vendored dependencies, virtualenvs, build output, and caches.
+        if (SKIPPED_DIRECTORIES.has(entry.name)) {
           continue;
         }
 
@@ -975,17 +1081,21 @@ export class Orchestrator {
   }
 
   async getDependencies(stableId: string): Promise<Entity[]> {
-    const deps = await this.graphClient.findDependencies(stableId);
+    const deps = await this.graphClient.findDependencies(stableId, this.config.repoPath);
     return deps.map(d => d.entity);
   }
 
   async getDependents(stableId: string): Promise<Entity[]> {
-    const deps = await this.graphClient.findDependents(stableId);
+    const deps = await this.graphClient.findDependents(stableId, this.config.repoPath);
     return deps.map(d => d.entity);
   }
 
   async getTransitiveDependencies(stableId: string, maxDepth: number = 5): Promise<Entity[]> {
-    return this.graphClient.findTransitiveDependencies(stableId, maxDepth);
+    return this.graphClient.findTransitiveDependencies(stableId, maxDepth, this.config.repoPath);
+  }
+
+  async getTransitiveDependents(stableId: string, maxDepth: number = 5): Promise<Entity[]> {
+    return this.graphClient.findTransitiveDependents(stableId, maxDepth, this.config.repoPath);
   }
 
   async getDeadCodeReport(): Promise<DeadCodeReport> {

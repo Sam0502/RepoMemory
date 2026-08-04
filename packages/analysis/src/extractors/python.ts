@@ -1,6 +1,13 @@
 import { Entity, Relationship, EntityType, RelationshipType, Language } from '@repo-memory/shared';
 import { ExtractorContext } from './interface.js';
 import { BaseExtractor } from './base.js';
+import { generateFileStableId } from '../resolver/ids.js';
+
+const ROUTER_OBJECTS = new Set([
+  'app', 'router', 'route', 'api', 'bp', 'blueprint', 'server',
+  'fastapi', 'flask', 'endpoint', 'main', 'app_router', 'api_router',
+  'auth', 'admin', 'user_routes', 'routes', 'this',
+]);
 
 export class PythonExtractor extends BaseExtractor {
   language = Language.PYTHON;
@@ -195,6 +202,9 @@ export class PythonExtractor extends BaseExtractor {
     const functionNode = callNode.children?.[0];
     if (!functionNode || functionNode.type !== 'attribute') return;
 
+    const receiverName = this.getAttributeReceiver(functionNode);
+    if (!receiverName || !ROUTER_OBJECTS.has(receiverName)) return;
+
     const methodNode = this.findChildrenByType(functionNode, 'identifier').pop();
     const methodName = methodNode?.text;
     if (!methodName) return;
@@ -305,6 +315,10 @@ export class PythonExtractor extends BaseExtractor {
     entities: Entity[],
     relationships: Relationship[]
   ): void {
+    // Only module-level names become entities. Locals inside functions,
+    // lambdas, and classes would pollute exports and dead-code reports.
+    if (!this.isModuleScope(node)) return;
+
     const leftNode = node.children?.[0];
     if (!leftNode) return;
 
@@ -333,6 +347,21 @@ export class PythonExtractor extends BaseExtractor {
         this.extractCallsFromNode(rightNode, entity.stableId, ctx, relationships);
       }
     }
+  }
+
+  private isModuleScope(node: any): boolean {
+    let current = node.parent;
+    while (current) {
+      if (
+        current.type === 'function_definition' ||
+        current.type === 'lambda' ||
+        current.type === 'class_definition'
+      ) {
+        return false;
+      }
+      current = current.parent;
+    }
+    return true;
   }
 
   private extractClassVariable(
@@ -364,7 +393,7 @@ export class PythonExtractor extends BaseExtractor {
 
     // Handle function calls in expression statements
     if (expression.type === 'call') {
-      this.extractCallsFromNode(expression, ctx.filePath, ctx, relationships);
+      this.extractCallsFromNode(expression, generateFileStableId(ctx.repoPath, ctx.filePath), ctx, relationships);
       
       // Detect API endpoints (Flask/FastAPI decorators)
       this.extractApiEndpoint(expression, ctx, entities, relationships);
@@ -377,9 +406,14 @@ export class PythonExtractor extends BaseExtractor {
     entities: Entity[],
     relationships: Relationship[]
   ): void {
-    // Check if this is a route decorator call
+    // Check if this is a route registration call
     const functionNode = node.children?.[0];
     if (!functionNode || functionNode.type !== 'attribute') return;
+
+    // Only treat calls on known router objects (app.get, router.post, bp.get)
+    // as endpoints; `dict.get('k')` / `requests.get(...)` are not routes.
+    const receiverName = this.getAttributeReceiver(functionNode);
+    if (!receiverName || !ROUTER_OBJECTS.has(receiverName)) return;
     
     const methodNode = this.findChildrenByType(functionNode, 'identifier').pop();
     const methodName = methodNode?.text;
@@ -440,6 +474,17 @@ export class PythonExtractor extends BaseExtractor {
     return !name.startsWith('_');
   }
 
+  // For an attribute node like `app.get` (or `blueprint.route`), return the
+  // receiver object name (`app` / `blueprint`).
+  private getAttributeReceiver(attributeNode: any): string | null {
+    const children = attributeNode.children || [];
+    const receiver = children[0];
+    if (!receiver) return null;
+    if (receiver.type === 'identifier') return receiver.text;
+    if (receiver.type === 'attribute') return this.getAttributeReceiver(receiver);
+    return null;
+  }
+
   private extractDocstring(node: any, entity: Entity, _ctx: ExtractorContext): void {
     // Extract docstring from function/class body
     const body = this.findChildByType(node, 'block') || node.childForFieldName('body');
@@ -452,9 +497,13 @@ export class PythonExtractor extends BaseExtractor {
     if (firstStatement.type === 'expression_statement') {
       const expression = firstStatement.children?.[0];
       if (expression && (expression.type === 'string' || expression.type === 'concatenated_string')) {
-        const docstring = expression.text.replace(/['"]/g, '').trim();
-        if (docstring) {
-          entity.docstring = docstring;
+        const raw = expression.text.trim();
+        // Strip only the outer quote delimiters (single, double, or triple),
+        // preserving quotes/apostrophes inside the docstring content.
+        const match = raw.match(/^('''|"""|'|")([\s\S]*?)\1$/);
+        const docstring = match ? match[2] : raw.replace(/^['"]/, '').replace(/['"]$/, '');
+        if (docstring.trim()) {
+          entity.docstring = docstring.trim();
         }
       }
     }

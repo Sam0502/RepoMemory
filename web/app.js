@@ -1,4 +1,12 @@
-const API_BASE = 'http://localhost:3000';
+// Relative API base: the frontend is served by the API server itself, so it
+// works on whatever port/host the server runs on (no hardcoded origin).
+const API_BASE = '';
+
+// Bearer token for the API when the server was started with
+// REPO_MEMORY_API_TOKEN (injected via /config.js, which the server serves
+// unauthenticated so the page can authenticate its own requests).
+const API_TOKEN = window.REPO_MEMORY_API_TOKEN || '';
+const AUTH_HEADERS = API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {};
 
 const TYPE_COLORS = {
   Class: '#58a6ff',
@@ -84,7 +92,7 @@ const qaSuggestions = document.getElementById('qaSuggestions');
 
 // --- API ---
 async function api(path) {
-  const res = await fetch(`${API_BASE}${path}`);
+  const res = await fetch(`${API_BASE}${path}`, { headers: AUTH_HEADERS });
   if (!res.ok) throw new Error(`API ${res.status}`);
   return res.json();
 }
@@ -92,7 +100,7 @@ async function api(path) {
 async function apiPost(path, body) {
   const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS },
     body: body ? JSON.stringify(body) : '{}',
   });
   if (!res.ok) {
@@ -104,7 +112,13 @@ async function apiPost(path, body) {
 
 // --- Utilities ---
 function escHtml(s) {
-  return s ? s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : '';
+  if (s === undefined || s === null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function shortPath(p) {
@@ -240,9 +254,9 @@ function renderEntityList(entities) {
     return;
   }
   entityListContent.innerHTML = entities.slice(0, 300).map(e => `
-    <div class="entity-item${e.stableId === selectedEntityId ? ' selected' : ''}" data-stable-id="${e.stableId}">
+    <div class="entity-item${e.stableId === selectedEntityId ? ' selected' : ''}" data-stable-id="${escHtml(e.stableId)}">
       <div class="name">
-        <span class="type-badge type-${e.type}">${e.type}</span>
+        <span class="type-badge type-${escHtml(e.type)}">${escHtml(e.type)}</span>
         ${escHtml(e.name)}
       </div>
       <div class="meta">${e.repoPath ? `<span class="repo-tag">${escHtml(e.repoPath)}</span>` : ''}${escHtml(shortPath(e.filePath))}</div>
@@ -317,8 +331,8 @@ function renderDetail(entity) {
   // Core info
   html += `<div class="detail-section">
     <h3>Info</h3>
-    <div class="detail-row"><div class="label">Type</div><div class="value"><span class="type-badge type-${entity.type}">${entity.type}</span></div></div>
-    <div class="detail-row"><div class="label">Language</div><div class="value">${entity.language}</div></div>
+    <div class="detail-row"><div class="label">Type</div><div class="value"><span class="type-badge type-${escHtml(entity.type)}">${escHtml(entity.type)}</span></div></div>
+    <div class="detail-row"><div class="label">Language</div><div class="value">${escHtml(entity.language)}</div></div>
     <div class="detail-row"><div class="label">File</div><div class="value path">${escHtml(entity.filePath)}</div></div>
     <div class="detail-row"><div class="label">Lines</div><div class="value">${entity.startLine}&ndash;${entity.endLine}</div></div>
     <div class="detail-row"><div class="label">Exported</div><div class="value">${entity.isExported ? 'Yes' : 'No'}</div></div>
@@ -458,7 +472,7 @@ function renderGraph() {
     .style('cursor', 'pointer')
     .on('click', (e, d) => selectEntity(d.stableId))
     .on('mouseover', (e, d) => {
-      showTooltip(`<strong>${escHtml(d.name)}</strong><br><span style="color:${TYPE_COLORS[d.type] || '#8b949e'}">${d.type}</span><br><span style="color:#8b949e">${escHtml(shortPath(d.filePath))}</span>`, e);
+      showTooltip(`<strong>${escHtml(d.name)}</strong><br><span style="color:${TYPE_COLORS[d.type] || '#8b949e'}">${escHtml(d.type)}</span><br><span style="color:#8b949e">${escHtml(shortPath(d.filePath))}</span>`, e);
     })
     .on('mouseout', hideTooltip);
 
@@ -556,7 +570,7 @@ function renderArchitectureGraph() {
     .style('cursor', 'pointer')
     .on('click', (e, d) => selectFile(d.fullPath))
     .on('mouseover', (e, d) => {
-      showTooltip(`<strong>${escHtml(d.name)}</strong><br><span style="color:${GROUP_COLORS[d.group] || '#8b949e'}">${d.group}</span><br><span style="color:#8b949e">${d.entityCount} entities</span><br><span style="color:#8b949e;font-size:10px">${(d.entityTypes || []).slice(0, 4).join(', ')}</span>`, e);
+      showTooltip(`<strong>${escHtml(d.name)}</strong><br><span style="color:${GROUP_COLORS[d.group] || '#8b949e'}">${escHtml(d.group)}</span><br><span style="color:#8b949e">${d.entityCount} entities</span><br><span style="color:#8b949e;font-size:10px">${escHtml((d.entityTypes || []).slice(0, 4).join(', '))}</span>`, e);
     })
     .on('mouseout', hideTooltip);
 
@@ -600,7 +614,7 @@ function renderCommitList(commits) {
     return;
   }
   commitListContent.innerHTML = commits.map(c => `
-    <div class="commit-item${c.hash === selectedCommitHash ? ' selected' : ''}" data-hash="${c.hash}">
+    <div class="commit-item${c.hash === selectedCommitHash ? ' selected' : ''}" data-hash="${escHtml(c.hash)}">
       <div class="hash">${c.hash.slice(0, 8)}</div>
       <div class="msg">${escHtml(c.message)}</div>
       <div class="meta">
@@ -702,8 +716,8 @@ async function loadSimilarEntities(stableId) {
       <h3>Similar Entities</h3>
       <div class="dep-list">
         ${similar.map(s => `
-          <li class="similar-item" data-stable-id="${s.stableId}">
-            <span class="type-badge type-${s.type}">${s.type}</span>
+          <li class="similar-item" data-stable-id="${escHtml(s.stableId)}">
+            <span class="type-badge type-${escHtml(s.type)}">${escHtml(s.type)}</span>
             <span>${escHtml(s.name)}</span>
           </li>
         `).join('')}
@@ -896,7 +910,7 @@ function renderDeadCode(data) {
   }
   html += items.slice(0, 100).map(d => `
     <div class="report-item">
-      <div class="report-main"><span class="type-badge type-${d.entity.type}">${d.entity.type}</span> ${escHtml(d.entity.name)}</div>
+      <div class="report-main"><span class="type-badge type-${escHtml(d.entity.type)}">${escHtml(d.entity.type)}</span> ${escHtml(d.entity.name)}</div>
       <div class="report-sub">${d.entity.repoPath ? `<span class="repo-tag">${escHtml(d.entity.repoPath)}</span>` : ''}${escHtml(shortPath(d.entity.filePath))}</div>
       <div class="report-sub dead-reason">${escHtml(d.reason)}</div>
     </div>
@@ -1066,7 +1080,7 @@ async function askQuestion() {
   try {
     const res = await fetch(`${API_BASE}/api/workspace/qa/ask`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...AUTH_HEADERS },
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`API ${res.status}`);
@@ -1081,7 +1095,7 @@ function renderQaAnswer(ans) {
   let html = `<div class="qa-intent">intent: ${escHtml(ans.intent || 'info')}${currentRepo !== 'all' ? ` &middot; repo: ${escHtml(currentRepo)}` : ''}</div>`;
   if (ans.entity) {
     html += `<div class="qa-entity" data-stable-id="${escHtml(ans.entity.stableId)}">
-      <span class="type-badge type-${ans.entity.type}">${ans.entity.type}</span>
+      <span class="type-badge type-${escHtml(ans.entity.type)}">${escHtml(ans.entity.type)}</span>
       <span>${escHtml(ans.entity.name)}</span>
       ${ans.entity.repoPath ? `<span class="repo-tag">${escHtml(ans.entity.repoPath)}</span>` : ''}
     </div>`;

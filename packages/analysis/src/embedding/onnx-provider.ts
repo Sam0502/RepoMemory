@@ -46,11 +46,16 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embedBatch(texts: string[]): Promise<number[][]> {
+    if (texts.length === 0) return [];
     if (!this.initialized) await this.initialize();
-    const results: number[][] = [];
-    for (const text of texts) {
-      results.push(await this.embed(text));
+    try {
+      const results = await this.extractor(texts, {
+        pooling: 'mean',
+        normalize: true,
+      });
+      return (Array.isArray(results) ? results : [results]).map((r: any) => Array.from(r.data) as number[]);
+    } catch (error) {
+      throw new Error(`ONNX embedding batch failed: ${error}`);
     }
-    return results;
   }
 }

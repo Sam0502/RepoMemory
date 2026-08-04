@@ -1,5 +1,7 @@
 import simpleGit, { SimpleGit } from 'simple-git';
-import { FileChange, Commit } from '@repo-memory/shared';
+import { FileChange, Commit, getLogger } from '@repo-memory/shared';
+
+const logger = getLogger({ component: 'ingestion' });
 
 export class GitOperations {
   private git: SimpleGit;
@@ -30,8 +32,9 @@ export class GitOperations {
         };
       }
       return null;
-    } catch {
-      return null;
+    } catch (error) {
+      logger.error({ err: error }, 'git: getLatestCommit failed');
+      throw error;
     }
   }
 
@@ -45,8 +48,9 @@ export class GitOperations {
         date: new Date(entry.date),
         filesChanged: [],
       }));
-    } catch {
-      return [];
+    } catch (error) {
+      logger.error({ err: error }, 'git: getCommitsSince failed');
+      throw error;
     }
   }
 
@@ -77,8 +81,9 @@ export class GitOperations {
         });
       }
       return commits;
-    } catch {
-      return [];
+    } catch (error) {
+      logger.error({ err: error }, 'git: getRecentCommitsWithChanges failed');
+      throw error;
     }
   }
 
@@ -86,8 +91,9 @@ export class GitOperations {
     try {
       const diff = await this.git.diff([from, to, '--numstat', '--summary']);
       return this.parseNumstatOutput(diff);
-    } catch {
-      return [];
+    } catch (error) {
+      logger.error({ err: error }, 'git: getDiffBetweenCommits failed');
+      throw error;
     }
   }
 
@@ -95,8 +101,9 @@ export class GitOperations {
     try {
       const diff = await this.git.diff(['--numstat', '--summary']);
       return this.parseNumstatOutput(diff);
-    } catch {
-      return [];
+    } catch (error) {
+      logger.error({ err: error }, 'git: getWorkingTreeDiff failed');
+      throw error;
     }
   }
 
@@ -104,8 +111,9 @@ export class GitOperations {
     try {
       const diff = await this.git.diff(['--cached', '--numstat', '--summary']);
       return this.parseNumstatOutput(diff);
-    } catch {
-      return [];
+    } catch (error) {
+      logger.error({ err: error }, 'git: getStagedDiff failed');
+      throw error;
     }
   }
 
@@ -121,7 +129,12 @@ export class GitOperations {
     try {
       const fs = await import('fs/promises');
       const path = await import('path');
-      const fullPath = path.join(this.repoPath, filePath);
+      const repoRoot = path.resolve(this.repoPath);
+      const fullPath = path.resolve(repoRoot, filePath);
+      const rel = path.relative(repoRoot, fullPath);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        return null;
+      }
       return await fs.readFile(fullPath, 'utf-8');
     } catch {
       return null;
@@ -136,8 +149,9 @@ export class GitOperations {
         added: status.not_added,
         deleted: status.deleted,
       };
-    } catch {
-      return { modified: [], added: [], deleted: [] };
+    } catch (error) {
+      logger.error({ err: error }, 'git: getStatus failed');
+      throw error;
     }
   }
 
@@ -145,8 +159,9 @@ export class GitOperations {
     try {
       const log = await this.git.log({ maxCount: 1 });
       return log.latest?.hash || null;
-    } catch {
-      return null;
+    } catch (error) {
+      logger.error({ err: error }, 'git: getLastCommitHash failed');
+      throw error;
     }
   }
 

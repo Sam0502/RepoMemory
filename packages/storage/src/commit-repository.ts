@@ -5,49 +5,74 @@ export class CommitRepository {
   constructor(private pool: Pool, private repoPath: string = '') {}
 
   async upsert(commit: Omit<Commit, 'id' | 'createdAt' | 'updatedAt'> & { fileChanges?: FileChange[] }): Promise<Commit> {
-    const query = `
-      INSERT INTO commits (hash, repo_path, message, author, date, files_changed)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT (hash) DO UPDATE SET
-        repo_path = EXCLUDED.repo_path,
-        message = EXCLUDED.message,
-        author = EXCLUDED.author,
-        date = EXCLUDED.date,
-        files_changed = EXCLUDED.files_changed
-      RETURNING *
-    `;
-    const values = [
-      commit.hash,
-      this.repoPath,
-      commit.message,
-      commit.author,
-      commit.date,
-      JSON.stringify(commit.filesChanged || []),
-    ];
-    const result = await this.pool.query(query, values);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    if (commit.fileChanges && commit.fileChanges.length > 0) {
-      for (const fc of commit.fileChanges) {
-        await this.pool.query(
-          `INSERT INTO file_changes (commit_hash, file_path, additions, deletions, status, old_path)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (commit_hash, file_path) DO UPDATE SET
+      const query = `
+        INSERT INTO commits (hash, repo_path, message, author, date, files_changed)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (repo_path, hash) DO UPDATE SET
+          message = EXCLUDED.message,
+          author = EXCLUDED.author,
+          date = EXCLUDED.date,
+          files_changed = EXCLUDED.files_changed
+        RETURNING *
+      `;
+      const values = [
+        commit.hash,
+        this.repoPath,
+        commit.message,
+        commit.author,
+        commit.date,
+        JSON.stringify(commit.filesChanged || []),
+      ];
+      const result = await client.query(query, values);
+
+      // Batch all file changes in a single statement, inside the same
+      // transaction as the commit row for atomicity.
+      const fileChanges = commit.fileChanges || [];
+      if (fileChanges.length > 0) {
+        const params: unknown[] = [];
+        const clauses = fileChanges.map((_, i) => {
+          const base = i * 7;
+          params.push(
+            commit.hash,
+            this.repoPath,
+            fileChanges[i].filePath,
+            fileChanges[i].additions,
+            fileChanges[i].deletions,
+            fileChanges[i].status,
+            fileChanges[i].oldPath || null
+          );
+          return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`;
+        });
+        await client.query(
+          `INSERT INTO file_changes (commit_hash, repo_path, file_path, additions, deletions, status, old_path)
+           VALUES ${clauses.join(', ')}
+           ON CONFLICT (repo_path, commit_hash, file_path) DO UPDATE SET
              additions = EXCLUDED.additions,
              deletions = EXCLUDED.deletions,
              status = EXCLUDED.status,
              old_path = EXCLUDED.old_path`,
-          [commit.hash, fc.filePath, fc.additions, fc.deletions, fc.status, fc.oldPath || null]
+          params
         );
       }
-    }
 
-    return this.mapRowToCommit(result.rows[0]);
+      await client.query('COMMIT');
+      return this.mapRowToCommit(result.rows[0]);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async findByHash(hash: string): Promise<Commit | null> {
     const result = this.repoPath
       ? await this.pool.query('SELECT * FROM commits WHERE hash = $1 AND repo_path = $2', [hash, this.repoPath])
-      : await this.pool.query('SELECT * FROM commits WHERE hash = $1', [hash]);
+      : await this.pool.query('SELECT * FROM commits WHERE hash = $1 ORDER BY date DESC LIMIT 1', [hash]);
     if (result.rows.length === 0) return null;
     return this.mapRowToCommit(result.rows[0]);
   }
@@ -63,10 +88,15 @@ export class CommitRepository {
   }
 
   async getFileChanges(commitHash: string): Promise<FileChange[]> {
-    const result = await this.pool.query(
-      'SELECT * FROM file_changes WHERE commit_hash = $1 ORDER BY file_path',
-      [commitHash]
-    );
+    const result = this.repoPath
+      ? await this.pool.query(
+          'SELECT * FROM file_changes WHERE commit_hash = $1 AND repo_path = $2 ORDER BY file_path',
+          [commitHash, this.repoPath]
+        )
+      : await this.pool.query(
+          'SELECT * FROM file_changes WHERE commit_hash = $1 ORDER BY file_path',
+          [commitHash]
+        );
     return result.rows.map(row => ({
       filePath: row.file_path,
       additions: row.additions,
@@ -100,7 +130,7 @@ export class CommitRepository {
                 COALESCE(SUM(f.deletions), 0)::int AS deletions,
                 MAX(c.date) AS last_changed
          FROM file_changes f
-         JOIN commits c ON c.hash = f.commit_hash
+         JOIN commits c ON c.hash = f.commit_hash AND c.repo_path = f.repo_path
          WHERE c.repo_path = $1 AND c.date >= NOW() - make_interval(days => $2)
          GROUP BY f.file_path
          ORDER BY commits DESC
@@ -111,7 +141,7 @@ export class CommitRepository {
                 COALESCE(SUM(f.deletions), 0)::int AS deletions,
                 MAX(c.date) AS last_changed
          FROM file_changes f
-         JOIN commits c ON c.hash = f.commit_hash
+         JOIN commits c ON c.hash = f.commit_hash AND c.repo_path = f.repo_path
          WHERE c.repo_path = $1
          GROUP BY f.file_path
          ORDER BY commits DESC
@@ -130,11 +160,11 @@ export class CommitRepository {
     const normalized = filePath.replace(/\\/g, '/');
     const query = this.repoPath
       ? `SELECT c.* FROM commits c
-         JOIN file_changes f ON f.commit_hash = c.hash
+         JOIN file_changes f ON f.commit_hash = c.hash AND f.repo_path = c.repo_path
          WHERE c.repo_path = $1 AND f.file_path = $2
          ORDER BY c.date DESC LIMIT $3`
       : `SELECT c.* FROM commits c
-         JOIN file_changes f ON f.commit_hash = c.hash
+         JOIN file_changes f ON f.commit_hash = c.hash AND f.repo_path = c.repo_path
          WHERE f.file_path = $1
          ORDER BY c.date DESC LIMIT $2`;
     const result = await this.pool.query(query, this.repoPath ? [this.repoPath, normalized, limit] : [normalized, limit]);

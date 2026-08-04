@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { Entity, EntityType, Language } from '@repo-memory/shared';
 
 export class EntityRepository {
@@ -29,7 +29,7 @@ export class EntityRepository {
     return this.mapRowToEntity(result.rows[0]);
   }
 
-  async upsert(entity: Omit<Entity, 'id' | 'createdAt' | 'updatedAt'>): Promise<Entity> {
+  async upsert(entity: Omit<Entity, 'id' | 'createdAt' | 'updatedAt'>, client?: PoolClient): Promise<Entity> {
     const query = `
       INSERT INTO entities (
         repo_path, stable_id, name, type, language, file_path, start_line, end_line,
@@ -70,7 +70,7 @@ export class EntityRepository {
       entity.lastSeenCommit
     ];
     
-    const result = await this.pool.query(query, values);
+    const result = await (client ?? this.pool).query(query, values);
     return this.mapRowToEntity(result.rows[0]);
   }
 
@@ -133,20 +133,22 @@ export class EntityRepository {
     return result.rows.map(this.mapRowToEntity);
   }
 
-  async updateEmbedding(stableId: string, embedding: number[]): Promise<void> {
-    const query = 'UPDATE entities SET embedding = $1 WHERE stable_id = $2';
-    await this.pool.query(query, [JSON.stringify(embedding), stableId]);
+  async updateEmbedding(stableId: string, embedding: number[], client?: PoolClient): Promise<void> {
+    const query = this.repoPath
+      ? 'UPDATE entities SET embedding = $1 WHERE stable_id = $2 AND repo_path = $3'
+      : 'UPDATE entities SET embedding = $1 WHERE stable_id = $2';
+    await (client ?? this.pool).query(query, this.repoPath ? [JSON.stringify(embedding), stableId, this.repoPath] : [JSON.stringify(embedding), stableId]);
   }
 
   async findSimilar(stableId: string, limit: number = 10, threshold: number = 0.5): Promise<Entity[]> {
     const query = this.repoPath
       ? `
-        SELECT e.*, 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) AS similarity
+        SELECT e.*, 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1 AND repo_path = $2)) AS similarity
         FROM entities e
         WHERE e.stable_id != $1
           AND e.repo_path = $2
           AND e.embedding IS NOT NULL
-          AND 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1)) > $3
+          AND 1 - (e.embedding <=> (SELECT embedding FROM entities WHERE stable_id = $1 AND repo_path = $2)) > $3
         ORDER BY similarity DESC
         LIMIT $4
       `
@@ -233,11 +235,11 @@ export class EntityRepository {
     await this.pool.query(query, this.repoPath ? [filePath, this.repoPath] : [filePath]);
   }
 
-  async deleteAll(): Promise<void> {
+  async deleteAll(client?: PoolClient): Promise<void> {
     const query = this.repoPath
       ? 'DELETE FROM entities WHERE repo_path = $1'
       : 'DELETE FROM entities';
-    await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
+    await (client ?? this.pool).query(query, this.repoPath ? [this.repoPath] : []);
   }
 
   private mapRowToEntity(row: any): Entity {

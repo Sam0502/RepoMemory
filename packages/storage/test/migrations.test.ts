@@ -44,12 +44,12 @@ describe('MigrationRunner', () => {
     const { pool, executed } = createMockPool([]);
     const runner = new MigrationRunner(pool as never, migrations);
     const applied = await runner.run();
-    expect(applied.map((m) => m.id)).toEqual([1, 2, 3, 4]);
-    expect(executed.map((m) => m.id)).toEqual([1, 2, 3, 4]);
+    expect(applied.map((m) => m.id)).toEqual([1, 2, 3, 4, 5]);
+    expect(executed.map((m) => m.id)).toEqual([1, 2, 3, 4, 5]);
   });
 
   it('skips already-applied migrations and is a no-op when fully migrated', async () => {
-    const { pool, executed } = createMockPool([1, 2, 3, 4]);
+    const { pool, executed } = createMockPool([1, 2, 3, 4, 5]);
     const runner = new MigrationRunner(pool as never, migrations);
     const applied = await runner.run();
     expect(applied).toEqual([]);
@@ -60,7 +60,7 @@ describe('MigrationRunner', () => {
     const { pool, executed } = createMockPool([1, 2]);
     const runner = new MigrationRunner(pool as never, migrations);
     const applied = await runner.run();
-    expect(applied.map((m) => m.id)).toEqual([3, 4]);
-    expect(executed.map((m) => m.id)).toEqual([3, 4]);
+    expect(applied.map((m) => m.id)).toEqual([3, 4, 5]);
+    expect(executed.map((m) => m.id)).toEqual([3, 4, 5]);
   });
 });

@@ -1,6 +1,7 @@
 import { Entity, Relationship, EntityType, RelationshipType, Language } from '@repo-memory/shared';
 import { createHash } from 'crypto';
 import { ExtractorContext, LanguageExtractor } from './interface.js';
+import { generateEntityStableId } from '../resolver/ids.js';
 
 export abstract class BaseExtractor implements LanguageExtractor {
   abstract language: Language;
@@ -21,7 +22,7 @@ export abstract class BaseExtractor implements LanguageExtractor {
   ): Entity | null {
     if (!name || name.length === 0) return null;
 
-    const stableId = this.generateStableId(ctx.filePath, name, ctx.repoPath);
+    const stableId = this.generateStableId(ctx.filePath, name, type, ctx.repoPath);
 
     return {
       id: stableId,
@@ -237,9 +238,8 @@ export abstract class BaseExtractor implements LanguageExtractor {
     };
   }
 
-  protected generateStableId(filePath: string, name: string, repoPath: string = ''): string {
-    const input = `${repoPath}:${filePath}:${name}`;
-    return createHash('md5').update(input).digest('hex');
+  protected generateStableId(filePath: string, name: string, type: EntityType, repoPath: string = ''): string {
+    return generateEntityStableId(repoPath, filePath, name, type);
   }
 
   protected truncateId(id: string, maxLength: number = 500): string {
@@ -342,7 +342,7 @@ export abstract class BaseExtractor implements LanguageExtractor {
   }
 
   protected getConfigName(filePath: string): string {
-    const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || filePath;
+    const fileName = filePath.split(/[\\/]/).pop() || filePath;
     return fileName.replace(/\.[^.]+$/, '');
   }
 

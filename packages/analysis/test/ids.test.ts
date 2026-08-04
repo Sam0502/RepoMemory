@@ -20,6 +20,12 @@ describe('generateEntityStableId', () => {
     const d = generateEntityStableId('/repo', 'src/a.ts', 'bar');
     expect(new Set([a, b, c, d]).size).toBe(4);
   });
+
+  it('disambiguates same-named entities of different types in one file', () => {
+    const iface = generateEntityStableId('/repo', 'src/a.ts', 'Foo', 'Interface');
+    const klass = generateEntityStableId('/repo', 'src/a.ts', 'Foo', 'Class');
+    expect(iface).not.toBe(klass);
+  });
 });
 
 describe('generateFileStableId', () => {

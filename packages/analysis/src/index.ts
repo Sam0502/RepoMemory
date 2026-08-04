@@ -1,11 +1,13 @@
-export { TreeSitterParser, getLanguageFromFilePath, shouldParseFile, isConfigFilePath, getGrammarKeyFromFilePath, PARSER_CONFIGS, registerLanguageExtractor } from './parser.js';
+export { TreeSitterParser, getLanguageFromFilePath, shouldParseFile, isConfigFilePath, getGrammarKeyFromFilePath, languageFromGrammarKey, PARSER_CONFIGS, registerLanguageExtractor } from './parser.js';
 export type { ParserConfig } from './parser.js';
 export { initTreeSitter, createParser, getGrammarBytes } from './tree-sitter-init.js';
 export {
   configureEmbeddings,
+  initializeEmbeddings,
   embed,
   embedBatch,
   generateEntityEmbedding,
+  generateEntityEmbeddings,
   getProviderName,
   getEmbeddingDimensions,
 } from './embeddings.js';

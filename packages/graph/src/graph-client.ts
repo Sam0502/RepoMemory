@@ -3,6 +3,21 @@ import { Entity, Relationship, EntityType, RelationshipType, Language, getLogger
 
 const logger = getLogger({ component: 'graph' });
 
+const MAX_TRAVERSAL_DEPTH = 6;
+
+function clampDepth(maxDepth: number): number {
+  if (!Number.isInteger(maxDepth) || maxDepth < 1) return 1;
+  return Math.min(maxDepth, MAX_TRAVERSAL_DEPTH);
+}
+
+function isRelationshipType(type: string): type is RelationshipType {
+  return (Object.values(RelationshipType) as string[]).includes(type);
+}
+
+function isEntityType(type: string): type is EntityType {
+  return (Object.values(EntityType) as string[]).includes(type);
+}
+
 export class GraphClient {
   private driver: Driver;
 
@@ -30,6 +45,7 @@ export class GraphClient {
       // Create indexes for entity types
       const entityTypes = Object.values(EntityType);
       for (const type of entityTypes) {
+        if (!isEntityType(type)) continue;
         await session.run(`
           CREATE INDEX IF NOT EXISTS FOR (e:${type}) ON (e.stableId)
         `);
@@ -38,6 +54,7 @@ export class GraphClient {
       // Create indexes for relationship types
       const relationshipTypes = Object.values(RelationshipType);
       for (const type of relationshipTypes) {
+        if (!isRelationshipType(type)) continue;
         await session.run(`
           CREATE INDEX IF NOT EXISTS FOR ()-[r:${type}]-() ON (r.filePath)
         `);
@@ -61,6 +78,9 @@ export class GraphClient {
   }
 
   async upsertEntity(entity: Entity, repoPath: string = ''): Promise<void> {
+    if (!isEntityType(entity.type)) {
+      throw new Error(`Refusing to upsert entity with unknown type: ${entity.type}`);
+    }
     const session = this.driver.session();
     try {
       const query = `
@@ -118,6 +138,9 @@ export class GraphClient {
   }
 
   async upsertRelationship(relationship: Relationship, repoPath: string = ''): Promise<void> {
+    if (!isRelationshipType(relationship.type)) {
+      throw new Error(`Refusing to upsert relationship with unknown type: ${relationship.type}`);
+    }
     const session = this.driver.session();
     try {
       const query = `
@@ -165,6 +188,9 @@ export class GraphClient {
   }
 
   async findEntitiesByType(type: EntityType, limit: number = 100, repoPath?: string): Promise<Entity[]> {
+    if (!isEntityType(type)) {
+      throw new Error(`Refusing to query entities with unknown type: ${type}`);
+    }
     const session = this.driver.session();
     try {
       const result = repoPath
@@ -202,55 +228,61 @@ export class GraphClient {
     }
   }
 
-  async findDependencies(stableId: string): Promise<{ entity: Entity; relationship: Relationship }[]> {
+  async findDependencies(stableId: string, repoPath?: string): Promise<{ entity: Entity; relationship: Relationship }[]> {
     const session = this.driver.session();
     try {
       const result = await session.run(
         `
         MATCH (source {stableId: $stableId})-[r:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES]->(target)
-        RETURN target as entity, r as relationship
+        WHERE ($repoPath IS NULL OR source.repoPath = $repoPath)
+        RETURN target as entity, r as relationship,
+               source.stableId AS sourceId, target.stableId AS targetId
         `,
-        { stableId }
+        { stableId, repoPath: repoPath ?? null }
       );
       
       return result.records.map(record => ({
         entity: this.mapRecordToEntity(record.get('entity')),
-        relationship: this.mapRecordToRelationship(record.get('relationship')),
+        relationship: this.mapRecordToRelationship(record.get('relationship'), record.get('sourceId'), record.get('targetId')),
       }));
     } finally {
       await session.close();
     }
   }
 
-  async findDependents(stableId: string): Promise<{ entity: Entity; relationship: Relationship }[]> {
+  async findDependents(stableId: string, repoPath?: string): Promise<{ entity: Entity; relationship: Relationship }[]> {
     const session = this.driver.session();
     try {
       const result = await session.run(
         `
         MATCH (source)-[r:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES]->(target {stableId: $stableId})
-        RETURN source as entity, r as relationship
+        WHERE ($repoPath IS NULL OR source.repoPath = $repoPath)
+        RETURN source as entity, r as relationship,
+               source.stableId AS sourceId, target.stableId AS targetId
         `,
-        { stableId }
+        { stableId, repoPath: repoPath ?? null }
       );
       
       return result.records.map(record => ({
         entity: this.mapRecordToEntity(record.get('entity')),
-        relationship: this.mapRecordToRelationship(record.get('relationship')),
+        relationship: this.mapRecordToRelationship(record.get('relationship'), record.get('sourceId'), record.get('targetId')),
       }));
     } finally {
       await session.close();
     }
   }
 
-  async findTransitiveDependencies(stableId: string, maxDepth: number = 5): Promise<Entity[]> {
+  async findTransitiveDependencies(stableId: string, maxDepth: number = 5, repoPath?: string): Promise<Entity[]> {
+    const depth = clampDepth(maxDepth);
     const session = this.driver.session();
     try {
       const result = await session.run(
         `
-        MATCH path = (source {stableId: $stableId})-[:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES*1..${maxDepth}]->(target)
+        MATCH path = (source {stableId: $stableId})-[:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES*1..${depth}]->(target)
+        WHERE ($repoPath IS NULL OR source.repoPath = $repoPath)
         RETURN DISTINCT target as entity
         `,
-        { stableId }
+        { stableId, repoPath: repoPath ?? null }
       );
       
       return result.records.map(record => this.mapRecordToEntity(record.get('entity')));
@@ -259,15 +291,17 @@ export class GraphClient {
     }
   }
 
-  async findTransitiveDependents(stableId: string, maxDepth: number = 5): Promise<Entity[]> {
+  async findTransitiveDependents(stableId: string, maxDepth: number = 5, repoPath?: string): Promise<Entity[]> {
+    const depth = clampDepth(maxDepth);
     const session = this.driver.session();
     try {
       const result = await session.run(
         `
-        MATCH path = (source)-[:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES*1..${maxDepth}]->(target {stableId: $stableId})
+        MATCH path = (source)-[:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES*1..${depth}]->(target {stableId: $stableId})
+        WHERE ($repoPath IS NULL OR source.repoPath = $repoPath)
         RETURN DISTINCT source as entity
         `,
-        { stableId }
+        { stableId, repoPath: repoPath ?? null }
       );
       
       return result.records.map(record => this.mapRecordToEntity(record.get('entity')));
@@ -281,11 +315,12 @@ export class GraphClient {
     targetId: string,
     maxDepth: number = 5
   ): Promise<{ nodes: Entity[]; relationships: Array<{ type: string; direction: 'out' | 'in' }> } | null> {
+    const depth = clampDepth(maxDepth);
     const session = this.driver.session();
     try {
       const result = await session.run(
         `
-        MATCH p = shortestPath((a {stableId: $sourceId})-[rels:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES|CONTAINS|EXPORTS*1..${maxDepth}]-(b {stableId: $targetId}))
+        MATCH p = shortestPath((a {stableId: $sourceId})-[rels:IMPORTS|DEPENDS_ON|CALLS|REFERENCES|HANDLES|CONTAINS|EXPORTS*1..${depth}]-(b {stableId: $targetId}))
         RETURN p
         `,
         { sourceId, targetId }
@@ -340,6 +375,9 @@ export class GraphClient {
   }
 
   async deleteRelationship(sourceId: string, targetId: string, type: string, filePath: string): Promise<void> {
+    if (!isRelationshipType(type)) {
+      throw new Error(`Refusing to delete relationship with unknown type: ${type}`);
+    }
     const session = this.driver.session();
     try {
       await session.run(
@@ -374,7 +412,7 @@ export class GraphClient {
     const session = this.driver.session();
     try {
       await session.run(
-        'MATCH (e) WHERE e.repoPath = $repoPath DETACH DELETE e',
+        'MATCH (e) WHERE coalesce(e.repoPath, "") = $repoPath DETACH DELETE e',
         { repoPath }
       );
     } finally {
@@ -507,12 +545,12 @@ export class GraphClient {
     };
   }
 
-  private mapRecordToRelationship(rel: any): Relationship {
+  private mapRecordToRelationship(rel: any, sourceId: string, targetId: string): Relationship {
     const properties = rel.properties;
     return {
       id: rel.identity.toString(),
-      sourceId: rel.start.toString(),
-      targetId: rel.end.toString(),
+      sourceId,
+      targetId,
       type: rel.type as RelationshipType,
       filePath: properties.filePath,
       line: properties.line,

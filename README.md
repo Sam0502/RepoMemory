@@ -15,6 +15,8 @@ RepoMemory parses your codebase, builds a knowledge graph of entities (classes, 
 - **Impact analysis** - see what's affected when a symbol changes
 - **Commit history** - browse recent commits and file changes
 - **Context packs** - token-budget context bundles for AI agents
+- **Task context packs** - build a focused, token-budgeted dossier from a natural-language task description (`POST /api/context-packs/task`)
+- **MCP server** - a Model Context Protocol (stdio) server exposing the whole memory as read-only tools for AI agents (`repo-memory mcp`)
 - **Similar entities** - semantic similarity search
 - **Cross-file symbol resolution** - bare-name calls/references resolved to real entities via a repo-wide symbol index
 - **Dead code detection** - reachability analysis over resolved edges
@@ -26,6 +28,8 @@ RepoMemory parses your codebase, builds a knowledge graph of entities (classes, 
 - **Reconciliation & repair jobs** - `verify`/`repair` dual-store (PostgreSQL vs Neo4j) consistency jobs via CLI and API, persisted to the `jobs` table
 - **Streaming analysis** - dead-code, boundaries, risk, and drift run over bounded paged windows (`ANALYSIS_BATCH_SIZE`) instead of loading whole repos, with a `pnpm bench` harness
 - **Live file watching** - `repo-memory watch` re-scans changed files on every edit (debounced) via the incremental path, with a live status indicator in the frontend
+- **Versioned schema migrations** - numbered, idempotent, advisory-locked migrations (`repo-memory db migrate`), including repo-scoped commit identity
+- **Optional API auth token** - set `REPO_MEMORY_API_TOKEN` to gate all API endpoints; the frontend bootstraps the token from a served `config.js`
 - **CLI and HTTP API** - query from command line or integrate with tools
 
 ## Prerequisites
@@ -78,10 +82,14 @@ RepoMemory/
 │   │   ├── domain.ts           # Domain/role inference + boundary config
 │   │   ├── boundaries.ts       # Architecture boundary validation
 │   │   ├── change.ts           # ChangeAnalyzer (churn, risk, drift)
+│   │   ├── streaming.ts        # Bounded-window streaming analysis
 │   │   └── embedding/          # Embedding providers
 │   ├── graph/                  # Neo4j client
 │   ├── storage/                # PostgreSQL client
-│   └── api/                    # Hono HTTP API + QA + context packs
+│   │   └── migrations/         # Versioned, idempotent schema migrations
+│   ├── services/               # Shared business logic (QA service, context packs) used by API + MCP
+│   ├── mcp/                    # Model Context Protocol server (stdio, read-only tools)
+│   └── api/                    # Hono HTTP API + context packs
 ├── app/                        # CLI + orchestrator
 └── web/                        # Frontend (HTML/CSS/JS)
 ```
@@ -106,6 +114,9 @@ node app/dist/cli.js serve --repo /path/to/repo --port 3000
 
 # Watch a repo live — re-scans changed files on every edit (debounced)
 node app/dist/cli.js watch --repo /path/to/repo --port 3000
+
+# Expose the memory as read-only MCP tools over stdio for AI agents
+node app/dist/cli.js mcp --repo /path/to/repo
 
 # Query entities
 node app/dist/cli.js query search "GraphClient"
@@ -164,6 +175,7 @@ node app/dist/cli.js jobs repair --repo /path/to/repo
 | GET | `/api/commits` | List recent commits |
 | GET | `/api/commits/:hash` | Get commit details + file changes |
 | GET | `/api/context-pack/:stableId` | Generate context pack for AI |
+| POST | `/api/context-packs/task` | Build a task context pack from a natural-language task (`{"task": "..."}`; optional `tokenBudget`, `maxFocal`, `repoPath`) |
 | GET | `/api/analysis/impact/:stableId` | Impact analysis |
 | GET | `/api/analysis/dead-code` | Dead code report (`?includeExported=true`, `?batchSize=`) |
 | GET | `/api/analysis/ownership` | Per-file dominant author report |
@@ -184,8 +196,9 @@ node app/dist/cli.js jobs repair --repo /path/to/repo
 | GET | `/api/workspace/entities/:stableId` | Cross-repo entity lookup by ID |
 | POST | `/api/workspace/qa/ask` | Cross-repo QA (answers name their repo) |
 | GET | `/metrics` | Prometheus metrics (disable with `METRICS_ENABLED=false`) |
+| GET | `/config.js` | Frontend bootstrap — injects `window.REPO_MEMORY_API_TOKEN` (always unauthenticated) |
 
-All non-workspace endpoints are scoped to the repository passed to `serve --repo`. Workspace endpoints always read across every scanned repository.
+All non-workspace endpoints are scoped to the repository passed to `serve --repo`. Workspace endpoints always read across every scanned repository. When `REPO_MEMORY_API_TOKEN` is set, all `/api/*` endpoints require `Authorization: Bearer <token>`; the web frontend picks the token up automatically via `config.js`.
 
 ## Docker Services
 
@@ -239,6 +252,10 @@ PINO_LOG_LEVEL=info
 
 # Expose the /metrics Prometheus endpoint (set to 'false' to disable)
 METRICS_ENABLED=true
+
+# Optional API auth token — when set, all /api/* endpoints require
+# Authorization: Bearer <token> (the frontend reads it from /config.js)
+REPO_MEMORY_API_TOKEN=
 ```
 
 ## Development
@@ -296,10 +313,15 @@ pnpm db:down
 - Hono HTTP server
 - Serves frontend static files
 - CORS enabled for local development
-- Context pack generation for AI agents
+- Context pack generation for AI agents (by stable ID and by task description)
 - Impact analysis with risk scoring
 - Natural-language QA service with intent classification and compound-question support
 - Workspace (cross-repo) endpoints alongside repo-scoped endpoints
+
+### MCP (Model Context Protocol) Layer
+- `packages/mcp` — read-only stdio server (`repo-memory mcp --repo <path>`)
+- 21 tools: entity lookup/search/similarity/dependencies/dependents/impact, context packs, task context packs, QA, analysis reports (dead code, boundaries, churn, risk, drift, ownership), commits, and cross-repo workspace queries
+- Reuses the same `packages/services` business logic as the HTTP API (QA + context packs)
 
 ### Frontend
 - Entity list with search, type filtering, and repo dropdown (multi-repo)
@@ -354,14 +376,21 @@ pnpm db:down
 - Workspace-wide cross-repo workflows (workspace API, CLI `--all-repos`, frontend repo dropdown)
 - Entity-change correlation (churn, risk, drift scoring)
 
-**Next (Phase 5: Hardening & Observability):**
-- ✅ Test foundation & quality gates (Vitest, ESLint, CI) — unit tests across 12 files, `pnpm lint`/`pnpm typecheck`/`pnpm test` green
-- ✅ Versioned schema migrations (replacing the monolithic `SCHEMA_SQL`; `schema_migrations` ledger + `repo-memory db migrate`)
-- ✅ Structured logging (`pino` + `Logger`), scan telemetry (`ScanReport` with per-phase timings), `/metrics` Prometheus endpoint, request logging + `X-Request-Id`
+**Phase 5 Complete** (v0.9.0–v0.13.0, M10–M16, hardening & observability):
+- ✅ Test foundation & quality gates (Vitest, ESLint, CI) — 136 tests across 20 files, `pnpm lint`/`pnpm typecheck`/`pnpm test` green
+- ✅ Versioned schema migrations (`schema_migrations` ledger + numbered/idempotent migrations, advisory-locked, `repo-memory db migrate`)
+- ✅ Structured logging (pino + `Logger`), scan telemetry (`ScanReport` with per-phase timings), `/metrics` Prometheus endpoint, request logging + `X-Request-Id`
 - ✅ Reconciliation & repair jobs over the dual PG/Neo4j store (`repo-memory jobs verify|repair`, `jobs` API)
 - ✅ Streaming analysis for repository scale (`ANALYSIS_BATCH_SIZE` paged dead-code/boundaries/risk/drift) + `pnpm bench` benchmark harness
 - ✅ Live file watching (`repo-memory watch`, `GET /api/status`, frontend live indicator)
-- Multi-language parsers (Go, Rust, Java)
+- ✅ Hardening pass 2: repo-scoped commit identity + transactional batched upserts, stable-ID type disambiguation, ONNX batch embeddings, persistent watch symbol index, atomic full-scan persistence, QA cache invalidation, CLI env config/exit codes/shutdown, frontend API token + relative URLs
+
+**Phase 5 Complete** (v0.14.0, M17, agent interface):
+- ✅ Shared `packages/services` extracted from the API (QA service + context pack builder), reused by the HTTP API and the MCP server
+- ✅ Task context packs: `ContextPackBuilder.buildTaskContext` turns a natural-language task into a token-budgeted dossier (direct/`search`/semantic resolution, one-hop graph expansion, per-file churn risk, boundary violations) — `POST /api/context-packs/task` and the MCP `task_context` tool
+- ✅ Model Context Protocol server (`packages/mcp`, `repo-memory mcp`): 21 read-only tools over stdio with `structuredContent`, built on the MCP SDK, wired with graceful shutdown
+
+**Next (Phase 5, deferred):**
 - Multi-language parsers (Go, Rust, Java)
 
 ## License

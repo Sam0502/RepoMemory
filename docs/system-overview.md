@@ -185,6 +185,33 @@ a **context pack** — a compact dossier containing the entity, its dependencies
 users, recent changes, and similar entities. This hands the assistant exactly what it
 needs without flooding it with the whole codebase.
 
+There are two kinds:
+
+- **By entity** — point at a specific piece of code and get its dossier.
+- **By task** — describe what you're trying to do in plain language ("add a paginated
+  endpoint for users"), and RepoMemory figures out which pieces of code matter and
+  assembles the dossier itself. It recognizes the relevant symbols directly or by
+  meaning, gathers their connections and change history, and trims everything to fit
+  a token budget so the answer stays focused.
+
+### 5.10 MCP: plugging RepoMemory into AI tools directly
+**MCP** (Model Context Protocol) is a standard way for AI assistants and coding tools
+to use external services. RepoMemory exposes an MCP **server** that any MCP-aware
+assistant can connect to. Through it, an assistant can call over twenty read-only
+"tools" — search for symbols, look up dependencies, run dead-code or risk reports,
+ask questions, pull context packs, and even ask across all projects at once.
+
+The key properties:
+
+- **Read-only** — the assistant can *look* but never *change* anything.
+- **Speaks the same language** — it uses the very same QA and context-pack engine as
+  the web page and the command line.
+- **Self-contained** — one command starts it, and it talks over standard input/output
+  (stdio), so it works with any MCP client on any machine.
+
+This means an AI assistant can browse your codebase's memory directly — no web page
+needed.
+
 ---
 
 ## 6. More than one project: the workspace
@@ -268,7 +295,14 @@ There are three doors into the system — all showing the same memory:
       └───────────────┘      └─────────────────┘      └─────────────────┘
       e.g. "show dead        a visual map you can     a standard web
       code"                  click and browse         interface other
-                                                     programs can call
+                                                      programs can call
+              ▲
+              │
+      ┌───────┴───────────────────┐
+      │  MCP server (AI tools)    │
+      │  standard "plug in" port  │
+      │  for AI assistants        │
+      └───────────────────────────┘
 ```
 
 - **The command line (CLI)** — for people comfortable with a terminal. Typing a
@@ -277,6 +311,9 @@ There are three doors into the system — all showing the same memory:
   history, analysis reports, and an "Ask" chat box.
 - **The HTTP API** — a standard web interface that other programs and AI assistants
   can call automatically. This is how RepoMemory plugs into developer tools.
+- **The MCP server** — an extra port made specially for AI assistants. An
+  MCP-aware tool (a coding assistant, for example) connects to it and gets a whole
+  toolbox of read-only commands to inspect the memory (see section 5.10).
 
 ---
 
@@ -293,6 +330,9 @@ practices so the memory is reliable:
   numbers for monitoring dashboards.
 - **Schema migrations** — as the system evolves, its databases change shape. Migrations
   are versioned and applied safely, like upgrades that never lose data.
+- **Access control** — the server can require a secret token (set via
+  `REPO_MEMORY_API_TOKEN`). When enabled, requests without the token are politely refused,
+  and the web page picks the token up automatically so people can keep browsing.
 - **Repair jobs** — as described in section 8, the two databases are kept consistent.
 
 ---
@@ -313,6 +353,7 @@ under the hood:
 | pino | A structured logger | A black box recorder |
 | Prometheus | A metrics collector | A dashboard of gauges |
 | chokidar | A file-change listener | The "ears" that hear edits |
+| MCP SDK | The standard "AI tool port" | A universal power outlet for assistants |
 
 ---
 
@@ -356,6 +397,11 @@ Let's walk through one realistic story to tie everything together.
 
 8. **Repair (safety net)**: once in a while, a Verify job confirms the two databases
    match; if anything is ever out of sync, a Repair job fixes it automatically.
+
+9. **AI assistant**: a coding assistant connects through the MCP server. It asks
+   *"what does app.ts depend on?"* through the `qa_ask` tool and asks for a
+   *task context pack* before editing — and RepoMemory hands back the exact dossier,
+   built from the very same engine that answered the developer at the command line.
 
 That's RepoMemory: a librarian, a map, a detective, and an assistant — all in one,
 built to keep a living memory of everything a software project does.

@@ -36,7 +36,8 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          # Must match the local toolchain (lockfile v6) — see packageManager.
+          version: 8
 
       - uses: actions/setup-node@v4
         with:
@@ -46,14 +47,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # NOTE: build runs before typecheck on purpose — per-package
+      # typecheck resolves workspace deps through dist/, which only exists
+      # after a build (fresh checkouts have none).
+      - name: Build
+        run: pnpm -r run build
+
       - name: Typecheck (8 projects)
         run: pnpm -r run typecheck
 
       - name: Lint
         run: pnpm lint
-
-      - name: Build
-        run: pnpm -r run build
 
       - name: Test (unit + PG integration)
         run: pnpm test

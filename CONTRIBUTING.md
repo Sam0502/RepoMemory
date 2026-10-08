@@ -52,10 +52,11 @@ pgvector instance, e.g. the compose service.
 
 ## Quality gate
 
-Every PR must pass the same gate CI runs:
+Every PR must pass the same gate CI runs (order matters — typecheck resolves
+workspace deps through `dist/`, so build comes first on fresh checkouts):
 
 ```bash
-pnpm typecheck && pnpm lint && pnpm build && pnpm test
+pnpm -r run build && pnpm -r run typecheck && pnpm lint && pnpm test
 ```
 
 Conventions:

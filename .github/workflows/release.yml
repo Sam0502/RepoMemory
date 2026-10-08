@@ -40,7 +40,8 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          # Must match the local toolchain (lockfile v6) — see packageManager.
+          version: 8
 
       - uses: actions/setup-node@v4
         with:
@@ -51,8 +52,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # NOTE: build first — typecheck resolves workspace deps via dist/.
       - name: Quality gate
-        run: pnpm -r run typecheck && pnpm lint && pnpm -r run build && pnpm test
+        run: pnpm -r run build && pnpm -r run typecheck && pnpm lint && pnpm test
 
       - name: Pack CLI bundle
         run: |

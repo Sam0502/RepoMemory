@@ -8,8 +8,17 @@ import type { McpServices } from '../src/services.js';
 // mock is enough to exercise listing + a single tool call end-to-end.
 const services = {
   repoPath: '/repo',
-  workspaceEntityRepo: { findByStableId: async () => null },
+  workspaceEntityRepo: {
+    findByStableId: async (stableId: string) =>
+      stableId === 'abc'
+        ? { stableId: 'abc', filePath: 'src/a.ts', startLine: 1, endLine: 3, repoPath: '/repo' }
+        : null,
+  },
   entityRepo: { search: async () => [] },
+  traversal: {
+    findMembers: async () => [],
+    countMembers: async () => 0,
+  },
 } as unknown as McpServices;
 
 async function withConnectedServer<T>(run: (client: Client) => Promise<T>): Promise<T> {
@@ -38,6 +47,8 @@ describe('MCP server', () => {
         'entity_dependencies',
         'entity_dependents',
         'entity_impact',
+        'entity_members',
+        'entity_source',
         'context_pack',
         'qa_ask',
         'task_context',
@@ -65,6 +76,31 @@ describe('MCP server', () => {
       expect(result.content).toHaveLength(1);
       expect(result.content[0]).toHaveProperty('text');
       expect(JSON.parse((result.content[0] as { text: string }).text)).toEqual({ entities: [], count: 0 });
+    });
+  });
+
+  it('lists members of a known entity', async () => {
+    await withConnectedServer(async (client) => {
+      const result = await client.callTool({ name: 'entity_members', arguments: { stableId: 'abc' } });
+      expect(JSON.parse((result.content[0] as { text: string }).text)).toEqual({
+        stableId: 'abc',
+        entities: [],
+        count: 0,
+        total: 0,
+      });
+    });
+  });
+
+  it('reports an error for unknown entities', async () => {
+    await withConnectedServer(async (client) => {
+      const members = await client.callTool({ name: 'entity_members', arguments: { stableId: 'nope' } });
+      expect(JSON.parse((members.content[0] as { text: string }).text)).toEqual({
+        error: 'Entity not found: nope',
+      });
+      const source = await client.callTool({ name: 'entity_source', arguments: { stableId: 'nope' } });
+      expect(JSON.parse((source.content[0] as { text: string }).text)).toEqual({
+        error: 'Entity not found: nope',
+      });
     });
   });
 });

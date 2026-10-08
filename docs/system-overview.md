@@ -110,12 +110,11 @@ find pieces with similar meanings even if their names are completely different.
 **Result: a meaning-fingerprint for each entity.**
 
 ### Stage 5 — Persist
-Everything is saved into two databases that complement each other:
-
-- **Neo4j** — a *graph database*. It stores the map: dots (entities) and lines
-  (relationships). Perfect for "who is connected to whom".
-- **PostgreSQL** — a *table database*. It stores the details: metadata, full text,
-  change history, and the meaning-fingerprints (using a feature called pgvector).
+Everything is saved into PostgreSQL — a *table database* that stores both the
+details (metadata, full text, change history, meaning-fingerprints via
+pgvector) and the map (entities + relationships). Graph questions like "who is
+connected to whom" run directly against those tables as recursive queries, so
+there is only one store to run and no second database to keep in sync.
 
 **Result: a complete, searchable memory of the project.**
 
@@ -197,8 +196,9 @@ There are two kinds:
 ### 5.10 MCP: plugging RepoMemory into AI tools directly
 **MCP** (Model Context Protocol) is a standard way for AI assistants and coding tools
 to use external services. RepoMemory exposes an MCP **server** that any MCP-aware
-assistant can connect to. Through it, an assistant can call over twenty read-only
-"tools" — search for symbols, look up dependencies, run dead-code or risk reports,
+assistant can connect to. Through it, an assistant can call 23 read-only
+"tools" — search for symbols, look up dependencies and dependents, list a
+class's members, pull exact source lines, run dead-code or risk reports,
 ask questions, pull context packs, and even ask across all projects at once.
 
 The key properties:
@@ -248,18 +248,18 @@ last synced.
 
 ---
 
-## 8. Staying healthy: keeping the two databases in agreement
+## 8. Staying healthy: integrity checks
 
-Because RepoMemory uses **two** databases (the graph map and the table store), they
-could theoretically drift apart — a piece might be in one but not the other. To keep
-them in perfect agreement, RepoMemory has two special maintenance jobs:
+Even with a single database, it is worth checking the memory periodically — a
+relationship might point at an entity that no longer exists, or some entities
+might be missing their meaning-fingerprints. RepoMemory has two special
+maintenance jobs:
 
-- **Verify** — performs a full comparison of both databases and produces a report:
-  what's missing where, what's duplicated, what's orphaned. It answers "are they
-  consistent?"
-- **Repair** — automatically fixes any differences found: re-adds what's missing,
-  deletes what's orphaned, and re-generates any missing meaning-fingerprints. Then it
-  runs Verify again to prove everything is clean.
+- **Verify** — inspects the database and produces a report: per-type counts,
+  duplicate IDs, dangling edges, and entities without embeddings. It answers
+  "is the memory healthy?"
+- **Repair** — re-generates any missing meaning-fingerprints, then runs Verify
+  again to prove everything is clean.
 
 This is the equivalent of a librarian periodically checking the card catalog against
 the actual books on the shelves.
@@ -285,7 +285,7 @@ There are three doors into the system — all showing the same memory:
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                        RepoMemory memory                        │
-│        (the two databases: graph map + table store)             │
+│        (PostgreSQL: table store + connection map)             │
 └──────────────────────────────────────────────────────────────────┘
               ▲                        ▲                        ▲
               │                        │                        │
@@ -322,7 +322,7 @@ There are three doors into the system — all showing the same memory:
 Even though it's invisible from the outside, RepoMemory follows careful engineering
 practices so the memory is reliable:
 
-- **Tests** — hundreds of automated checks (a "safety net") that run on every change,
+- **Tests** — 170+ automated checks (a "safety net") that run on every change,
   verifying each part behaves correctly.
 - **Logging** — every important action writes a structured, timestamped record, so
   when something goes wrong you can trace exactly what happened.
@@ -333,7 +333,7 @@ practices so the memory is reliable:
 - **Access control** — the server can require a secret token (set via
   `REPO_MEMORY_API_TOKEN`). When enabled, requests without the token are politely refused,
   and the web page picks the token up automatically so people can keep browsing.
-- **Repair jobs** — as described in section 8, the two databases are kept consistent.
+- **Repair jobs** — as described in section 8, the memory is kept healthy.
 
 ---
 
@@ -346,11 +346,10 @@ under the hood:
 |-----------|--------------|------------------|
 | Tree-sitter | A grammar-based code reader per language | A grammarian who can diagram any sentence |
 | Symbol index | A project-wide "phone book" of names | The phone book that resolves who's who |
-| Neo4j | A graph database for the map | A subway map of connections |
-| PostgreSQL + pgvector | A table database with meaning-fingerprints | The encyclopedia with a "similarity" index |
+| PostgreSQL + pgvector | A table database with meaning-fingerprints — and the connection map, queried recursively | The encyclopedia with a "similarity" index |
 | Embeddings | Meaning-fingerprints for pieces of code | Song recognition fingerprints |
 | Hono | A lightweight web server | The front desk that answers all requests |
-| pino | A structured logger | A black box recorder |
+| logger | A dependency-free structured logger (JSON lines) | A black box recorder |
 | Prometheus | A metrics collector | A dashboard of gauges |
 | chokidar | A file-change listener | The "ears" that hear edits |
 | MCP SDK | The standard "AI tool port" | A universal power outlet for assistants |
@@ -395,8 +394,8 @@ Let's walk through one realistic story to tie everything together.
 7. **QA**: the developer asks *"what does app.ts depend on?"* and gets a clear answer
    with evidence, naming `math.ts` and `addNumbers`.
 
-8. **Repair (safety net)**: once in a while, a Verify job confirms the two databases
-   match; if anything is ever out of sync, a Repair job fixes it automatically.
+8. **Verify (safety net)**: once in a while, a Verify job confirms the memory is
+   healthy — no dangling edges, no duplicate IDs, no missing embeddings.
 
 9. **AI assistant**: a coding assistant connects through the MCP server. It asks
    *"what does app.ts depend on?"* through the `qa_ask` tool and asks for a

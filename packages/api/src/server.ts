@@ -3,17 +3,16 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { serve } from '@hono/node-server';
 import type { ServerType } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
-import { GraphClient } from '@repo-memory/graph';
-import { EntityRepository, RelationshipRepository, CommitRepository, JobRepository } from '@repo-memory/storage';
-import { parseDomainConfig, ChangeAnalyzer, streamDeadCode, streamBoundaries, resolveBatchSize } from '@repo-memory/analysis';
+import { EntityRepository, RelationshipRepository, CommitRepository, JobRepository, TraversalService, listWorkspaceRepos } from '@repo-memory/storage';
+import { parseDomainConfig, streamDeadCode, streamBoundaries, resolveBatchSize } from '@repo-memory/analysis';
 import type { DomainConfig, EmbeddingProvider } from '@repo-memory/analysis';
-import { Entity, EntityType, Relationship, RelationshipType, JobType, getLogger, metrics, registerDefaultMetrics } from '@repo-memory/shared';
+import { EntityType, RelationshipType, JobType, getLogger, metrics, registerDefaultMetrics } from '@repo-memory/shared';
 import type { Logger, Job, RepoStatus } from '@repo-memory/shared';
-import { Pool } from 'pg';
+import type { Pool } from 'pg';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
-import { ContextPackBuilder, QaService } from '@repo-memory/services';
+import { ContextPackBuilder, QaService, makeChangeAnalyzer, readEntitySource, MAX_SOURCE_LINES } from '@repo-memory/services';
 
 class HttpError extends Error {
   constructor(public readonly status: number, message: string) {
@@ -70,7 +69,7 @@ export interface ApiConfig {
   port: number;
   host: string;
   repoPath: string;
-  graphClient: GraphClient;
+  traversal: TraversalService;
   pgPool: Pool;
   logger?: Logger;
   // Optional embedding provider for semantic task-pack seeding. When absent,
@@ -86,89 +85,31 @@ export interface ApiConfig {
 
 export function createApp(config: ApiConfig, webDir?: string): Hono {
   const app = new Hono();
-  const graphClient = config.graphClient;
+  const traversal = config.traversal;
   const log = config.logger || getLogger({ component: 'api', repoPath: config.repoPath });
   registerDefaultMetrics();
   const entityRepo = new EntityRepository(config.pgPool, config.repoPath);
   const relationshipRepo = new RelationshipRepository(config.pgPool, config.repoPath);
   const commitRepo = new CommitRepository(config.pgPool, config.repoPath);
   const jobRepo = new JobRepository(config.pgPool);
-  const qaService = new QaService(entityRepo, relationshipRepo, commitRepo, config.graphClient, config.pgPool, false, config.repoPath);
+  const qaService = new QaService(entityRepo, relationshipRepo, commitRepo, config.traversal, config.pgPool, false, config.repoPath);
 
   // Unfiltered repositories for workspace-wide (cross-repo) queries.
   // Entity stable IDs are namespaced by repo path, so cross-repo lookups are safe.
   const workspaceEntityRepo = new EntityRepository(config.pgPool, '');
   const workspaceRelationshipRepo = new RelationshipRepository(config.pgPool, '');
   const workspaceCommitRepo = new CommitRepository(config.pgPool, '');
-  const workspaceContextBuilder = new ContextPackBuilder(workspaceEntityRepo, workspaceCommitRepo, config.graphClient);
-  const workspaceQa = new QaService(workspaceEntityRepo, workspaceRelationshipRepo, workspaceCommitRepo, config.graphClient, config.pgPool, true, '');
+  const workspaceContextBuilder = new ContextPackBuilder(workspaceEntityRepo, workspaceCommitRepo, config.traversal);
+  const workspaceQa = new QaService(workspaceEntityRepo, workspaceRelationshipRepo, workspaceCommitRepo, config.traversal, config.pgPool, true, '');
 
   // Resolve a repo filter value ("all" / empty = every repo) to a scoped repo instance.
   const repoFor = (repoPath: string | undefined): EntityRepository =>
     repoPath && repoPath !== 'all' ? new EntityRepository(config.pgPool, repoPath) : workspaceEntityRepo;
 
   // --- Change analysis (churn / risk / drift) ------------------------------
-  // Paged access so the streaming analysis paths keep only one window of each
-  // store in memory regardless of repo size.
-  const changeAnalyzerFor = (_repoPath: string): ChangeAnalyzer =>
-    new ChangeAnalyzer({
-      fileChurnRows: (p, days) => new CommitRepository(config.pgPool, p).getFileChurn(p, 100000, days),
-      entityPage: (p, offset, limit) => new EntityRepository(config.pgPool, p).findAll(limit, offset),
-      relationshipPage: (p, offset, limit) =>
-        new RelationshipRepository(config.pgPool, p).findByTypesPaged(
-          [
-            RelationshipType.CALLS,
-            RelationshipType.REFERENCES,
-            RelationshipType.IMPORTS,
-            RelationshipType.EXTENDS,
-            RelationshipType.IMPLEMENTS,
-            RelationshipType.HANDLES,
-          ],
-          limit,
-          offset
-        ),
-      entityByStableId: (p, stableId) => new EntityRepository(config.pgPool, p).findByStableId(stableId),
-      entities: async (repoPath) => {
-        const repo = new EntityRepository(config.pgPool, repoPath);
-        const entities: Entity[] = [];
-        const limit = resolveBatchSize();
-        let offset = 0;
-        while (true) {
-          const batch = await repo.findAll(limit, offset);
-          entities.push(...batch);
-          if (batch.length < limit) break;
-          offset += limit;
-        }
-        return entities;
-      },
-      relationships: async (repoPath) => {
-        const repo = new RelationshipRepository(config.pgPool, repoPath);
-        const rels: Relationship[] = [];
-        const limit = resolveBatchSize();
-        let offset = 0;
-        while (true) {
-          const batch = await repo.findByTypesPaged(
-            [
-              RelationshipType.CALLS,
-              RelationshipType.REFERENCES,
-              RelationshipType.IMPORTS,
-              RelationshipType.EXTENDS,
-              RelationshipType.IMPLEMENTS,
-              RelationshipType.HANDLES,
-            ],
-            limit,
-            offset
-          );
-          rels.push(...batch);
-          if (batch.length < limit) break;
-          offset += limit;
-        }
-        return rels;
-      },
-      lastCommitDate: (p) => new CommitRepository(config.pgPool, p).getLastCommitDate(p),
-    });
-
-  const changeAnalyzer = changeAnalyzerFor(config.repoPath);
+  // One shared analyzer; its providers are lazy per repo path, so scoped and
+  // cross-repo questions alike read the right store.
+  const changeAnalyzer = makeChangeAnalyzer(config.pgPool);
 
   // Request logging + metrics: capture method/path/status/duration and correlate
   // logs via X-Request-Id. Runs first so it also measures CORS + static serving.
@@ -181,17 +122,27 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
 
     const start = performance.now();
     let status = 500;
-    try {
-      await next();
-      status = c.res.status || 404;
-    } finally {
-      const durationMs = performance.now() - start;
-
+    let counted = false;
+    const countOnce = (s: number) => {
+      if (counted) return;
+      counted = true;
       metrics.inc('repo_memory_api_requests_total', {
         method: c.req.method,
         path: metricPath(c.req.path),
-        status: String(status),
+        status: String(s),
       });
+    };
+    try {
+      await next();
+      status = c.res.status || 404;
+      countOnce(status);
+    } catch (err) {
+      status = err instanceof HttpError ? err.status : 500;
+      countOnce(status);
+      throw err;
+    } finally {
+      const durationMs = performance.now() - start;
+
       metrics.observe('repo_memory_api_request_duration_seconds', durationMs / 1000);
 
       const fields = { requestId, method: c.req.method, path: c.req.path, status, durationMs };
@@ -230,10 +181,22 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   // Bootstrap config for the frontend: exposes the API token (when set) so the
   // same-origin page can authenticate its own /api/* requests. Served outside
   // /api/* because the page needs it before it can authenticate anything.
+  // Loopback-only: off-host callers receive an empty token so a LAN peer can't
+  // steal the bearer. Set ALLOW_TOKEN_BOOTSTRAP=false to disable entirely.
   app.get('/config.js', (c) => {
-    const token = process.env.REPO_MEMORY_API_TOKEN || '';
+    const allowBootstrap = (process.env.ALLOW_TOKEN_BOOTSTRAP ?? 'true') !== 'false';
+    const host = (c.req.header('host') || '').toLowerCase();
+    const hostname = host.split(':')[0];
+    const isLoopback =
+      hostname === '' ||
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '::1' ||
+      hostname === '[::1]';
+    const token = allowBootstrap && isLoopback ? process.env.REPO_MEMORY_API_TOKEN || '' : '';
     return c.text(`window.REPO_MEMORY_API_TOKEN = ${JSON.stringify(token)};\n`, 200, {
       'Content-Type': 'text/javascript; charset=utf-8',
+      'Cache-Control': 'no-store',
     });
   });
 
@@ -255,9 +218,14 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     return c.json(status);
   });
 
-  // Prometheus metrics (disable with METRICS_ENABLED=false)
+  // Prometheus metrics (disable with METRICS_ENABLED=false). When API auth is
+  // enabled, require the bearer token like /api/* so counts aren't leaked.
   if ((process.env.METRICS_ENABLED ?? 'true') !== 'false') {
     app.get('/metrics', (c) => {
+      const apiToken = process.env.REPO_MEMORY_API_TOKEN;
+      if (apiToken && c.req.header('authorization') !== `Bearer ${apiToken}`) {
+        return c.json({ error: 'Unauthorized' }, 401);
+      }
       registerDefaultMetrics();
       return c.text(metrics.render(), 200, {
         'Content-Type': 'text/plain; version=0.0.4; charset=utf-8',
@@ -291,10 +259,18 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
 
   app.get('/api/entities/type/:type', async (c) => {
     const type = requireEntityType(c.req.param('type'));
-    const entities = await entityRepo.findByType(type);
+    const limit = intParam(c.req.query('limit'), 100, { min: 1, max: 1000 });
+    const entities = await entityRepo.findByType(type, limit);
     return c.json({ entities });
   });
 
+  app.get('/api/entities/file/*', async (c) => {
+    const filePath = c.req.param('*') || c.req.param('filePath') || '';
+    const entities = await entityRepo.findByFilePath(filePath);
+    return c.json({ entities });
+  });
+
+  // Legacy single-segment alias (nested paths should use /api/entities/file/*).
   app.get('/api/entities/file/:filePath', async (c) => {
     const filePath = c.req.param('filePath');
     const entities = await entityRepo.findByFilePath(filePath);
@@ -306,19 +282,20 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     const sourceId = c.req.query('sourceId');
     const targetId = c.req.query('targetId');
     const type = c.req.query('type');
+    const limit = intParam(c.req.query('limit'), 100, { min: 1, max: 1000 });
 
     if (sourceId) {
-      const relationships = await relationshipRepo.findBySourceId(sourceId);
+      const relationships = (await relationshipRepo.findBySourceId(sourceId)).slice(0, limit);
       return c.json({ relationships });
     }
 
     if (targetId) {
-      const relationships = await relationshipRepo.findByTargetId(targetId);
+      const relationships = (await relationshipRepo.findByTargetId(targetId)).slice(0, limit);
       return c.json({ relationships });
     }
 
     if (type) {
-      const relationships = await relationshipRepo.findByType(requireRelationshipType(type));
+      const relationships = await relationshipRepo.findByType(requireRelationshipType(type), limit);
       return c.json({ relationships });
     }
 
@@ -335,16 +312,14 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
       return c.json({ error: 'Entity not found' }, 404);
     }
 
-    // Get all entities in the same file (file-level dependencies)
-    const sameFileEntities = await workspaceEntityRepo.findByFilePath(entity.filePath);
-    const dependencies = sameFileEntities
-      .filter(e => e.stableId !== stableId)
-      .slice(0, 20);
-
-    // Entities that depend on this one (inbound edges), scoped to its repo.
-    const dependents = (await graphClient.findDependents(stableId, entity.repoPath || config.repoPath))
-      .map(d => d.entity)
-      .slice(0, 20);
+    const scope = entity.repoPath || config.repoPath;
+    // Real 1-hop graph neighbourhood (not same-file heuristic).
+    const [depRows, dependentRows] = await Promise.all([
+      traversal.findDependencies(stableId, scope),
+      traversal.findDependents(stableId, scope),
+    ]);
+    const dependencies = depRows.map(d => d.entity).slice(0, 20);
+    const dependents = dependentRows.map(d => d.entity).slice(0, 20);
 
     return c.json({
       entity,
@@ -356,21 +331,58 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
 
   app.get('/api/graph/dependencies/:stableId', async (c) => {
     const stableId = c.req.param('stableId');
-    const dependencies = await graphClient.findDependencies(stableId, config.repoPath);
-    return c.json({ dependencies: dependencies.map(d => d.entity) });
+    const limit = intParam(c.req.query('limit'), 50, { min: 1, max: 500 });
+    const [rows, total] = await Promise.all([
+      traversal.findDependencies(stableId, config.repoPath, limit),
+      traversal.countDependencies(stableId, config.repoPath),
+    ]);
+    return c.json({ dependencies: rows.map(d => d.entity), count: rows.length, total });
   });
 
   app.get('/api/graph/dependents/:stableId', async (c) => {
     const stableId = c.req.param('stableId');
-    const dependents = await graphClient.findDependents(stableId, config.repoPath);
-    return c.json({ dependents: dependents.map(d => d.entity) });
+    const limit = intParam(c.req.query('limit'), 50, { min: 1, max: 500 });
+    const [rows, total] = await Promise.all([
+      traversal.findDependents(stableId, config.repoPath, limit),
+      traversal.countDependents(stableId, config.repoPath),
+    ]);
+    return c.json({ dependents: rows.map(d => d.entity), count: rows.length, total });
   });
 
   app.get('/api/graph/transitive/:stableId', async (c) => {
     const stableId = c.req.param('stableId');
     const maxDepth = intParam(c.req.query('maxDepth'), 5, { min: 1, max: 6 });
-    const entities = await graphClient.findTransitiveDependencies(stableId, maxDepth, config.repoPath);
+    const entities = await traversal.findTransitiveDependencies(stableId, maxDepth, config.repoPath);
     return c.json({ entities });
+  });
+
+  app.get('/api/entities/:stableId/members', async (c) => {
+    const stableId = c.req.param('stableId');
+    const limit = intParam(c.req.query('limit'), 100, { min: 1, max: 500 });
+    const entity = await workspaceEntityRepo.findByStableId(stableId);
+    if (!entity) {
+      return c.json({ error: 'Entity not found' }, 404);
+    }
+    const scope = entity.repoPath || config.repoPath;
+    const [rows, total] = await Promise.all([
+      traversal.findMembers(stableId, scope, limit),
+      traversal.countMembers(stableId, scope),
+    ]);
+    return c.json({ entity, members: rows.map(d => d.entity), count: rows.length, total });
+  });
+
+  app.get('/api/entities/:stableId/source', async (c) => {
+    const stableId = c.req.param('stableId');
+    const maxLines = intParam(c.req.query('maxLines'), MAX_SOURCE_LINES, { min: 1, max: 10000 });
+    const entity = (await entityRepo.findByStableId(stableId)) || (await workspaceEntityRepo.findByStableId(stableId));
+    if (!entity) {
+      return c.json({ error: 'Entity not found' }, 404);
+    }
+    const source = await readEntitySource(entity.repoPath || config.repoPath, entity, maxLines);
+    if (!source) {
+      return c.json({ error: 'Source not available for this entity' }, 404);
+    }
+    return c.json(source);
   });
 
   // Similar entities endpoint (semantic search)
@@ -397,11 +409,13 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
 
   app.get('/api/commits/:hash', async (c) => {
     const hash = c.req.param('hash');
-    const commit = await workspaceCommitRepo.findByHash(hash);
+    // Prefer the served repo on hash collisions across repos.
+    const commit = (await commitRepo.findByHash(hash)) || (await workspaceCommitRepo.findByHash(hash));
     if (!commit) {
       return c.json({ error: 'Commit not found' }, 404);
     }
-    const fileChanges = await workspaceCommitRepo.getFileChanges(hash);
+    const scopedFileRepo = new CommitRepository(config.pgPool, commit.repoPath || config.repoPath);
+    const fileChanges = await scopedFileRepo.getFileChanges(hash);
     return c.json({ commit, fileChanges });
   });
 
@@ -536,15 +550,20 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
         }
       }
     }
-    
-    return c.json({ files, links });
+
+    const truncated = filesResult.rowCount === 1000;
+    return c.json({ files, links, truncated });
   });
 
-  // Context pack endpoint
+  // Context pack endpoint (scoped to the served repo first to avoid cross-repo leaks)
   app.get('/api/context-pack/:stableId', async (c) => {
     const stableId = c.req.param('stableId');
     const tokenBudget = intParam(c.req.query('tokenBudget'), 4000, { min: 100, max: 1_000_000 });
-    const pack = await workspaceContextBuilder.build(stableId, tokenBudget);
+    const scopedEntity = await entityRepo.findByStableId(stableId);
+    const builder = scopedEntity
+      ? new ContextPackBuilder(entityRepo, commitRepo, config.traversal)
+      : workspaceContextBuilder;
+    const pack = await builder.build(stableId, tokenBudget);
     if (!pack) {
       return c.json({ error: 'Entity not found' }, 404);
     }
@@ -575,10 +594,10 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     const builder = new ContextPackBuilder(
       new EntityRepository(config.pgPool, scope),
       new CommitRepository(config.pgPool, scope),
-      config.graphClient,
+      config.traversal,
       {
         embedder: config.embedder,
-        changeAnalyzer: changeAnalyzerFor(scope),
+        changeAnalyzer,
         relationshipRepo: new RelationshipRepository(config.pgPool, scope),
         repoPath: scope,
       }
@@ -594,20 +613,7 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   // Impact analysis
   app.get('/api/analysis/impact/:stableId', async (c) => {
     const stableId = c.req.param('stableId');
-    
-    const directImpact = await graphClient.findDependents(stableId, config.repoPath);
-    const indirectImpact = await graphClient.findTransitiveDependents(stableId, 3, config.repoPath);
-    
-    const affectedFiles = new Set<string>();
-    directImpact.forEach(d => affectedFiles.add(d.entity.filePath));
-    indirectImpact.forEach(e => affectedFiles.add(e.filePath));
-
-    return c.json({
-      directImpact: directImpact.map(d => d.entity),
-      indirectImpact,
-      affectedFiles: Array.from(affectedFiles),
-      riskScore: Math.min(1.0, directImpact.length * 0.1 + indirectImpact.length * 0.05),
-    });
+    return c.json(await qaService.computeImpact(stableId));
   });
 
   // Dead code detection (streamed in windows; ?batchSize= tunes page size)
@@ -620,7 +626,7 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
       {
         page: (offset, limit) =>
           relationshipRepo.findByTypesPaged(
-            [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS],
+            [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS, RelationshipType.HANDLES],
             limit,
             offset
           ),
@@ -633,29 +639,8 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   // Ownership analysis (dominant author per file from commit history)
   app.get('/api/analysis/ownership', async (c) => {
     const limit = intParam(c.req.query('limit'), 500, { min: 1, max: 10000 });
-    const result = await config.pgPool.query(
-      `SELECT file_path,
-              (ARRAY_AGG(author ORDER BY cnt DESC))[1] AS owner,
-              MAX(cnt) AS commits
-       FROM (
-         SELECT f.file_path, c.author, COUNT(*) AS cnt
-         FROM file_changes f
-         JOIN commits c ON c.hash = f.commit_hash
-         WHERE c.repo_path = $1
-         GROUP BY f.file_path, c.author
-       ) sub
-       GROUP BY file_path
-       ORDER BY file_path
-       LIMIT $2`,
-      [config.repoPath, limit]
-    );
-    return c.json({
-      ownership: result.rows.map(row => ({
-        filePath: row.file_path,
-        owner: row.owner,
-        commits: parseInt(row.commits),
-      })),
-    });
+    const ownership = await commitRepo.getOwnership(config.repoPath, limit);
+    return c.json({ ownership });
   });
 
   // Architecture boundary validation (streamed in windows; ?batchSize= tunes page size)
@@ -705,7 +690,7 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     if (!entity) {
       return c.json({ error: 'Entity not found' }, 404);
     }
-    const info = await changeAnalyzerFor(entity.repoPath || config.repoPath).computeEntityChange(entity.repoPath || config.repoPath, stableId);
+    const info = await changeAnalyzer.computeEntityChange(entity.repoPath || config.repoPath, stableId);
     return c.json({ entity: info });
   });
 
@@ -772,26 +757,14 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
   // --- Workspace (cross-repo) endpoints -------------------------------------
 
   app.get('/api/workspace/repos', async (c) => {
-    const result = await config.pgPool.query(
-      `SELECT e.repo_path AS repo_path,
-              COUNT(e.id)::int AS entity_count,
-              (SELECT COUNT(*)::int FROM commits c WHERE c.repo_path = e.repo_path) AS commit_count
-       FROM entities e
-       WHERE e.repo_path <> ''
-       GROUP BY e.repo_path
-       ORDER BY e.repo_path`
-    );
-    const state = await config.pgPool.query(
-      'SELECT repo_path, last_commit_hash, last_scan_at FROM repo_state'
-    );
-    const stateByPath = new Map(state.rows.map(r => [r.repo_path, r]));
+    const repos = await listWorkspaceRepos(config.pgPool);
     return c.json({
-      repos: result.rows.map(row => ({
-        repoPath: row.repo_path,
-        entityCount: parseInt(row.entity_count),
-        commitCount: parseInt(row.commit_count),
-        lastCommitHash: stateByPath.get(row.repo_path)?.last_commit_hash || null,
-        lastScanAt: stateByPath.get(row.repo_path)?.last_scan_at || null,
+      repos: repos.map(row => ({
+        repoPath: row.repoPath,
+        entityCount: row.entityCount,
+        commitCount: row.commitCount,
+        lastCommitHash: row.lastCommitHash,
+        lastScanAt: row.lastScanAt,
       })),
     });
   });
@@ -837,14 +810,15 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
           new EntityRepository(config.pgPool, body.repoPath),
           new RelationshipRepository(config.pgPool, body.repoPath),
           new CommitRepository(config.pgPool, body.repoPath),
-          config.graphClient, config.pgPool, false, body.repoPath
+          config.traversal, config.pgPool, false, body.repoPath
         )
       : workspaceQa;
     const answer = await qa.ask(question);
     return c.json(answer);
   });
 
-  // Central error handler: structured JSON (no stack), metrics + log for 5xx.
+  // Central error handler: structured JSON (no stack). Metrics are counted once
+  // in the request middleware (which rethrows after counting), so don't count here.
   app.onError((err, c) => {
     const status = err instanceof HttpError ? err.status : 500;
     const message = err instanceof HttpError ? err.message : 'Internal Server Error';
@@ -853,11 +827,6 @@ export function createApp(config: ApiConfig, webDir?: string): Hono {
     } else {
       log.debug({ err, path: c.req.path }, 'request rejected');
     }
-    metrics.inc('repo_memory_api_requests_total', {
-      method: c.req.method,
-      path: metricPath(c.req.path),
-      status: String(status),
-    });
     return c.json({ error: message }, status as ContentfulStatusCode);
   });
 

@@ -1,19 +1,36 @@
-import simpleGit, { SimpleGit } from 'simple-git';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { FileChange, Commit, getLogger } from '@repo-memory/shared';
+
+const execFileAsync = promisify(execFile);
 
 const logger = getLogger({ component: 'ingestion' });
 
-export class GitOperations {
-  private git: SimpleGit;
+// Commits newer than `since` (exclusive): `since..HEAD`.
+const LOG_ENTRY_FORMAT = '%H%x00%an%x00%aI%x00%s';
 
-  constructor(private repoPath: string) {
-    this.git = simpleGit(repoPath);
+interface LogEntry {
+  hash: string;
+  author: string;
+  date: Date;
+  subject: string;
+}
+
+export class GitOperations {
+  constructor(private repoPath: string) {}
+
+  private async git(args: string[]): Promise<string> {
+    const { stdout } = await execFileAsync('git', args, {
+      cwd: this.repoPath,
+      maxBuffer: 256 * 1024 * 1024,
+    });
+    return stdout;
   }
 
   async isRepository(): Promise<boolean> {
     try {
-      await this.git.status();
-      return true;
+      const output = await this.git(['rev-parse', '--is-inside-work-tree']);
+      return output.trim() === 'true';
     } catch {
       return false;
     }
@@ -21,17 +38,17 @@ export class GitOperations {
 
   async getLatestCommit(): Promise<Commit | null> {
     try {
-      const log = await this.git.log({ maxCount: 1 });
-      if (log.latest) {
-        return {
-          hash: log.latest.hash,
-          message: log.latest.message,
-          author: log.latest.author_name,
-          date: new Date(log.latest.date),
-          filesChanged: [],
-        };
-      }
-      return null;
+      const output = await this.git(['log', '-1', `--pretty=format:${LOG_ENTRY_FORMAT}`]);
+      const entries = parseLogEntries(output);
+      if (entries.length === 0) return null;
+      const latest = entries[0];
+      return {
+        hash: latest.hash,
+        message: latest.subject,
+        author: latest.author,
+        date: latest.date,
+        filesChanged: [],
+      };
     } catch (error) {
       logger.error({ err: error }, 'git: getLatestCommit failed');
       throw error;
@@ -40,12 +57,12 @@ export class GitOperations {
 
   async getCommitsSince(since: string): Promise<Commit[]> {
     try {
-      const log = await this.git.log({ from: since });
-      return log.all.map(entry => ({
+      const output = await this.git(['log', `${since}..HEAD`, `--pretty=format:${LOG_ENTRY_FORMAT}`]);
+      return parseLogEntries(output).map((entry) => ({
         hash: entry.hash,
-        message: entry.message,
-        author: entry.author_name,
-        date: new Date(entry.date),
+        message: entry.subject,
+        author: entry.author,
+        date: entry.date,
         filesChanged: [],
       }));
     } catch (error) {
@@ -59,7 +76,7 @@ export class GitOperations {
   async getRecentCommitsWithChanges(limit: number = 100): Promise<Array<Commit & { fileChanges: FileChange[] }>> {
     try {
       const format = '%x00%H%x00%an%x00%aI%x00%s';
-      const output = await this.git.raw(['log', `--max-count=${limit}`, '--numstat', '--summary', `--pretty=format:${format}`]);
+      const output = await this.git(['log', `--max-count=${limit}`, '--numstat', '--summary', `--pretty=format:${format}`]);
       const parts = output.split('\0');
       const commits: Array<Commit & { fileChanges: FileChange[] }> = [];
       for (let i = 1; i + 3 < parts.length; i += 4) {
@@ -89,7 +106,7 @@ export class GitOperations {
 
   async getDiffBetweenCommits(from: string, to: string): Promise<FileChange[]> {
     try {
-      const diff = await this.git.diff([from, to, '--numstat', '--summary']);
+      const diff = await this.git(['diff', from, to, '--numstat', '--summary']);
       return this.parseNumstatOutput(diff);
     } catch (error) {
       logger.error({ err: error }, 'git: getDiffBetweenCommits failed');
@@ -99,7 +116,7 @@ export class GitOperations {
 
   async getWorkingTreeDiff(): Promise<FileChange[]> {
     try {
-      const diff = await this.git.diff(['--numstat', '--summary']);
+      const diff = await this.git(['diff', '--numstat', '--summary']);
       return this.parseNumstatOutput(diff);
     } catch (error) {
       logger.error({ err: error }, 'git: getWorkingTreeDiff failed');
@@ -109,7 +126,7 @@ export class GitOperations {
 
   async getStagedDiff(): Promise<FileChange[]> {
     try {
-      const diff = await this.git.diff(['--cached', '--numstat', '--summary']);
+      const diff = await this.git(['diff', '--cached', '--numstat', '--summary']);
       return this.parseNumstatOutput(diff);
     } catch (error) {
       logger.error({ err: error }, 'git: getStagedDiff failed');
@@ -119,7 +136,7 @@ export class GitOperations {
 
   async getFileContent(filePath: string): Promise<string | null> {
     try {
-      return await this.git.show([`HEAD:${filePath}`]);
+      return await this.git(['show', `HEAD:${filePath}`]);
     } catch {
       return null;
     }
@@ -141,14 +158,29 @@ export class GitOperations {
     }
   }
 
+  // Porcelain v1 status folded into the legacy shape: worktree/staged
+  // modifications, untracked files, and deletions. Staged-new (`A`) and
+  // renamed (`R`) entries are skipped, matching the previous mapping.
   async getStatus(): Promise<{ modified: string[]; added: string[]; deleted: string[] }> {
     try {
-      const status = await this.git.status();
-      return {
-        modified: status.modified,
-        added: status.not_added,
-        deleted: status.deleted,
-      };
+      const output = await this.git(['status', '--porcelain=v1', '-uall']);
+      const modified: string[] = [];
+      const added: string[] = [];
+      const deleted: string[] = [];
+      for (const line of output.split('\n')) {
+        if (line.length < 4) continue;
+        const x = line[0];
+        const y = line[1];
+        const filePath = unquotePorcelainPath(line.slice(3));
+        if (x === '?' && y === '?') {
+          added.push(filePath);
+        } else if (x === 'D' || y === 'D') {
+          deleted.push(filePath);
+        } else if (x === 'M' || y === 'M') {
+          modified.push(filePath);
+        }
+      }
+      return { modified, added, deleted };
     } catch (error) {
       logger.error({ err: error }, 'git: getStatus failed');
       throw error;
@@ -157,8 +189,9 @@ export class GitOperations {
 
   async getLastCommitHash(): Promise<string | null> {
     try {
-      const log = await this.git.log({ maxCount: 1 });
-      return log.latest?.hash || null;
+      const output = await this.git(['log', '-1', '--pretty=format:%H']);
+      const hash = output.trim();
+      return hash || null;
     } catch (error) {
       logger.error({ err: error }, 'git: getLastCommitHash failed');
       throw error;
@@ -229,4 +262,29 @@ export class GitOperations {
 
     return changes;
   }
+}
+
+// Splits `--pretty` NUL-separated log output into per-commit entries.
+function parseLogEntries(output: string): LogEntry[] {
+  const parts = output.split('\0');
+  const entries: LogEntry[] = [];
+  for (let i = 0; i + 3 < parts.length; i += 4) {
+    if (!parts[i]) continue;
+    entries.push({
+      hash: parts[i],
+      author: parts[i + 1],
+      date: new Date(parts[i + 2]),
+      subject: parts[i + 3].split('\n')[0],
+    });
+  }
+  return entries;
+}
+
+// Porcelain quotes paths containing special characters (`"a b"`).
+function unquotePorcelainPath(path: string): string {
+  const trimmed = path.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  return trimmed;
 }

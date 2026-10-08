@@ -2,6 +2,58 @@
 
 All notable changes to RepoMemory will be documented in this file.
 
+## [Unreleased] - Agent-oriented memory (source, members, traversal, extraction)
+
+### Added
+- **MCP `entity_source` + `entity_members`** (23 tools total): exact working-tree source lines for an entity (`?maxLines`, default 2000, path-jailed to its repo) and CONTAINS member listing (methods of a class, symbols of a file). New API endpoints `GET /api/entities/:stableId/source` and `GET /api/entities/:stableId/members`
+- **`readEntitySource()`** (`packages/services/src/source.ts`): shared path-jailed disk reader used by API + MCP
+- **`TraversalService.findMembers`/`countMembers`** + `countDependencies`/`countDependents`; dependency/dependents/members endpoints and tools now return `total` alongside paged `count`, and accept `?limit=`
+- **Signature/docstring/purpose extraction** (`extractors/base.ts`): every TS/JS entity gets a declaration-header signature; JSDoc blocks attach as docstring (`@tag` lines dropped, `#` comments ignored so Python keeps its own docstrings); purpose = first docstring sentence, else null. Verified live: `TraversalService` re-scanned with all three populated
+
+### Changed
+- **Traversal walks EXTENDS/IMPLEMENTS/TESTS** by default: impact analysis now sees implementors, subclasses, and covering tests (risk math updated everywhere via the single `computeImpact()`)
+- **Ghost-row detection**: `verify` reports `staleFiles`/`staleFileCount` (entities indexed for files missing on disk — found live: `packages/api/src/qa.ts` ghosts from an old move); `repair` deletes them (`staleFilesRemoved`) — verified live: 3 files removed, `ok: true` after
+- **Docs**: tool counts 21 → 23, new endpoint rows in README/AGENTS
+- **Verified**: 173/173 tests green against live PostgreSQL (12 traversal-CTE, 4 source-unit, 4 MCP, 4 API-integration, 4 integrity), plus live stdio MCP probes (search → members → source → impact → QA → verify → repair) on this repo
+
+## [Unreleased] - Dependency slim-down + single-store (Neo4j removed)
+
+### Removed
+- **Neo4j deleted**: `packages/graph` (619-line `GraphClient` + `neo4j-driver`), the `neo4j` compose service/volumes, `NEO4J_*` env, and all dual-writes removed. PostgreSQL is the only store; traversal runs as recursive CTEs
+- **Dropped runtime deps**: `glob` (unused), `simple-git` (replaced by `execFile('git')`), `commander` (replaced by `node:util.parseArgs`), `pino` (replaced by a dependency-free pino-compatible JSON logger in `shared`)
+- **Docs**: deleted stale `plan.md`; removed duplicate root `scripts/download-model.mjs`
+
+### Added
+- **`TraversalService`** (`packages/storage/src/traversal.ts`): PG-backed `findDependencies`/`findDependents` (entity-joined), `findTransitiveDependencies`/`findTransitiveDependents` (depth-clamped ≤6, cycle-safe), `findShortestPath` (undirected BFS CTE, same shape as before). Same edge-type filters and repo scoping as the old Cypher. New skip-guarded integration suite (`traversal-integration.test.ts`, own `repo_memory_traversal` DB) — verified live: 9/9 pass
+- **`listWorkspaceRepos(pool)`** (`packages/storage/src/workspace.ts`): shared by CLI `workspace repos`, `GET /api/workspace/repos`, and MCP `workspace_repos`
+- **`makeChangeAnalyzer(pool)`** (`packages/services/src/change-factory.ts`): one shared factory replacing 4 copy-pasted `ChangeAnalyzer` wirings (orchestrator, API, MCP, QA)
+- **`QaService.computeImpact(stableId)`**: single impact implementation shared by QA answers, `GET /api/analysis/impact/:stableId`, and MCP `entity_impact`
+
+### Changed
+- **Verify/repair are PG-only integrity jobs**: per-type counts, `duplicateStableIds`, `danglingSources` (anomaly), `unresolvedTargets` (info), `entitiesWithoutEmbedding`; repair re-embeds + re-verifies. `VerificationReport`/`RepairReport` reshaped; frontend jobs tab updated
+- **Optional dependencies**: `@repo-memory/api` + `@repo-memory/mcp` are optional in `app` (lazy `import()` in serve/watch/mcp; app dist back to ~67KB), `chokidar` is optional in `ingestion` (`FileWatcher` falls back to `node:fs.watch` recursive — verified live without chokidar)
+- **Lazy ONNX**: `@xenova/transformers` imports inside `initialize()` only — placeholder/gemini scans never load onnxruntime
+- **`db:migrate` runs from `dist`** (`node dist/migrate.js`); `bench` moved to `app/scripts/`; `ApiConfig.graphClient`/`McpServerConfig.graphClient` renamed to `traversal`
+- **Verified**: `pnpm -r run typecheck` (8 projects), `pnpm lint`, `pnpm build`, `pnpm test` green — 154 passed, 0 skipped against live PostgreSQL
+
+## [0.15.0] - 2026-09-10
+
+### Fixed - Non-CI hardening (dual-store scoping, auth, analysis correctness)
+- **Neo4j repo-scoping** (`packages/graph/src/graph-client.ts`): `upsertRelationship` matches endpoints by `(stableId, repoPath)`; `findDependencies/Dependents/Transitive` constrain both ends; `findShortestPath/searchEntities/deleteEntity/deleteRelationship` accept optional `repoPath` (empty = workspace); `count/list` relationship helpers constrain both nodes. New `deleteRelationshipsByFilePath(filePath, repoPath?)`
+- **PostgreSQL scoping**: migration `006-entity-repo-scoping` replaces global `UNIQUE(stable_id)` with `UNIQUE(repo_path, stable_id)`; `EntityRepository.upsert` uses `ON CONFLICT(repo_path, stable_id)`. Migration `007-embedding-provider` adds `repo_state.embedding_provider/model`. New `normalizeRepoPath()` (`packages/shared/src/paths.ts`)
+- **Repair correctness** (`app/src/orchestrator.ts`): re-embed loop pages from offset 0 (mutating `SET embedding` previously skipped rows); `updateRepoState` records provider signature and warns on provider change (`jobs repair` to re-embed); file deletion and incremental persist pass `repoPath` and clean Neo4j stale edges via `deleteRelationshipsByFilePath`
+- **Ownership joins**: new `CommitRepository.getOwnership()` (`JOIN ... ON hash + repo_path`, filtered on `f.repo_path`); API/MCP/QA use it instead of inline SQL with cross-repo `hash`-only joins. `QaService` change analyzer now wires paged sources + bounded `findByType(type, limit)`
+- **Auth hardening** (`packages/api/src/server.ts`): `/config.js` serves the token loopback-only with `no-store` (`ALLOW_TOKEN_BOOTSTRAP=false` disables); `/metrics` requires the bearer when auth is set; fixed double-counted `api_requests_total` (middleware counts once, `onError` no longer counts)
+- **API consistency**: `GET /api/entities/file/*` wildcard (legacy single-segment kept); bounded `entities/type` + `relationships` (`limit`, default 100/max 1000); `graph/traverse` returns real 1-hop dependencies/dependents; `graph/architecture` returns `{truncated}`; `commits/:hash` + `context-pack/:stableId` prefer the served repo on cross-repo collisions; `dead-code` streams `HANDLES`
+- **Extractors**: TS/Python no longer double-extract class members (skip handled `class_body/block`); Python `from x import y as z` stores alias `z`; `isTestFunction`/`isTestFileByContent` word-boundary anchored
+- **Dead code**: `HANDLES` in `RELEVANT_TYPES` (API/MCP sets too); `*-server/cli/entry` roots; raw file-path sources bridge via FILE-entity index; index-pointer BFS; streaming doc clarifies O(repo) index + windowed payloads
+- **Embeddings**: `normalizeToDimensions` always L2-normalizes and rejects malformed vectors; Gemini uses `x-goog-api-key` header + timeouts + truncation + strict validation with per-item fallback (no silent zero-vectors); `getProviderSignature()` + provider-change warning (single-column model: switch providers → re-embed)
+- **Watcher** (`packages/ingestion/src/file-watcher.ts`): working `debounceMs` coalescing, `path.relative` normalization, `unlinkDir` handling
+- **Frontend** (`web/index.html`, `web/app.js`): pinned `d3@7.9.0` (jsdelivr + SRI) with `requireD3()` offline fallback guards on all render paths; `innerHTML` audit — dynamic strings consistently `escHtml()`-escaped
+- **Ops/hygiene**: `docker-compose.yml` `healthcheck` + `restart`; new `.env.example` (`EMBEDDING_MODEL`, `CORS_ORIGIN`, `ALLOW_TOKEN_BOOTSTRAP`); per-package `lint: eslint` (was `tsc --noEmit` alias) + `test` for graph/app; `pnpm.overrides protobufjs>=7.5.6` (lock → 8.8.0); AGENTS env docs updated
+- **Tests**: migration registry/integration updated for ledgers `[1..7]`
+- **Verified**: `pnpm -r run typecheck`, `pnpm -r run lint`, `pnpm build`, `pnpm test` green (142 passed, 3 skipped PG-integration)
+
 ## [0.14.0] - 2026-08-04
 
 ### Added (M17) - Agent Interface (MCP server + task context packs)

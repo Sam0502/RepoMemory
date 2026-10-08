@@ -12,16 +12,16 @@
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts",
+    "build": "tsup",
     "typecheck": "tsc --noEmit",
-    "lint": "tsc --noEmit",
+    "lint": "eslint src test --max-warnings=0",
     "test": "vitest run"
   },
   "dependencies": {
-    "@repo-memory/shared": "workspace:*",
-    "simple-git": "^3.27.0",
-    "chokidar": "^4.0.0",
-    "glob": "^11.0.0"
+    "@repo-memory/shared": "workspace:*"
+  },
+  "optionalDependencies": {
+    "chokidar": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

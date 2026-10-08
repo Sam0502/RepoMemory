@@ -75,11 +75,11 @@ export class RelationshipRepository {
     return result.rows.map(this.mapRowToRelationship);
   }
 
-  async findByType(type: RelationshipType): Promise<Relationship[]> {
+  async findByType(type: RelationshipType, limit: number = 1000): Promise<Relationship[]> {
     const query = this.repoPath
-      ? 'SELECT * FROM relationships WHERE type = $1 AND repo_path = $2 ORDER BY created_at'
-      : 'SELECT * FROM relationships WHERE type = $1 ORDER BY created_at';
-    const result = await this.pool.query(query, this.repoPath ? [type, this.repoPath] : [type]);
+      ? 'SELECT * FROM relationships WHERE type = $1 AND repo_path = $2 ORDER BY created_at LIMIT $3'
+      : 'SELECT * FROM relationships WHERE type = $1 ORDER BY created_at LIMIT $2';
+    const result = await this.pool.query(query, this.repoPath ? [type, this.repoPath, limit] : [type, limit]);
     return result.rows.map(this.mapRowToRelationship);
   }
 

@@ -319,6 +319,8 @@ async function openEntityDetail(entity) {
     loadSimilarEntities(entity.stableId),
     loadContextPack(entity.stableId),
     loadChangeAnalysis(entity.stableId),
+    loadMembers(entity.stableId),
+    loadSource(entity.stableId),
   ]);
   hideGraphLoading();
 }
@@ -339,12 +341,33 @@ function renderDetail(entity) {
     <div class="detail-row"><div class="label">Confidence</div><div class="value">${(entity.confidence * 100).toFixed(0)}%</div></div>
     ${entity.purpose ? `<div class="detail-row"><div class="label">Purpose</div><div class="value">${escHtml(entity.purpose)}</div></div>` : ''}
     ${entity.responsibility ? `<div class="detail-row"><div class="label">Responsibility</div><div class="value">${escHtml(entity.responsibility)}</div></div>` : ''}
+    ${entity.signature ? `<div class="detail-row"><div class="label">Signature</div><div class="value mono">${escHtml(entity.signature)}</div></div>` : ''}
   </div>`;
 
   // Stable ID
   html += `<div class="detail-section">
     <h3>Identity</h3>
     <div class="detail-row"><div class="value mono">${escHtml(entity.stableId)}</div></div>
+  </div>`;
+
+  // Documentation (JSDoc/docstring, placeholder-free)
+  if (entity.docstring) {
+    html += `<div class="detail-section">
+      <h3>Documentation</h3>
+      <div class="doc-block">${escHtml(entity.docstring)}</div>
+    </div>`;
+  }
+
+  // Source code (placeholder, filled async)
+  html += `<div class="detail-section" id="sourceSection">
+    <h3>Source</h3>
+    <div class="loading-text">Loading...</div>
+  </div>`;
+
+  // Members (placeholder, filled async)
+  html += `<div class="detail-section" id="membersSection">
+    <h3>Members</h3>
+    <div class="loading-text">Loading...</div>
   </div>`;
 
   // Similar entities (placeholder, filled async)
@@ -382,6 +405,16 @@ closeDetail.addEventListener('click', () => {
 });
 
 // --- Graph ---
+function requireD3() {
+  if (typeof d3 === 'undefined') {
+    graphLoading.classList.remove('hidden');
+    graphLoading.querySelector('span').textContent =
+      'Graph library (D3) failed to load — check network or vendor d3.min.js locally.';
+    return false;
+  }
+  return true;
+}
+
 async function loadGraph(stableId, depth) {
   try {
     const data = await api(`/api/graph/traverse/${stableId}?depth=${depth}`);
@@ -393,6 +426,7 @@ async function loadGraph(stableId, depth) {
 }
 
 function buildGraph(data) {
+  if (!requireD3()) return;
   const nodes = new Map();
   const links = [];
 
@@ -416,6 +450,7 @@ function buildGraph(data) {
 }
 
 function renderGraph() {
+  if (!requireD3()) return;
   const container = document.getElementById('graphContainer');
   const width = container.clientWidth;
   const height = container.clientHeight;
@@ -517,6 +552,7 @@ async function loadArchitectureGraph() {
 }
 
 function renderArchitectureGraph() {
+  if (!requireD3()) return;
   const container = document.getElementById('graphContainer');
   const width = container.clientWidth;
   const height = container.clientHeight;
@@ -698,6 +734,52 @@ async function loadImpactAnalysis(stableId) {
     `;
   } catch {
     section.innerHTML = '<h3>Impact Analysis</h3><div class="empty-state">Unavailable</div>';
+  }
+}
+
+// --- Members ---
+async function loadMembers(stableId) {
+  const section = document.getElementById('membersSection');
+  if (!section) return;
+  try {
+    const data = await api(`/api/entities/${stableId}/members?limit=100`);
+    const members = data.members || [];
+    const total = data.total ?? members.length;
+    if (!members.length) {
+      section.innerHTML = '<h3>Members</h3><div class="empty-state">No members</div>';
+      return;
+    }
+    section.innerHTML = `
+      <h3>Members <span style="font-weight:400;text-transform:none;color:#8b949e">${members.length}${total > members.length ? ` of ${total}` : ''}</span></h3>
+      <div class="dep-list">
+        ${members.map(m => `
+          <li class="similar-item" data-stable-id="${escHtml(m.stableId)}">
+            <span class="type-badge type-${escHtml(m.type)}">${escHtml(m.type)}</span>
+            <span>${escHtml(m.name)}</span>
+          </li>
+        `).join('')}
+      </div>
+    `;
+    section.querySelectorAll('.similar-item').forEach(el => {
+      el.addEventListener('click', () => selectEntity(el.dataset.stableId));
+    });
+  } catch {
+    section.innerHTML = '<h3>Members</h3><div class="empty-state">Unavailable</div>';
+  }
+}
+
+// --- Source ---
+async function loadSource(stableId) {
+  const section = document.getElementById('sourceSection');
+  if (!section) return;
+  try {
+    const data = await api(`/api/entities/${stableId}/source?maxLines=200`);
+    section.innerHTML = `
+      <h3>Source <span style="font-weight:400;text-transform:none;color:#8b949e">lines ${data.startLine}&ndash;${data.endLine} of ${data.totalLines}${data.truncated ? ' (truncated)' : ''}</span></h3>
+      <pre class="code-block">${escHtml(data.source)}</pre>
+    `;
+  } catch {
+    section.innerHTML = '<h3>Source</h3><div class="empty-state">Unavailable</div>';
   }
 }
 
@@ -1002,25 +1084,22 @@ function renderJobDetail(job) {
   }
   const r = job.result;
   if (job.type === 'verify') {
-    const pctOk = r.entityTotal && r.relationshipTotal
-      ? Math.max(r.entityTotal.pg, r.relationshipTotal.pg) === 0 ? 100 : Math.round(((r.entityTotal.pg + r.relationshipTotal.pg) - Math.abs(r.entityTotal.delta) - Math.abs(r.relationshipTotal.delta)) / (r.entityTotal.pg + r.relationshipTotal.pg) * 100)
-      : 0;
     jobsDetail.innerHTML = `
-      <div class="report-summary">${r.ok ? '<span class="add">OK</span>' : '<span class="del">Drift detected</span>'} &middot; entities ${r.entityTotal.pg}/${r.entityTotal.graph} (Δ${r.entityTotal.delta}) &middot; relationships ${r.relationshipTotal.pg}/${r.relationshipTotal.graph} (Δ${r.relationshipTotal.delta}) &middot; match ~${pctOk}%</div>
+      <div class="report-summary">${r.ok ? '<span class="add">OK</span>' : '<span class="del">Issues detected</span>'} &middot; entities ${r.entityTotal} &middot; relationships ${r.relationshipTotal}</div>
       <div class="report-sub evidence">
-        <div>&bull; duplicate graph nodes: ${r.duplicateGraphNodes}</div>
-        <div>&bull; missing in graph: ${r.missingInGraph.length} / orphan graph nodes: ${r.orphanGraphNodes.length}</div>
-        <div>&bull; missing relationships: ${r.missingRelationshipCount} / orphan relationships: ${r.orphanRelationshipCount}</div>
+        <div>&bull; duplicate stable IDs: ${r.duplicateStableIds}</div>
+        <div>&bull; dangling sources: ${r.danglingSourceCount} / unresolved targets (info): ${r.unresolvedTargets}</div>
+        <div>&bull; stale files (entities for files missing on disk): ${r.staleFileCount}${r.staleFiles && r.staleFiles.length ? ` — ${r.staleFiles.slice(0, 10).map(escHtml).join(', ')}${r.staleFileCount > r.staleFiles.length ? ', …' : ''}` : ''}</div>
         <div>&bull; entities without embedding: ${r.entitiesWithoutEmbedding}</div>
       </div>
     `;
   } else if (job.type === 'repair') {
     const va = r.verifyAfter || {};
     jobsDetail.innerHTML = `
-      <div class="report-summary"><span class="add">Repaired</span> &middot; entities upserted ${r.entitiesUpserted} &middot; relationships upserted ${r.relationshipsUpserted} &middot; orphan nodes deleted ${r.orphanNodesDeleted} &middot; orphan relationships deleted ${r.orphanRelationshipsDeleted} &middot; embeddings generated ${r.embeddingsGenerated}</div>
+      <div class="report-summary"><span class="add">Repaired</span> &middot; stale files removed ${r.staleFilesRemoved} &middot; embeddings generated ${r.embeddingsGenerated}</div>
       <div class="report-sub evidence">
-        <div>&bull; post-repair: entities ${va.entityTotal ? `${va.entityTotal.pg}/${va.entityTotal.graph}` : 'n/a'} &middot; relationships ${va.relationshipTotal ? `${va.relationshipTotal.pg}/${va.relationshipTotal.graph}` : 'n/a'}</div>
-        <div>&bull; remaining missing in graph: ${va.missingInGraph ? va.missingInGraph.length : 'n/a'}</div>
+        <div>&bull; post-repair: entities ${va.entityTotal !== undefined ? va.entityTotal : 'n/a'} &middot; relationships ${va.relationshipTotal !== undefined ? va.relationshipTotal : 'n/a'}</div>
+        <div>&bull; remaining dangling sources: ${va.danglingSourceCount !== undefined ? va.danglingSourceCount : 'n/a'}</div>
         <div>&bull; remaining entities without embedding: ${va.entitiesWithoutEmbedding !== undefined ? va.entitiesWithoutEmbedding : 'n/a'}</div>
       </div>
     `;
@@ -1052,7 +1131,7 @@ jobsRefreshBtn.addEventListener('click', () => {
 // --- QA tab ---
 const QA_SUGGESTIONS = [
   'who calls createUser',
-  'where is GraphClient defined',
+  'where is TraversalService defined',
   'which files change the most',
   'is the architecture drifting',
   'what tests cover this',

@@ -1,7 +1,7 @@
-import { EntityRepository, RelationshipRepository, CommitRepository } from '@repo-memory/storage';
-import { GraphClient } from '@repo-memory/graph';
+import { EntityRepository, RelationshipRepository, CommitRepository, TraversalService } from '@repo-memory/storage';
 import { Entity, Relationship, RelationshipType } from '@repo-memory/shared';
 import { detectDeadCode, ChangeAnalyzer } from '@repo-memory/analysis';
+import { makeChangeAnalyzer } from './change-factory.js';
 import { Pool } from 'pg';
 
 export interface QaAnswer {
@@ -34,7 +34,7 @@ export class QaService {
     private entityRepo: EntityRepository,
     private relationshipRepo: RelationshipRepository,
     private commitRepo: CommitRepository,
-    private graphClient: GraphClient,
+    private traversal: TraversalService,
     private pool: Pool,
     private workspace: boolean = false,
     private repoPath: string = ''
@@ -49,6 +49,28 @@ export class QaService {
   invalidateCache(): void {
     this.deadCodeCache = null;
     this.changeAnalyzer = null;
+  }
+
+  // Direct + transitive dependents of an entity with affected files and a
+  // risk score. Shared by QA answers, the API impact endpoint, and the MCP
+  // impact tool so all three agree.
+  async computeImpact(stableId: string): Promise<{
+    directImpact: Entity[];
+    indirectImpact: Entity[];
+    affectedFiles: string[];
+    riskScore: number;
+  }> {
+    const direct = await this.traversal.findDependents(stableId, this.graphScope);
+    const indirect = await this.traversal.findTransitiveDependents(stableId, 3, this.graphScope);
+    const affectedFiles = new Set<string>();
+    direct.forEach(d => affectedFiles.add(d.entity.filePath));
+    indirect.forEach(e => affectedFiles.add(e.filePath));
+    return {
+      directImpact: direct.map(d => d.entity),
+      indirectImpact: indirect,
+      affectedFiles: [...affectedFiles],
+      riskScore: Math.min(1.0, direct.length * 0.1 + indirect.length * 0.05),
+    };
   }
 
   async ask(question: string): Promise<QaAnswer> {
@@ -145,7 +167,7 @@ export class QaService {
     let answer: string;
     switch (intent) {
       case 'dependencies': {
-        const deps = await this.graphClient.findDependencies(entity.stableId, this.graphScope);
+        const deps = await this.traversal.findDependencies(entity.stableId, this.graphScope);
         const depEntities = deps.map(d => d.entity);
         if (entity.type === 'File') {
           const imports = deps.filter(d => d.relationship.type === RelationshipType.IMPORTS);
@@ -165,7 +187,7 @@ export class QaService {
         break;
       }
       case 'dependents': {
-        const deps = await this.graphClient.findDependents(entity.stableId, this.graphScope);
+        const deps = await this.traversal.findDependents(entity.stableId, this.graphScope);
         const depEntities = deps.map(d => d.entity);
         answer = depEntities.length
           ? `${entity.name} is used by: ${depEntities.map(d => `${d.name} (${this.entityPath(d)})`).join(', ')}`
@@ -217,22 +239,18 @@ export class QaService {
         break;
       }
       case 'impact': {
-        const direct = await this.graphClient.findDependents(entity.stableId, this.graphScope);
-        const indirect = await this.graphClient.findTransitiveDependents(entity.stableId, 3, this.graphScope);
-        const affectedFiles = new Set<string>();
-        direct.forEach(d => affectedFiles.add(d.entity.filePath));
-        indirect.forEach(e => affectedFiles.add(e.filePath));
-        const risk = Math.min(1.0, direct.length * 0.1 + indirect.length * 0.05);
+        const impact = await this.computeImpact(entity.stableId);
+        const risk = impact.riskScore;
         answer =
-          `Changing ${entity.name} directly affects ${direct.length} entities and ` +
-          `${indirect.length} transitive dependents across ${affectedFiles.size} files. ` +
+          `Changing ${entity.name} directly affects ${impact.directImpact.length} entities and ` +
+          `${impact.indirectImpact.length} transitive dependents across ${impact.affectedFiles.length} files. ` +
           `Risk score: ${Math.round(risk * 100)}/100.`;
-        if (affectedFiles.size) {
-          answer += `\nAffected files: ${Array.from(affectedFiles).slice(0, 10).join(', ')}`;
+        if (impact.affectedFiles.length) {
+          answer += `\nAffected files: ${impact.affectedFiles.slice(0, 10).join(', ')}`;
         }
         evidence.push({
           type: 'impact',
-          description: `Direct=${direct.length}, transitive=${indirect.length}, files=${affectedFiles.size}, risk=${risk.toFixed(2)}`,
+          description: `Direct=${impact.directImpact.length}, transitive=${impact.indirectImpact.length}, files=${impact.affectedFiles.length}, risk=${risk.toFixed(2)}`,
         });
         break;
       }
@@ -242,7 +260,7 @@ export class QaService {
           answer = `Could not find a second entity in "${question}" to trace a path to.`;
           break;
         }
-        const path = await this.graphClient.findShortestPath(entity.stableId, target.stableId, 5);
+        const path = await this.traversal.findShortestPath(entity.stableId, target.stableId, 5);
         if (!path) {
           answer = `No path found between ${entity.name} and ${target.name} within 5 hops.`;
         } else {
@@ -267,7 +285,7 @@ export class QaService {
         break;
       }
       case 'file-deps': {
-        const deps = await this.graphClient.findDependencies(entity.stableId, this.graphScope);
+        const deps = await this.traversal.findDependencies(entity.stableId, this.graphScope);
         const imports = deps.filter(d => d.relationship.type === RelationshipType.IMPORTS);
         const calls = deps.filter(d => d.relationship.type !== RelationshipType.IMPORTS);
         answer = `${entity.name} imports ${imports.length} module(s) and references ${calls.length} symbol(s).`;
@@ -295,7 +313,7 @@ export class QaService {
   }
 
   private async findTestsFor(entity: Entity): Promise<Entity[]> {
-    const candidates = await this.graphClient.findDependents(entity.stableId, this.graphScope);
+    const candidates = await this.traversal.findDependents(entity.stableId, this.graphScope);
     let tests = candidates.map(d => d.entity).filter(e => e.isTest);
 
     // Endpoints: also include tests that cover their handlers
@@ -304,7 +322,7 @@ export class QaService {
       for (const rel of handlerRels.filter(r => r.type === RelationshipType.HANDLES)) {
         const handler = await this.entityRepo.findByStableId(rel.targetId);
         if (handler) {
-          const handlerDeps = await this.graphClient.findDependents(handler.stableId, this.graphScope);
+          const handlerDeps = await this.traversal.findDependents(handler.stableId, this.graphScope);
           tests = handlerDeps.map(d => d.entity).filter(e => e.isTest);
           if (tests.length) break;
         }
@@ -315,7 +333,7 @@ export class QaService {
     if (tests.length === 0) {
       const fileEntity = (await this.entityRepo.findByFilePath(entity.filePath)).find(e => e.type === 'File');
       if (fileEntity) {
-        const fileDeps = await this.graphClient.findDependents(fileEntity.stableId, this.graphScope);
+        const fileDeps = await this.traversal.findDependents(fileEntity.stableId, this.graphScope);
         tests = fileDeps.map(d => d.entity).filter(e => e.isTest);
       }
     }
@@ -539,16 +557,19 @@ export class QaService {
   private async queryOwnership(filePath: string): Promise<{ owner: string; commits: number } | null> {
     // file paths in file_changes use forward slashes; normalize for matching
     const normalized = filePath.replace(/\\/g, '/');
+    const scope = this.workspace ? '' : this.repoPath;
+    const whereRepo = scope ? 'AND f.repo_path = $2' : '';
+    const params = scope ? [normalized, scope] : [normalized];
     const result = await this.pool.query(
       `SELECT (ARRAY_AGG(author ORDER BY cnt DESC))[1] AS owner, MAX(cnt) AS commits
        FROM (
          SELECT c.author, COUNT(*) AS cnt
          FROM file_changes f
-         JOIN commits c ON c.hash = f.commit_hash
-         WHERE f.file_path = $1
+         JOIN commits c ON c.hash = f.commit_hash AND c.repo_path = f.repo_path
+         WHERE f.file_path = $1 ${whereRepo}
          GROUP BY c.author
        ) sub`,
-      [normalized]
+      params
     );
     const row = result.rows[0];
     if (!row || !row.owner) return null;
@@ -557,29 +578,7 @@ export class QaService {
 
   private getChangeAnalyzer(): ChangeAnalyzer {
     if (!this.changeAnalyzer) {
-      this.changeAnalyzer = new ChangeAnalyzer({
-        fileChurnRows: (repoPath, days) => this.commitRepo.getFileChurn(repoPath, 100000, days),
-        entities: async () => {
-          const all: Entity[] = [];
-          const limit = 10000;
-          let offset = 0;
-          while (true) {
-            const batch = await this.entityRepo.findAll(limit, offset);
-            all.push(...batch);
-            if (batch.length < limit) break;
-            offset += limit;
-          }
-          return all;
-        },
-        relationships: async () => {
-          const all: Relationship[] = [];
-          for (const type of [RelationshipType.CALLS, RelationshipType.REFERENCES, RelationshipType.IMPORTS, RelationshipType.EXTENDS, RelationshipType.IMPLEMENTS, RelationshipType.HANDLES]) {
-            all.push(...(await this.relationshipRepo.findByType(type)));
-          }
-          return all;
-        },
-        lastCommitDate: (repoPath) => this.commitRepo.getLastCommitDate(repoPath),
-      });
+      this.changeAnalyzer = makeChangeAnalyzer(this.pool);
     }
     return this.changeAnalyzer;
   }

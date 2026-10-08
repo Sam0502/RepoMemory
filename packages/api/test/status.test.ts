@@ -9,7 +9,7 @@ function makeApp(getStatus?: () => Promise<RepoStatus>) {
     port: 0,
     host: 'localhost',
     repoPath: '/repo',
-    graphClient: {} as never,
+    traversal: {} as never,
     pgPool: {} as never,
     getStatus,
   });

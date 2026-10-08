@@ -7,8 +7,7 @@ import {
   RelationshipType,
   Commit,
 } from '@repo-memory/shared';
-import { EntityRepository, CommitRepository, RelationshipRepository } from '@repo-memory/storage';
-import { GraphClient } from '@repo-memory/graph';
+import { EntityRepository, CommitRepository, RelationshipRepository, TraversalService } from '@repo-memory/storage';
 import {
   ChangeAnalyzer,
   streamBoundaries,
@@ -53,7 +52,7 @@ export class ContextPackBuilder {
   constructor(
     private entityRepo: EntityRepository,
     private commitRepo: CommitRepository,
-    private graphClient: GraphClient,
+    private traversal: TraversalService,
     private options: ContextPackBuilderOptions = {}
   ) {}
 
@@ -61,8 +60,8 @@ export class ContextPackBuilder {
     const entity = await this.entityRepo.findByStableId(stableId);
     if (!entity) return null;
 
-    const deps = await this.graphClient.findDependencies(stableId);
-    const dependents = await this.graphClient.findDependents(stableId);
+    const deps = await this.traversal.findDependencies(stableId);
+    const dependents = await this.traversal.findDependents(stableId);
     const similar = await this.entityRepo.findSimilar(stableId, 5, 0.3);
     const commits = await this.commitRepo.findRecent(10);
 
@@ -150,14 +149,14 @@ export class ContextPackBuilder {
         expanded.push(focal);
       }
       const scope = focal.repoPath ?? repoPath;
-      for (const d of await this.graphClient.findDependencies(focal.stableId, scope)) {
+      for (const d of await this.traversal.findDependencies(focal.stableId, scope)) {
         rels.push(d.relationship);
         if (!seenExpanded.has(d.entity.stableId)) {
           seenExpanded.add(d.entity.stableId);
           expanded.push(d.entity);
         }
       }
-      for (const d of await this.graphClient.findDependents(focal.stableId, scope)) {
+      for (const d of await this.traversal.findDependents(focal.stableId, scope)) {
         rels.push(d.relationship);
         if (!seenExpanded.has(d.entity.stableId)) {
           seenExpanded.add(d.entity.stableId);

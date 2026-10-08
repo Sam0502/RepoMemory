@@ -1,27 +1,24 @@
 import { Pool, PoolClient } from 'pg';
-import { GraphClient } from '@repo-memory/graph';
-import { EntityRepository, RelationshipRepository, CommitRepository, JobRepository, migrate, createPool } from '@repo-memory/storage';
+import { EntityRepository, RelationshipRepository, CommitRepository, JobRepository, migrate, createPool, TraversalService, findStaleFiles } from '@repo-memory/storage';
 import { GitOperations, FileWatcher } from '@repo-memory/ingestion';
 import {
   TreeSitterParser, getGrammarKeyFromFilePath, languageFromGrammarKey,
   shouldParseFile, isConfigFilePath,
-  configureEmbeddings, initializeEmbeddings, generateEntityEmbedding, generateEntityEmbeddings, getProviderName,
+  configureEmbeddings, initializeEmbeddings, generateEntityEmbedding, generateEntityEmbeddings, getProviderName, getProviderSignature,
   SymbolIndex, RelationshipResolver, createFileEntity,
   applyDomainMetadata, parseDomainConfig, ChangeAnalyzer,
-  streamDeadCode, streamBoundaries, resolveBatchSize
+  streamDeadCode, streamBoundaries
 } from '@repo-memory/analysis';
 import type { EmbeddingConfig, DeadCodeReport, DomainConfig, BoundaryReport } from '@repo-memory/analysis';
 import { RelationshipType, getLogger, metrics, registerDefaultMetrics } from '@repo-memory/shared';
 import type { Logger } from '@repo-memory/shared';
-import type { Entity, Relationship, ParseResult, ScanReport, ScanPhaseReport, ScanType, Job, JobType, VerificationReport, RepairReport, TypeCountDelta, RepoStatus, FileChange } from '@repo-memory/shared';
+import { makeChangeAnalyzer } from '@repo-memory/services';
+import type { Entity, Relationship, ParseResult, ScanReport, ScanPhaseReport, ScanType, Job, JobType, VerificationReport, RepairReport, RepoStatus, FileChange } from '@repo-memory/shared';
 import { readFileSync } from 'fs';
 import { join, relative } from 'path';
 
 export interface OrchestratorConfig {
   repoPath: string;
-  neo4jUri?: string;
-  neo4jUser?: string;
-  neo4jPassword?: string;
   pgHost?: string;
   pgPort?: number;
   pgDatabase?: string;
@@ -77,7 +74,7 @@ interface ScanState {
 
 export class Orchestrator {
   private logger: Logger;
-  private graphClient: GraphClient;
+  private traversal!: TraversalService;
   private pgPool!: Pool;
   private entityRepo!: EntityRepository;
   private relationshipRepo!: RelationshipRepository;
@@ -102,11 +99,6 @@ export class Orchestrator {
   constructor(config: OrchestratorConfig) {
     this.config = config;
     this.logger = getLogger({ component: 'orchestrator', repoPath: config.repoPath });
-    this.graphClient = new GraphClient(
-      config.neo4jUri,
-      config.neo4jUser,
-      config.neo4jPassword
-    );
     this.gitOps = new GitOperations(config.repoPath);
   }
 
@@ -125,14 +117,11 @@ export class Orchestrator {
     this.jobRepo = new JobRepository(this.pgPool);
     this.logger.info('Initializing Repository Memory Engine...');
 
-    // Verify database connections
-    await this.graphClient.verifyConnectivity();
-
     // Run migrations
     await migrate(this.pgPool);
 
-    // Create Neo4j schema
-    await this.graphClient.createSchema();
+    // PostgreSQL is the only store; traversal queries run against it.
+    this.traversal = new TraversalService(this.pgPool);
 
     // Initialize embeddings
     if (this.config.embeddings) {
@@ -269,18 +258,14 @@ export class Orchestrator {
     // Fresh full scan: replace this repo's data atomically. Parse/resolve/embed
     // must succeed before the destructive step (delete + re-insert) runs; that
     // happens inside one PostgreSQL transaction so a mid-persist failure rolls
-    // back to the previous snapshot. The graph is cleared first (it can't join
-    // the transaction); graph upserts inside the transaction rebuild it, and any
-    // residual Neo4j gaps are reconciled by the repair job.
+    // back to the previous snapshot.
     //
     // Memory stays bounded regardless of repo size: files are processed in
     // windows. Entities + their CONTAINS edges are persisted as each window is
     // parsed (both endpoints of a CONTAINS edge live in the same file), so the
     // heavy per-file data (entities, embeddings) is freed between windows. Only
     // the lightweight raw relationships are buffered across windows, because
-    // cross-file resolution requires the complete repo symbol index and Neo4j
-    // relationship upserts require both endpoint nodes to already exist.
-    await this.graphClient.deleteAll(this.config.repoPath);
+    // cross-file resolution requires the complete repo symbol index.
     const client = await this.pgPool.connect();
     let entitiesStored = 0;
     let relationshipsStored = 0;
@@ -371,9 +356,7 @@ export class Orchestrator {
       }
 
       // Resolve + persist every file's relationships against the now-complete
-      // index. All entity nodes already exist in both stores (entities are
-      // persisted per-window; Neo4j relationships are written after the final
-      // window so their endpoints always exist).
+      // index. All entities already exist (persisted per-window above).
       const resolveStart = performance.now();
       for (const [filePath, relationships] of pendingRelationships) {
         const fileEntity = createFileEntity(filePath, this.config.repoPath);
@@ -509,16 +492,38 @@ export class Orchestrator {
 
   private async updateRepoState(commitHash: string): Promise<void> {
     try {
+      const { provider, model } = getProviderSignature();
       await this.pgPool.query(
-        `INSERT INTO repo_state (repo_path, last_commit_hash, last_scan_at)
-         VALUES ($1, $2, NOW())
+        `INSERT INTO repo_state (repo_path, last_commit_hash, last_scan_at, embedding_provider, embedding_model)
+         VALUES ($1, $2, NOW(), $3, $4)
          ON CONFLICT (repo_path) DO UPDATE SET
            last_commit_hash = EXCLUDED.last_commit_hash,
-           last_scan_at = NOW()`,
-        [this.config.repoPath, commitHash]
+           last_scan_at = NOW(),
+           embedding_provider = EXCLUDED.embedding_provider,
+           embedding_model = EXCLUDED.embedding_model`,
+        [this.config.repoPath, commitHash, provider, model]
       );
+      await this.warnOnEmbeddingProviderChange(provider, model);
     } catch (error) {
       this.logger.error({ err: error }, 'Failed to update repo state');
+    }
+  }
+
+  private async warnOnEmbeddingProviderChange(provider: string, model: string): Promise<void> {
+    try {
+      const result = await this.pgPool.query(
+        'SELECT embedding_provider, embedding_model FROM repo_state WHERE repo_path = $1',
+        [this.config.repoPath]
+      );
+      const row = result.rows[0];
+      if (row?.embedding_provider && row.embedding_provider !== provider) {
+        this.logger.warn(
+          { repoPath: this.config.repoPath, previous: `${row.embedding_provider}:${row.embedding_model}`, current: `${provider}:${model}` },
+          'Embedding provider changed — run `jobs repair` to re-embed so similarity stays comparable'
+        );
+      }
+    } catch {
+      // repo_state may predate migration 007; non-fatal.
     }
   }
 
@@ -615,7 +620,8 @@ export class Orchestrator {
 
   // --- Live file watching (5.6) ---------------------------------------------
   //
-  // Watches the working tree with chokidar (via FileWatcher) and replays each
+  // Watches the working tree (via FileWatcher — chokidar when installed, a
+  // node:fs.watch fallback otherwise) and replays each
   // file:change / file:add / file:delete through the same incremental-scan path
   // (processChanges single-file path / handleFileDeletion). Events are queued
   // and flushed on a debounce window so a burst of edits coalesces into one
@@ -923,18 +929,17 @@ export class Orchestrator {
     return embeddings;
   }
 
-  // Build the symbol index and resolve every file's relationships against it.
-  // Split from persistence so scans can time the resolve phase independently.
-  // (Full scans build the index incrementally across parse windows instead.)
+// Build the symbol index and resolve every file's relationships against it.
+// Split from persistence so scans can time the resolve phase independently.
+// (Full scans build the index incrementally across parse windows instead.)
 
-  // Persist entities + relationships for a full scan. Entities are stored before
-  // any relationship (graph upserts require both endpoints to exist). Full scans
-  // persist per-window instead of buffering the whole repo.
+// Persist entities + relationships for a full scan. Full scans persist
+// per-window instead of buffering the whole repo.
 
-  // Store a batch of relationships in both databases. Used by the full scan to
-  // persist CONTAINS edges per-window and resolved relationships once the whole
-  // repo symbol index is built; the incremental path uses persistFileRelationships
-  // (which additionally cleans up stale rows for the file).
+// Store a batch of relationships. Used by the full scan to
+// persist CONTAINS edges per-window and resolved relationships once the whole
+// repo symbol index is built; the incremental path uses persistFileRelationships
+// (which additionally cleans up stale rows for the file).
   private async persistRelationships(
     relationships: Relationship[],
     client?: PoolClient,
@@ -943,7 +948,6 @@ export class Orchestrator {
     for (const relationship of relationships) {
       try {
         await this.relationshipRepo.upsert(relationship, client);
-        await this.graphClient.upsertRelationship(relationship, this.config.repoPath);
         stored++;
       } catch (error) {
         this.logger.error({ err: error, filePath: relationship.filePath }, 'Failed to store relationship');
@@ -964,12 +968,10 @@ export class Orchestrator {
 
     const entities = [...result.entities, fileEntity];
 
-    // Store entities in both databases
     let stored = 0;
     for (const entity of entities) {
       try {
         await this.entityRepo.upsert(entity, client);
-        await this.graphClient.upsertEntity(entity, this.config.repoPath);
         const embedding = embeddings.get(entity.stableId);
         if (embedding) {
           await this.entityRepo.updateEmbedding(entity.stableId, embedding, client);
@@ -998,7 +1000,7 @@ export class Orchestrator {
     );
 
     // Structural containment: the file contains each top-level entity, so file
-    // nodes connect to their symbols in the graph
+    // nodes connect to their symbols for traversal queries
     for (const entity of result.entities) {
       rels.push({
         id: `contains:${fileEntity.stableId}:${entity.stableId}`,
@@ -1013,12 +1015,11 @@ export class Orchestrator {
       });
     }
 
-    // Store relationships in both databases
+    // Store relationships
     let stored = 0;
     for (const relationship of rels) {
       try {
         await this.relationshipRepo.upsert(relationship, client);
-        await this.graphClient.upsertRelationship(relationship, this.config.repoPath);
         stored++;
       } catch (error) {
         this.logger.error({ err: error, filePath: result.filePath }, 'Failed to store relationship');
@@ -1031,11 +1032,7 @@ export class Orchestrator {
   private async handleFileDeletion(filePath: string): Promise<void> {
     this.logger.debug({ file: filePath }, 'Handling file deletion');
 
-    // Remove entities from both databases
-    const entities = await this.entityRepo.findByFilePath(filePath);
-    for (const entity of entities) {
-      await this.graphClient.deleteEntity(entity.stableId);
-    }
+    // Remove entities (repo-scoped so other repos survive)
     await this.entityRepo.deleteByFilePath(filePath);
 
     // Remove relationships
@@ -1081,21 +1078,21 @@ export class Orchestrator {
   }
 
   async getDependencies(stableId: string): Promise<Entity[]> {
-    const deps = await this.graphClient.findDependencies(stableId, this.config.repoPath);
+    const deps = await this.traversal.findDependencies(stableId, this.config.repoPath);
     return deps.map(d => d.entity);
   }
 
   async getDependents(stableId: string): Promise<Entity[]> {
-    const deps = await this.graphClient.findDependents(stableId, this.config.repoPath);
+    const deps = await this.traversal.findDependents(stableId, this.config.repoPath);
     return deps.map(d => d.entity);
   }
 
   async getTransitiveDependencies(stableId: string, maxDepth: number = 5): Promise<Entity[]> {
-    return this.graphClient.findTransitiveDependencies(stableId, maxDepth, this.config.repoPath);
+    return this.traversal.findTransitiveDependencies(stableId, maxDepth, this.config.repoPath);
   }
 
   async getTransitiveDependents(stableId: string, maxDepth: number = 5): Promise<Entity[]> {
-    return this.graphClient.findTransitiveDependents(stableId, maxDepth, this.config.repoPath);
+    return this.traversal.findTransitiveDependents(stableId, maxDepth, this.config.repoPath);
   }
 
   async getDeadCodeReport(): Promise<DeadCodeReport> {
@@ -1174,60 +1171,7 @@ export class Orchestrator {
 
   private getChangeAnalyzer(): ChangeAnalyzer {
     if (!this.changeAnalyzer) {
-      this.changeAnalyzer = new ChangeAnalyzer({
-        fileChurnRows: (repoPath, days) => this.commitRepo.getFileChurn(repoPath, 100000, days),
-        entityPage: (repoPath, offset, limit) => this.entityRepo.findAll(limit, offset),
-        relationshipPage: (repoPath, offset, limit) =>
-          this.relationshipRepo.findByTypesPaged(
-            [
-              RelationshipType.CALLS,
-              RelationshipType.REFERENCES,
-              RelationshipType.IMPORTS,
-              RelationshipType.EXTENDS,
-              RelationshipType.IMPLEMENTS,
-              RelationshipType.HANDLES,
-            ],
-            limit,
-            offset
-          ),
-        entityByStableId: (repoPath, stableId) => this.entityRepo.findByStableId(stableId),
-        entities: async () => {
-          const all: Entity[] = [];
-          const limit = resolveBatchSize();
-          let offset = 0;
-          while (true) {
-            const batch = await this.entityRepo.findAll(limit, offset);
-            all.push(...batch);
-            if (batch.length < limit) break;
-            offset += limit;
-          }
-          return all;
-        },
-        relationships: async () => {
-          const all: Relationship[] = [];
-          const limit = resolveBatchSize();
-          let offset = 0;
-          while (true) {
-            const batch = await this.relationshipRepo.findByTypesPaged(
-              [
-                RelationshipType.CALLS,
-                RelationshipType.REFERENCES,
-                RelationshipType.IMPORTS,
-                RelationshipType.EXTENDS,
-                RelationshipType.IMPLEMENTS,
-                RelationshipType.HANDLES,
-              ],
-              limit,
-              offset
-            );
-            all.push(...batch);
-            if (batch.length < limit) break;
-            offset += limit;
-          }
-          return all;
-        },
-        lastCommitDate: (repoPath) => this.commitRepo.getLastCommitDate(repoPath),
-      });
+      this.changeAnalyzer = makeChangeAnalyzer(this.pgPool);
     }
     return this.changeAnalyzer;
   }
@@ -1301,44 +1245,41 @@ export class Orchestrator {
     }
   }
 
-  // Compare PostgreSQL (source of truth) against Neo4j: per-type entity and
-  // relationship counts, orphan nodes/edges on either side, and entities whose
-  // embedding is missing.
+  // PostgreSQL integrity check: per-type entity and relationship counts,
+  // duplicate stable IDs, relationships whose source is not a known entity
+  // (an anomaly), relationships pointing at non-entity targets (expected for
+  // external/unresolved imports — informational only), ghost rows for files
+  // missing from disk, and entities whose embedding is missing.
   private async verifyRepo(repoPath: string): Promise<VerificationReport> {
     const entityRepo = new EntityRepository(this.pgPool, repoPath);
     const relationshipRepo = new RelationshipRepository(this.pgPool, repoPath);
 
-    const pgEntityCounts = await entityRepo.countByType();
-    const graphEntityCounts = await this.graphClient.countEntitiesByType(repoPath);
+    const entityCounts = (await entityRepo.countByType()).map(({ type, count }) => ({ type, count }));
+    const relationshipCounts = (await relationshipRepo.countByType()).map(({ type, count }) => ({ type, count }));
+    const entityTotal = entityCounts.reduce((sum, row) => sum + row.count, 0);
+    const relationshipTotal = relationshipCounts.reduce((sum, row) => sum + row.count, 0);
 
-    const pgIds = new Set(await entityRepo.findAllStableIds());
-    const graphIds = await this.graphClient.listEntityStableIds(repoPath);
-    const uniqueGraphIds = new Set(graphIds);
-    const duplicateGraphNodes = graphIds.length - uniqueGraphIds.size;
-    const missingInGraph = [...pgIds].filter(id => !uniqueGraphIds.has(id)).sort();
-    const orphanGraphNodes = [...uniqueGraphIds].filter(id => !pgIds.has(id)).sort();
+    const { rows: dupRows } = await this.pgPool.query(
+      'SELECT stable_id FROM entities WHERE repo_path = $1 GROUP BY stable_id HAVING COUNT(*) > 1',
+      [repoPath]
+    );
+    const duplicateStableIds = dupRows.length;
 
-    const pgRelCounts = await relationshipRepo.countByType();
-    const graphRelCounts = await this.graphClient.countRelationshipsByType(repoPath);
-
-    // A PG relationship is only *representable* in the graph when both of its
-    // endpoint stable IDs are real entities (some PG rows reference unresolved
-    // expression text as targetId, which cannot be a graph node). Reconciliation
-    // targets the representable subset; the raw per-type counts stay available
-    // for the surface breakdown.
-    const pgRelKeys = (await relationshipRepo.findAllKeys())
-      .filter(k => pgIds.has(k.sourceId) && pgIds.has(k.targetId))
-      .map(relationshipKey);
-    const graphRelKeys = new Set((await this.graphClient.listRelationshipKeys(repoPath)).map(relationshipKey));
-    const missingRelationships = [...pgRelKeys].filter(key => !graphRelKeys.has(key)).sort();
-    const orphanRelationships = [...graphRelKeys].filter(key => !pgRelKeys.includes(key)).sort();
+    const entityIds = new Set(await entityRepo.findAllStableIds());
+    const keys = await relationshipRepo.findAllKeys();
+    const danglingSources = keys
+      .filter(k => !entityIds.has(k.sourceId))
+      .map(relationshipKey)
+      .sort();
+    const unresolvedTargets = keys.filter(k => !entityIds.has(k.targetId)).length;
 
     const entitiesWithoutEmbedding = await entityRepo.countWithoutEmbedding();
 
-    const entityCounts = this.mergeTypeCounts(pgEntityCounts, graphEntityCounts);
-    const relationshipCounts = this.mergeTypeCounts(pgRelCounts, graphRelCounts);
-    const entityTotal = { pg: pgIds.size, graph: uniqueGraphIds.size, delta: pgIds.size - uniqueGraphIds.size };
-    const relationshipTotal = { pg: pgRelKeys.length, graph: graphRelKeys.size, delta: pgRelKeys.length - graphRelKeys.size };
+    // Ghost rows: entities indexed for files that no longer exist on disk
+    // (moves/deletes that incremental scans never reconciled). The list is
+    // capped for report size; the count covers everything.
+    const allStaleFiles = findStaleFiles(repoPath, await entityRepo.findAllFilePaths());
+    const staleFiles = allStaleFiles.slice(0, 100);
 
     const report: VerificationReport = {
       repoPath,
@@ -1347,109 +1288,47 @@ export class Orchestrator {
       relationshipCounts,
       entityTotal,
       relationshipTotal,
-      duplicateGraphNodes,
-      missingInGraph,
-      orphanGraphNodes,
-      missingRelationshipCount: missingRelationships.length,
-      missingRelationships,
-      orphanRelationshipCount: orphanRelationships.length,
-      orphanRelationships,
+      duplicateStableIds,
+      danglingSources,
+      danglingSourceCount: danglingSources.length,
+      unresolvedTargets,
+      staleFiles,
+      staleFileCount: allStaleFiles.length,
       entitiesWithoutEmbedding,
-      ok: missingInGraph.length === 0 && orphanGraphNodes.length === 0
-        && missingRelationships.length === 0 && orphanRelationships.length === 0,
+      ok: duplicateStableIds === 0 && danglingSources.length === 0 && allStaleFiles.length === 0,
     };
 
     this.logger.info(
-      { repoPath, entityDelta: report.entityTotal.delta, relationshipDelta: report.relationshipTotal.delta,
-        missingInGraph: missingInGraph.length, orphanNodes: orphanGraphNodes.length, entitiesWithoutEmbedding },
+      { repoPath, entityTotal, relationshipTotal,
+        danglingSources: danglingSources.length, staleFiles: allStaleFiles.length, entitiesWithoutEmbedding },
       'Verification report produced'
     );
     return report;
   }
 
-  // Re-sync Neo4j from PostgreSQL: upsert entities and relationships that are
-  // missing from the graph, delete orphan graph nodes/edges, and re-embed any
-  // entities that have no embedding.
+  // Repair: delete ghost rows for files missing from disk, re-embed entities
+  // with null embeddings, then re-verify. Dangling sources and duplicate
+  // stable IDs are reported by verify but never auto-deleted — they need human
+  // inspection, not blind repair.
   private async repairRepo(repoPath: string): Promise<RepairReport> {
     const entityRepo = new EntityRepository(this.pgPool, repoPath);
     const relationshipRepo = new RelationshipRepository(this.pgPool, repoPath);
 
-    let entitiesUpserted = 0;
-    let relationshipsUpserted = 0;
-    let orphanNodesDeleted = 0;
-    let orphanRelationshipsDeleted = 0;
+    let staleFilesRemoved = 0;
+    for (const filePath of findStaleFiles(repoPath, await entityRepo.findAllFilePaths())) {
+      await entityRepo.deleteByFilePath(filePath);
+      await relationshipRepo.deleteByFilePath(filePath);
+      staleFilesRemoved++;
+    }
+
     let embeddingsGenerated = 0;
 
-    // Entities missing from the graph get upserted from PG (source of truth).
-    const pgIds = new Set(await entityRepo.findAllStableIds());
-    const graphIds = new Set(await this.graphClient.listEntityStableIds(repoPath));
-    const missingInGraph = [...pgIds].filter(id => !graphIds.has(id));
-    const missingSet = new Set(missingInGraph);
-
+    // Re-embed entities with null embeddings. Embedded rows leave the
+    // "without embedding" result set, so keep offset at 0 and page from the
+    // head until empty — incrementing an offset would skip rows.
     const pageLimit = 500;
-    let offset = 0;
     while (true) {
-      const batch = await entityRepo.findAll(pageLimit, offset);
-      if (batch.length === 0) break;
-      for (const entity of batch) {
-        if (!missingSet.has(entity.stableId)) continue;
-        await this.graphClient.upsertEntity(entity, repoPath);
-        entitiesUpserted++;
-      }
-      if (batch.length < pageLimit) break;
-      offset += pageLimit;
-    }
-
-    // Orphan graph nodes (no PG row) are deleted along with their edges.
-    for (const stableId of graphIds) {
-      if (pgIds.has(stableId)) continue;
-      await this.graphClient.deleteEntity(stableId);
-      orphanNodesDeleted++;
-    }
-
-    // Relationships missing from the graph get upserted. Endpoints are
-    // guaranteed present after the entity pass above; only relationships whose
-    // PG endpoint IDs are real entities are representable in the graph.
-    const pgRelKeys = new Map<string, { sourceId: string; targetId: string; type: string; filePath: string }>();
-    for (const key of await relationshipRepo.findAllKeys()) {
-      if (!pgIds.has(key.sourceId) || !pgIds.has(key.targetId)) continue;
-      pgRelKeys.set(relationshipKey(key), key);
-    }
-    const graphRelKeys = new Map<string, { sourceId: string; targetId: string; type: string; filePath: string }>();
-    for (const key of await this.graphClient.listRelationshipKeys(repoPath)) {
-      graphRelKeys.set(relationshipKey(key), key);
-    }
-    const missingRelKeys = [...pgRelKeys.keys()].filter(key => !graphRelKeys.has(key));
-
-    if (missingRelKeys.length > 0) {
-      const missingRelSet = new Set(missingRelKeys);
-      let relOffset = 0;
-      while (true) {
-        const batch = await relationshipRepo.findAll(pageLimit, relOffset);
-        if (batch.length === 0) break;
-        for (const rel of batch) {
-          if (!missingRelSet.has(relationshipKey(rel))) continue;
-          await this.graphClient.upsertRelationship(rel, repoPath);
-          relationshipsUpserted++;
-        }
-        if (batch.length < pageLimit) break;
-        relOffset += pageLimit;
-      }
-    }
-
-    // Orphan graph relationships: edges whose key has no PG counterpart. Orphan
-    // nodes were already deleted above (DETACH DELETE), so this only removes
-    // surplus edges between entities that still exist in PG.
-    for (const [key, rel] of graphRelKeys) {
-      if (pgRelKeys.has(key)) continue;
-      await this.graphClient.deleteRelationship(rel.sourceId, rel.targetId, rel.type, rel.filePath);
-      orphanRelationshipsDeleted++;
-    }
-
-    // Re-embed entities with null embeddings.
-    let embedOffset = 0;
-    while (true) {
-      const batch = await entityRepo.findWithoutEmbedding(pageLimit, embedOffset);
+      const batch = await entityRepo.findWithoutEmbedding(pageLimit, 0);
       if (batch.length === 0) break;
       for (const entity of batch) {
         try {
@@ -1461,62 +1340,27 @@ export class Orchestrator {
         }
       }
       if (batch.length < pageLimit) break;
-      embedOffset += pageLimit;
     }
 
-    this.logger.info(
-      { repoPath, entitiesUpserted, relationshipsUpserted, orphanNodesDeleted, orphanRelationshipsDeleted, embeddingsGenerated },
-      'Repair completed'
-    );
+    this.logger.info({ repoPath, staleFilesRemoved, embeddingsGenerated }, 'Repair completed');
 
     const verifyAfter = await this.verifyRepo(repoPath);
     return {
       repoPath,
       ranAt: new Date().toISOString(),
-      entitiesUpserted,
-      relationshipsUpserted,
-      orphanNodesDeleted,
-      orphanRelationshipsDeleted,
+      staleFilesRemoved,
       embeddingsGenerated,
       verifyAfter,
     };
   }
 
-  // Merge per-type counts from both stores into a single delta table.
-  private mergeTypeCounts(
-    pg: Array<{ type: string; count: number }>,
-    graph: Array<{ type: string; count: number }>,
-  ): TypeCountDelta[] {
-    const byType = new Map<string, { pgCount: number; graphCount: number }>();
-    for (const row of pg) {
-      byType.set(row.type, { pgCount: row.count, graphCount: 0 });
-    }
-    for (const row of graph) {
-      const existing = byType.get(row.type);
-      if (existing) {
-        existing.graphCount = row.count;
-      } else {
-        byType.set(row.type, { pgCount: 0, graphCount: row.count });
-      }
-    }
-    return [...byType.entries()]
-      .map(([type, counts]) => ({
-        type,
-        pgCount: counts.pgCount,
-        graphCount: counts.graphCount,
-        delta: counts.pgCount - counts.graphCount,
-      }))
-      .sort((a, b) => a.type.localeCompare(b.type));
-  }
-
   async close(): Promise<void> {
     await this.stopWatching();
-    await this.graphClient.close();
     await this.pgPool.end();
   }
 }
 
-// Canonical key for a relationship in both stores (matches the repo-scoped
+// Canonical key for a relationship (matches the repo-scoped
 // unique constraint on source_id, target_id, type, file_path).
 function relationshipKey(rel: { sourceId: string; targetId: string; type: string; filePath: string }): string {
   return `${rel.sourceId}|${rel.targetId}|${rel.type}|${rel.filePath}`;

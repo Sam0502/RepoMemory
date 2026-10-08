@@ -286,33 +286,29 @@ export interface Job {
   createdAt: Date;
 }
 
-export interface TypeCountDelta {
+export interface TypeCount {
   type: string;
-  pgCount: number;
-  graphCount: number;
-  delta: number;
+  count: number;
 }
 
-export interface CountDelta {
-  pg: number;
-  graph: number;
-  delta: number;
-}
-
+// PostgreSQL integrity report (single-store). `danglingSources` are
+// relationships whose source is not a known entity (an anomaly — sources are
+// always entities after persistence). Relationships pointing at non-entity
+// targets are expected (external/unresolved imports) and reported only as the
+// informational `unresolvedTargets` count.
 export interface VerificationReport {
   repoPath: string;
   ranAt: string;
-  entityCounts: TypeCountDelta[];
-  relationshipCounts: TypeCountDelta[];
-  entityTotal: CountDelta;
-  relationshipTotal: CountDelta;
-  duplicateGraphNodes: number;
-  missingInGraph: string[];
-  orphanGraphNodes: string[];
-  missingRelationshipCount: number;
-  missingRelationships: string[];
-  orphanRelationshipCount: number;
-  orphanRelationships: string[];
+  entityCounts: TypeCount[];
+  relationshipCounts: TypeCount[];
+  entityTotal: number;
+  relationshipTotal: number;
+  duplicateStableIds: number;
+  danglingSources: string[];
+  danglingSourceCount: number;
+  unresolvedTargets: number;
+  staleFiles: string[];
+  staleFileCount: number;
   entitiesWithoutEmbedding: number;
   ok: boolean;
 }
@@ -320,10 +316,7 @@ export interface VerificationReport {
 export interface RepairReport {
   repoPath: string;
   ranAt: string;
-  entitiesUpserted: number;
-  relationshipsUpserted: number;
-  orphanNodesDeleted: number;
-  orphanRelationshipsDeleted: number;
+  staleFilesRemoved: number;
   embeddingsGenerated: number;
   verifyAfter: VerificationReport;
 }

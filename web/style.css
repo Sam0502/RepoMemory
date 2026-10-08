@@ -571,6 +571,35 @@ main {
   overflow-y: auto;
 }
 
+/* Source code + documentation blocks */
+.code-block {
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  padding: 8px;
+  margin: 4px 0 0;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #c9d1d9;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.doc-block {
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-left: 3px solid #58a6ff;
+  border-radius: 4px;
+  padding: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #8b949e;
+  white-space: pre-wrap;
+}
+
 /* Similar entities */
 .similar-item {
   display: flex;

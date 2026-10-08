@@ -1,23 +1,26 @@
 export const TARGET_DIMENSIONS = 768;
 
+// Normalize any provider vector to TARGET_DIMENSIONS with L2 unit length.
+// NOTE: outputs are only comparable within a single provider. Switching
+// providers requires a re-embed (see embeddings.ts recordEmbeddingProvider),
+// otherwise zero-padded 384d vectors and native 768d vectors share an index
+// but live in different subspaces.
 export function normalizeToDimensions(vector: number[], targetDim: number = TARGET_DIMENSIONS): number[] {
-  if (vector.length === targetDim) return vector;
-
-  if (vector.length > targetDim) {
-    return vector.slice(0, targetDim);
+  if (!Array.isArray(vector) || vector.some(v => typeof v !== 'number' || !Number.isFinite(v))) {
+    throw new Error('Refusing to normalize a malformed embedding vector');
   }
-
-  const padded = [...vector, ...new Array(targetDim - vector.length).fill(0)];
-  const magnitude = Math.sqrt(padded.reduce((sum, v) => sum + v * v, 0));
-  if (magnitude > 0) {
-    for (let i = 0; i < padded.length; i++) {
-      padded[i] /= magnitude;
-    }
+  let out: number[];
+  if (vector.length === targetDim) {
+    out = [...vector];
+  } else if (vector.length > targetDim) {
+    out = vector.slice(0, targetDim);
+  } else {
+    out = [...vector, ...new Array(targetDim - vector.length).fill(0)];
   }
-  return padded;
+  return l2Normalize(out);
 }
 
-export function l2Normalize(vector: number[]): number[] {
+function l2Normalize(vector: number[]): number[] {
   const magnitude = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
   if (magnitude === 0) return vector;
   return vector.map(v => v / magnitude);

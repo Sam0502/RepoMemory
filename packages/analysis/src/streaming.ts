@@ -70,6 +70,7 @@ export async function streamDeadCode(
   // Pass 1: stream entities into a compact index + root set. Keep only the
   // fields classification needs; drop heavy doc/signature strings.
   const index = new Map<string, CompactEntity>();
+  const filePathToFileId = new Map<string, string>();
   const roots = new Set<string>();
   let totalEntities = 0;
   await forEachPage(entities, batchSize, (rows) => {
@@ -83,29 +84,34 @@ export async function streamDeadCode(
         name: entity.name,
         filePath: entity.filePath,
       });
+      if (entity.type === EntityType.FILE) filePathToFileId.set(entity.filePath, entity.stableId);
       if (isDeadCodeRoot(entity)) roots.add(entity.stableId);
     }
   });
 
   // Pass 2: stream relationships into a compact outgoing adjacency over edges
   // between real entities. Targets are stored as bare stable IDs, never full
-  // relationship objects.
+  // relationship objects. Raw file-path sources (pre-reanchor rows) resolve via
+  // the FILE-entity index. Note: the compact index + adjacency are O(repo);
+  // only relationship/entity payloads are windowed.
   const outgoing = new Map<string, string[]>();
   await forEachPage(relationships, batchSize, (rows) => {
     for (const rel of rows) {
       if (!RELEVANT_TYPES.has(rel.type)) continue;
-      if (!index.has(rel.sourceId) || !index.has(rel.targetId)) continue;
-      const list = outgoing.get(rel.sourceId);
+      const source = index.has(rel.sourceId) ? rel.sourceId : filePathToFileId.get(rel.sourceId);
+      if (!source || !index.has(rel.targetId)) continue;
+      const list = outgoing.get(source);
       if (list) list.push(rel.targetId);
-      else outgoing.set(rel.sourceId, [rel.targetId]);
+      else outgoing.set(source, [rel.targetId]);
     }
   });
 
-  // BFS from roots over outgoing edges.
+  // BFS from roots over outgoing edges (index-pointer queue, not shift()).
   const reachable = new Set<string>(roots);
   const queue = [...roots];
-  while (queue.length > 0) {
-    const current = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const current = queue[head++]!;
     for (const target of outgoing.get(current) || []) {
       if (!reachable.has(target)) {
         reachable.add(target);

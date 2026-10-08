@@ -11,7 +11,7 @@
 // regressions in the streaming analysis paths (which must stay O(working-set))
 // can be caught as repo size grows.
 
-import { Orchestrator } from './orchestrator.js';
+import { Orchestrator } from '../src/orchestrator.js';
 import { resolveBatchSize } from '@repo-memory/analysis';
 import { resolve } from 'path';
 import type { EmbeddingConfig } from '@repo-memory/analysis';

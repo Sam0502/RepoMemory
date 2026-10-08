@@ -24,6 +24,8 @@ export abstract class BaseExtractor implements LanguageExtractor {
 
     const stableId = this.generateStableId(ctx.filePath, name, type, ctx.repoPath);
 
+    const docstring = this.extractJSDoc(node);
+
     return {
       id: stableId,
       stableId,
@@ -35,12 +37,79 @@ export abstract class BaseExtractor implements LanguageExtractor {
       endLine: node.endPosition.row + 1,
       startColumn: node.startPosition.column,
       endColumn: node.endPosition.column,
+      signature: this.extractSignature(node),
+      docstring,
+      purpose: this.extractPurpose(docstring),
       isExported,
       isTest: this.isTestFile(ctx.filePath) || this.isTestFileByContent(ctx.content || ''),
       confidence: 0.9,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
+  }
+
+  // First line of the node's source text (declaration header for functions,
+  // classes, methods, properties), truncated. Gives agents a quick signature
+  // without opening the file.
+  protected extractSignature(node: any): string | undefined {
+    const text = typeof node?.text === 'string' ? node.text : '';
+    const firstLine = text.split('\n')[0]?.trim();
+    if (!firstLine) return undefined;
+    return firstLine.length > 240 ? `${firstLine.slice(0, 237)}...` : firstLine;
+  }
+
+  // Leading JSDoc/C-style comment block above a declaration. Walks up through
+  // `export_statement` wrappers (the comment sits beside the export, not the
+  // declaration), then collects contiguous preceding `comment` siblings.
+  // Only C-style comments (`//`, `/*`, `/**`) attach — `#` comments (Python)
+  // are left to that language's own docstring handling. Tag lines (`@param`,
+  // `@returns`, …) are dropped; the description remains.
+  protected extractJSDoc(node: any): string | undefined {
+    let candidate = node;
+    let parent = node?.parent;
+    while (parent && parent.type === 'export_statement') {
+      candidate = parent;
+      parent = parent.parent;
+    }
+    const blocks: string[] = [];
+    let sibling = candidate?.previousNamedSibling;
+    while (sibling && sibling.type === 'comment') {
+      blocks.unshift(sibling.text);
+      sibling = sibling.previousNamedSibling;
+    }
+    if (blocks.length === 0 || !blocks[0].trimStart().startsWith('/')) return undefined;
+    const cleaned = blocks
+      .map((block) =>
+        block
+          .split('\n')
+          .map((line) =>
+            line
+              .trim()
+              .replace(/^\/\*\*?/, '')
+              .replace(/\*\/$/, '')
+              .replace(/^\*\s?/, '')
+              .replace(/^\/\/\s?/, '')
+              .trim()
+          )
+          .filter((line) => line.length > 0 && !line.startsWith('@'))
+          .join('\n')
+      )
+      .join('\n')
+      .trim();
+    return cleaned || undefined;
+  }
+
+  // Deterministic purpose heuristic: first sentence of the docstring.
+  // Honest nulls when there is no docstring — no synthesized summaries.
+  protected extractPurpose(docstring: string | undefined): string | undefined {
+    if (!docstring) return undefined;
+    const firstLine = docstring
+      .split('\n')
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+    if (!firstLine) return undefined;
+    const sentence = firstLine.match(/^[^.!?\n]+[.!?]?/)?.[0]?.trim();
+    return sentence || undefined;
   }
 
   protected createExportRel(filePath: string, stableId: string, node: any): Relationship {
@@ -263,13 +332,14 @@ export abstract class BaseExtractor implements LanguageExtractor {
   }
 
   protected isTestFunction(name: string): boolean {
-    // Detect test functions by naming patterns
+    // Detect test functions by naming patterns (word-boundary anchored to
+    // avoid matching item/iterate/contest/etc).
     const lowerName = name.toLowerCase();
-    return lowerName.startsWith('test') || 
-           lowerName.startsWith('it') ||
-           lowerName.startsWith('should') ||
-           lowerName.startsWith('describe') ||
-           lowerName.startsWith('expect');
+    return /^test\b/.test(lowerName) ||
+           /^it\b/.test(lowerName) ||
+           /^should\b/.test(lowerName) ||
+           /^describe\b/.test(lowerName) ||
+           /^expect\b/.test(lowerName);
   }
 
   protected isTestSuite(name: string): boolean {
@@ -280,15 +350,15 @@ export abstract class BaseExtractor implements LanguageExtractor {
   }
 
   protected isTestFileByContent(content: string): boolean {
-    // Detect test files by content patterns
+    // Detect test files by content patterns (word-boundary anchored).
     const testPatterns = [
-      /describe\s*\(/,
-      /it\s*\(/,
-      /test\s*\(/,
-      /expect\s*\(/,
-      /assert\./,
-      /pytest\.mark/,
-      /unittest\.TestCase/,
+      /\bdescribe\s*\(/,
+      /\bit\s*\(/,
+      /\btest\s*\(/,
+      /\bexpect\s*\(/,
+      /\bassert\./,
+      /\bpytest\.mark/,
+      /\bunittest\.TestCase/,
     ];
     return testPatterns.some(pattern => pattern.test(content));
   }

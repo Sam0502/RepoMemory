@@ -5,9 +5,9 @@ import { z } from 'zod';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { parseDomainConfig, streamBoundaries, streamDeadCode, resolveBatchSize } from '@repo-memory/analysis';
-import { EntityRepository, RelationshipRepository, CommitRepository } from '@repo-memory/storage';
+import { EntityRepository, RelationshipRepository, CommitRepository, listWorkspaceRepos } from '@repo-memory/storage';
 import { RelationshipType } from '@repo-memory/shared';
-import { ContextPackBuilder, QaService } from '@repo-memory/services';
+import { ContextPackBuilder, QaService, readEntitySource, MAX_SOURCE_LINES } from '@repo-memory/services';
 import { createMcpServices } from './services.js';
 import type { McpServerConfig, McpServices } from './services.js';
 
@@ -17,6 +17,7 @@ const BOUNDARY_TYPES = [
   RelationshipType.REFERENCES,
   RelationshipType.EXTENDS,
   RelationshipType.IMPLEMENTS,
+  RelationshipType.HANDLES,
 ];
 
 const DEAD_CODE_TYPES = [
@@ -25,6 +26,7 @@ const DEAD_CODE_TYPES = [
   RelationshipType.IMPORTS,
   RelationshipType.EXTENDS,
   RelationshipType.IMPLEMENTS,
+  RelationshipType.HANDLES,
 ];
 
 function toolResult(data: unknown): CallToolResult {
@@ -57,7 +59,7 @@ function taskBuilderFor(services: McpServices, repoPath: string): ContextPackBui
   return new ContextPackBuilder(
     new EntityRepository(services.pgPool, repoPath),
     new CommitRepository(services.pgPool, repoPath),
-    services.graphClient,
+    services.traversal,
     {
       embedder: services.embedder,
       changeAnalyzer: services.changeAnalyzer,
@@ -129,11 +131,16 @@ function registerTools(server: McpServer, services: McpServices): void {
     },
     async ({ stableId, depth }) => {
       const d = depth ?? 1;
-      const entities =
-        d <= 1
-          ? (await services.graphClient.findDependencies(stableId, services.repoPath)).map(x => x.entity)
-          : await services.graphClient.findTransitiveDependencies(stableId, d, services.repoPath);
-      return toolResult({ stableId, depth: d, entities, count: entities.length });
+      if (d <= 1) {
+        const [rows, total] = await Promise.all([
+          services.traversal.findDependencies(stableId, services.repoPath),
+          services.traversal.countDependencies(stableId, services.repoPath),
+        ]);
+        const entities = rows.map(x => x.entity);
+        return toolResult({ stableId, depth: d, entities, count: entities.length, total });
+      }
+      const entities = await services.traversal.findTransitiveDependencies(stableId, d, services.repoPath);
+      return toolResult({ stableId, depth: d, entities, count: entities.length, total: entities.length });
     }
   );
 
@@ -149,11 +156,16 @@ function registerTools(server: McpServer, services: McpServices): void {
     },
     async ({ stableId, depth }) => {
       const d = depth ?? 1;
-      const entities =
-        d <= 1
-          ? (await services.graphClient.findDependents(stableId, services.repoPath)).map(x => x.entity)
-          : await services.graphClient.findTransitiveDependents(stableId, d, services.repoPath);
-      return toolResult({ stableId, depth: d, entities, count: entities.length });
+      if (d <= 1) {
+        const [rows, total] = await Promise.all([
+          services.traversal.findDependents(stableId, services.repoPath),
+          services.traversal.countDependents(stableId, services.repoPath),
+        ]);
+        const entities = rows.map(x => x.entity);
+        return toolResult({ stableId, depth: d, entities, count: entities.length, total });
+      }
+      const entities = await services.traversal.findTransitiveDependents(stableId, d, services.repoPath);
+      return toolResult({ stableId, depth: d, entities, count: entities.length, total: entities.length });
     }
   );
 
@@ -165,17 +177,48 @@ function registerTools(server: McpServer, services: McpServices): void {
       inputSchema: z.object({ stableId: z.string() }),
     },
     async ({ stableId }) => {
-      const directImpact = await services.graphClient.findDependents(stableId, services.repoPath);
-      const indirectImpact = await services.graphClient.findTransitiveDependents(stableId, 3, services.repoPath);
-      const affectedFiles = new Set<string>();
-      directImpact.forEach(d => affectedFiles.add(d.entity.filePath));
-      indirectImpact.forEach(e => affectedFiles.add(e.filePath));
-      return toolResult({
-        directImpact: directImpact.map(d => d.entity),
-        indirectImpact,
-        affectedFiles: [...affectedFiles],
-        riskScore: Math.min(1.0, directImpact.length * 0.1 + indirectImpact.length * 0.05),
-      });
+      return toolResult(await services.qaService.computeImpact(stableId));
+    }
+  );
+
+  server.registerTool(
+    'entity_members',
+    {
+      title: 'Get members',
+      description: 'Member entities contained in a class, file, or other parent (methods of a class, top-level symbols of a file).',
+      inputSchema: z.object({
+        stableId: z.string(),
+        limit: z.number().int().min(1).max(500).optional(),
+      }),
+    },
+    async ({ stableId, limit }) => {
+      const entity = await services.workspaceEntityRepo.findByStableId(stableId);
+      if (!entity) return toolResult({ error: `Entity not found: ${stableId}` });
+      const scope = entity.repoPath || services.repoPath;
+      const [rows, total] = await Promise.all([
+        services.traversal.findMembers(stableId, scope, limit ?? 100),
+        services.traversal.countMembers(stableId, scope),
+      ]);
+      const entities = rows.map(x => x.entity);
+      return toolResult({ stableId, entities, count: entities.length, total });
+    }
+  );
+
+  server.registerTool(
+    'entity_source',
+    {
+      title: 'Get source',
+      description: 'Exact source lines for an entity (working-tree content, path-jailed to its repository).',
+      inputSchema: z.object({
+        stableId: z.string(),
+        maxLines: z.number().int().min(1).max(10000).optional(),
+      }),
+    },
+    async ({ stableId, maxLines }) => {
+      const entity = await services.workspaceEntityRepo.findByStableId(stableId);
+      if (!entity) return toolResult({ error: `Entity not found: ${stableId}` });
+      const source = await readEntitySource(entity.repoPath || services.repoPath, entity, maxLines ?? MAX_SOURCE_LINES);
+      return toolResult(source ? { source } : { error: `Source not available for: ${stableId}` });
     }
   );
 
@@ -339,29 +382,8 @@ function registerTools(server: McpServer, services: McpServices): void {
       }),
     },
     async ({ limit }) => {
-      const result = await services.pgPool.query(
-        `SELECT file_path,
-                (ARRAY_AGG(author ORDER BY cnt DESC))[1] AS owner,
-                MAX(cnt) AS commits
-         FROM (
-           SELECT f.file_path, c.author, COUNT(*) AS cnt
-           FROM file_changes f
-           JOIN commits c ON c.hash = f.commit_hash
-           WHERE c.repo_path = $1
-           GROUP BY f.file_path, c.author
-         ) sub
-         GROUP BY file_path
-         ORDER BY file_path
-         LIMIT $2`,
-        [services.repoPath, limit ?? 500]
-      );
-      return toolResult({
-        ownership: result.rows.map(row => ({
-          filePath: row.file_path,
-          owner: row.owner,
-          commits: parseInt(row.commits),
-        })),
-      });
+      const ownership = await services.commitRepo.getOwnership(services.repoPath, limit ?? 500);
+      return toolResult({ ownership });
     }
   );
 
@@ -394,9 +416,12 @@ function registerTools(server: McpServer, services: McpServices): void {
       inputSchema: z.object({ hash: z.string() }),
     },
     async ({ hash }) => {
-      const commit = await services.workspaceCommitRepo.findByHash(hash);
+      const commit =
+        (await services.commitRepo.findByHash(hash)) ||
+        (await services.workspaceCommitRepo.findByHash(hash));
       if (!commit) return toolResult({ error: `Commit not found: ${hash}` });
-      const fileChanges = await services.workspaceCommitRepo.getFileChanges(hash);
+      const scoped = new CommitRepository(services.pgPool, commit.repoPath || services.repoPath);
+      const fileChanges = await scoped.getFileChanges(hash);
       return toolResult({ commit, fileChanges });
     }
   );
@@ -411,26 +436,14 @@ function registerTools(server: McpServer, services: McpServices): void {
       inputSchema: z.object({}),
     },
     async () => {
-      const result = await services.pgPool.query(
-        `SELECT e.repo_path AS repo_path,
-                COUNT(e.id)::int AS entity_count,
-                (SELECT COUNT(*)::int FROM commits c WHERE c.repo_path = e.repo_path) AS commit_count
-         FROM entities e
-         WHERE e.repo_path <> ''
-         GROUP BY e.repo_path
-         ORDER BY e.repo_path`
-      );
-      const state = await services.pgPool.query(
-        'SELECT repo_path, last_commit_hash, last_scan_at FROM repo_state'
-      );
-      const stateByPath = new Map(state.rows.map(r => [r.repo_path, r]));
+      const repos = await listWorkspaceRepos(services.pgPool);
       return toolResult({
-        repos: result.rows.map(row => ({
-          repoPath: row.repo_path,
-          entityCount: parseInt(row.entity_count),
-          commitCount: parseInt(row.commit_count),
-          lastCommitHash: stateByPath.get(row.repo_path)?.last_commit_hash || null,
-          lastScanAt: stateByPath.get(row.repo_path)?.last_scan_at || null,
+        repos: repos.map(row => ({
+          repoPath: row.repoPath,
+          entityCount: row.entityCount,
+          commitCount: row.commitCount,
+          lastCommitHash: row.lastCommitHash,
+          lastScanAt: row.lastScanAt,
         })),
       });
     }
@@ -470,7 +483,7 @@ function registerTools(server: McpServer, services: McpServices): void {
             new EntityRepository(services.pgPool, scope),
             new RelationshipRepository(services.pgPool, scope),
             new CommitRepository(services.pgPool, scope),
-            services.graphClient,
+            services.traversal,
             services.pgPool,
             false,
             scope

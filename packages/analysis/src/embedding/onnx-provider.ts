@@ -1,4 +1,3 @@
-import { pipeline, env } from '@xenova/transformers';
 import { EmbeddingProvider } from './provider.js';
 import { getLogger } from '@repo-memory/shared';
 
@@ -10,18 +9,21 @@ export class OnnxEmbeddingProvider implements EmbeddingProvider {
   readonly name = 'onnx';
   readonly dimensions = 384;
 
-  constructor(private modelId: string = 'Xenova/all-MiniLM-L6-v2', cacheDir?: string) {
-    if (cacheDir) {
-      env.cacheDir = cacheDir;
-    }
-    env.allowRemoteModels = true;
-    env.localModelPath = '';
-  }
+  constructor(private modelId: string = 'Xenova/all-MiniLM-L6-v2', private cacheDir?: string) {}
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
     logger.info({ modelId: this.modelId }, 'Loading embedding model');
     try {
+      // Lazy import so `@xenova/transformers` (onnxruntime native) loads only
+      // when the ONNX provider is actually used — placeholder/gemini scans
+      // never pay for it.
+      const { pipeline, env } = await import('@xenova/transformers');
+      if (this.cacheDir) {
+        env.cacheDir = this.cacheDir;
+      }
+      env.allowRemoteModels = true;
+      env.localModelPath = '';
       this.extractor = await pipeline('feature-extraction', this.modelId, {
         quantized: true,
       });

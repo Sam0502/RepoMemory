@@ -13,13 +13,13 @@ A repository-scale memory engine that continuously scans source code, extracts s
 - **Change analytics**: churn, risk, and architectural drift scoring from commit history
 - **Natural-language QA**: intent-classified answers with evidence, compound/multi-hop questions
 - **Context packs**: token-budgeted dossiers for AI agents — by stable ID (`context-pack`) or from a natural-language task (`context-packs/task`, the MCP `task_context` tool)
-- **MCP server**: a Model Context Protocol stdio server (`repo-memory mcp`) exposing 21 read-only tools for AI agents
+- **MCP server**: a Model Context Protocol stdio server (`repo-memory mcp`) exposing 23 read-only tools for AI agents
 - **Workspace-wide (cross-repo) queries**: search, QA, and reporting across all scanned repositories
 - **Streaming analysis**: dead-code, boundaries, risk, and drift run over bounded paged windows (`ANALYSIS_BATCH_SIZE`) so memory stays flat at any repo size
-- **Reconciliation & repair jobs**: `verify`/`repair` dual-store (PostgreSQL vs Neo4j) consistency via CLI and API, persisted to the `jobs` table
+- **Integrity jobs**: `verify`/`repair` PostgreSQL integrity via CLI and API, persisted to the `jobs` table
 - **Live file watching**: `watch` re-scans changed files on every edit (debounced) via the incremental path
 - **Versioned schema migrations**: numbered, idempotent, advisory-locked migrations (`repo-memory db migrate`)
-- **Observability**: pino structured logging (`PINO_LOG_LEVEL`), per-phase scan telemetry, Prometheus `/metrics`
+- **Observability**: dependency-free structured JSON logging (`PINO_LOG_LEVEL`, pino-compatible output), per-phase scan telemetry, Prometheus `/metrics`
 - **Optional API auth**: `REPO_MEMORY_API_TOKEN` gates all `/api/*` endpoints; the frontend bootstraps it from a served `config.js`
 - **CLI and HTTP API** for both developers and AI agents
 
@@ -29,8 +29,7 @@ A repository-scale memory engine that continuously scans source code, extracts s
 - **Language:** TypeScript
 - **Build Tool:** tsup
 - **Dev Server:** tsx watch
-- **Graph Database:** Neo4j (Docker)
-- **Metadata Database:** PostgreSQL + pgvector (Docker)
+- **Database:** PostgreSQL + pgvector (Docker) — the only store; graph traversal runs as recursive CTEs via `TraversalService` in `@repo-memory/storage`
 - **Parser:** Tree-sitter WASM (v0.22.6)
 - **API Framework:** Hono
 - **MCP:** `@modelcontextprotocol/sdk` (v1.30.0, zod 4)
@@ -39,7 +38,7 @@ A repository-scale memory engine that continuously scans source code, extracts s
 ## Project Structure
 ```
 RepoMemory/
-├── docker-compose.yml          # Neo4j + PostgreSQL
+├── docker-compose.yml          # PostgreSQL
 ├── package.json                # Root workspace
 ├── pnpm-workspace.yaml
 ├── tsconfig.json
@@ -60,11 +59,10 @@ RepoMemory/
 │   │   ├── change.ts           # ChangeAnalyzer (churn, risk, drift)
 │   │   ├── streaming.ts        # Bounded-window streaming analysis
 │   │   └── embedding/          # Embedding providers
-│   ├── graph/                  # Neo4j client
-│   ├── storage/                # PostgreSQL client
+│   ├── storage/                # PostgreSQL client + traversal (recursive-CTE graph queries)
 │   │   └── migrations/         # Versioned, idempotent schema migrations
 │   ├── services/               # Shared business logic (QA + context packs) reused by API & MCP
-│   ├── mcp/                    # Model Context Protocol server (stdio, 21 read-only tools)
+│   ├── mcp/                    # Model Context Protocol server (stdio, 23 read-only tools)
 │   └── api/                    # Hono HTTP API + QA + context packs
 ├── app/                        # CLI + orchestration
 └── web/                        # Frontend (HTML/CSS/JS)
@@ -163,21 +161,20 @@ node app/dist/cli.js serve --repo /path/to/repo --port 3000
 # Watch a repo live — re-scans changed files on every edit (debounced), serves API
 node app/dist/cli.js watch --repo /path/to/repo --port 3000 --debounce 500
 
-# Serve the memory as read-only MCP tools over stdio for AI agents (21 tools)
+# Serve the memory as read-only MCP tools over stdio for AI agents (23 tools)
 node app/dist/cli.js mcp --repo /path/to/repo
 
 # Show stats
 node app/dist/cli.js stats --repo /path/to/repo
 ```
 
-### Reconciliation & repair jobs
+### Integrity jobs
 ```bash
-# Compare PostgreSQL vs Neo4j for a repo (per-type counts, missing/orphan
-# entities + relationships, duplicate graph nodes, embedding nulls)
+# Check PostgreSQL integrity for a repo (per-type counts, duplicate stable
+# IDs, dangling edges, embedding nulls)
 node app/dist/cli.js jobs verify --repo /path/to/repo
 
-# Re-sync Neo4j from PostgreSQL: upsert missing entities/relationships, delete
-# orphan graph nodes/edges, re-embed entities with null embeddings
+# Repair: re-embed entities with null embeddings, then re-verify
 node app/dist/cli.js jobs repair --repo /path/to/repo
 
 # Run a job against every scanned repository
@@ -201,6 +198,8 @@ pnpm --filter @repo-memory/storage db:migrate
 - `GET /api/entities/type/:type` - Get entities by type
 - `GET /api/entities/file/:filePath` - Get entities by file
 - `GET /api/entities/similar/:stableId` - Find similar entities
+- `GET /api/entities/:stableId/members` - Member entities (methods of a class, symbols of a file)
+- `GET /api/entities/:stableId/source` - Exact source lines for an entity (`?maxLines=`)
 - `GET /api/relationships` - List relationships
 - `GET /api/graph/traverse/:stableId` - Traverse graph
 - `GET /api/graph/dependencies/:stableId` - Get dependencies
@@ -220,10 +219,10 @@ pnpm --filter @repo-memory/storage db:migrate
 - `GET /api/analysis/risk/:stableId` - Entity-level change/risk info
 - `GET /api/analysis/drift` - Architecture drift signals with evidence
 - `POST /api/qa/ask` - Natural-language QA (`{"question": "..."}`)
-- `GET /api/jobs` - List reconciliation/repair jobs (`?type=`, `?limit=`)
+- `GET /api/jobs` - List integrity jobs (`?type=`, `?limit=`)
 - `GET /api/jobs/:id` - Get a job + its report
 - `POST /api/jobs/verify` - Run a verify job (`{"repoPath": "..."}`; 501 without a wired job runner)
-- `POST /api/jobs/repair` - Run a repair job (re-syncs Neo4j from PostgreSQL)
+- `POST /api/jobs/repair` - Run a repair job (re-embeds missing embeddings, then re-verifies)
 - `GET /api/workspace/repos` - List all scanned repositories + stats
 - `GET /api/workspace/entities` - Cross-repo entity list (optional `repoPath` filter)
 - `GET /api/workspace/entities/search/:query` - Cross-repo search
@@ -237,11 +236,6 @@ All non-workspace endpoints are scoped to the repository passed to `serve --repo
 
 ## Environment Variables
 ```bash
-# Neo4j
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=repo-memory-password
-
 # PostgreSQL
 PG_HOST=localhost
 PG_PORT=5433
@@ -251,6 +245,7 @@ PG_PASSWORD=repo-memory-password
 
 # Embeddings
 EMBEDDING_PROVIDER=onnx        # onnx, gemini, or placeholder
+EMBEDDING_MODEL=               # override per-provider model (onnx: all-MiniLM-L6-v2, gemini: text-embedding-004)
 GEMINI_API_KEY=your-key         # if using gemini
 EMBEDDING_CACHE_DIR=./models    # model cache directory
 
@@ -261,9 +256,14 @@ ANALYSIS_BATCH_SIZE=5000        # page size for streaming dead-code/boundaries/r
 PINO_LOG_LEVEL=info             # fatal/error/warn/info/debug/trace (structured JSON to stderr)
 METRICS_ENABLED=true            # set to 'false' to disable the /metrics endpoint
 
-# API auth (optional) — when set, all /api/* endpoints require
+# API auth (optional) — when set, all /api/* endpoints (+ /metrics) require
 # Authorization: Bearer <token>; the frontend reads it from /config.js
+# (loopback-only; set ALLOW_TOKEN_BOOTSTRAP=false to disable the bootstrap)
 REPO_MEMORY_API_TOKEN=
+ALLOW_TOKEN_BOOTSTRAP=true
+
+# Frontend CORS origin
+CORS_ORIGIN=http://localhost:3000
 ```
 
 ## Multi-Repository Support
@@ -274,7 +274,6 @@ REPO_MEMORY_API_TOKEN=
 - Rescan a repo to re-tag existing data after upgrading from a pre-multi-repo version
 
 ## Docker Services
-- **Neo4j:** http://localhost:7474 (browser), bolt://localhost:7687
 - **PostgreSQL:** localhost:5433
 
 ## Known Issues
@@ -282,12 +281,12 @@ REPO_MEMORY_API_TOKEN=
 - ONNX embedding model must be downloaded separately: `pnpm --filter @repo-memory/analysis download-model`
 
 ## Testing
-Vitest is the test runner (`pnpm test`, `pnpm test:watch`) — 145 tests across 22 files covering
+Vitest is the test runner (`pnpm test`, `pnpm test:watch`) — 173 tests across 24 files covering
 shared (logger, metrics, types, IDs), analysis (extractors, resolver, dead-code, domains,
-boundaries, change, streaming, embeddings), storage (migrations + PG integration), api (QA,
+boundaries, change, streaming, embeddings), storage (migrations, traversal, integrity + PG integration), api (QA,
 context packs, status), services (task context packs), mcp (tool registry), and ingestion (git,
 file watcher). Storage integration tests
-auto-skip when Postgres is unreachable. ESLint (`pnpm lint`) + `pnpm typecheck` (7 projects)
+auto-skip when Postgres is unreachable. ESLint (`pnpm lint`) + `pnpm typecheck` (8 projects)
 are wired into the same quality gate. Beyond tests, verify functionality with:
 ```bash
 # Scan a test repository

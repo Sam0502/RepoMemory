@@ -23,7 +23,7 @@ describe('QaService.classifyIntent', () => {
 
   it('classifies dependent questions', () => {
     expect(service.classifyIntent('who calls createUser?')).toBe('dependents');
-    expect(service.classifyIntent('who uses GraphClient?')).toBe('dependents');
+    expect(service.classifyIntent('who uses TraversalService?')).toBe('dependents');
   });
 
   it('classifies location questions', () => {

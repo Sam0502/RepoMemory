@@ -50,6 +50,11 @@ export class PythonExtractor extends BaseExtractor {
           (child.type === 'function_definition' || child.type === 'class_definition')) {
         continue;
       }
+      // class_definition already extracts its body via extractClass —
+      // skip the block to avoid duplicate METHOD entities.
+      if (nodeType === 'class_definition' && (child.type === 'block' || child.type === 'function_definition' || child.type === 'assignment' || child.type === 'decorated_definition')) {
+        continue;
+      }
       this.extractNodes(child, ctx, entities, relationships);
     }
   }
@@ -294,9 +299,11 @@ export class PythonExtractor extends BaseExtractor {
           const symbol = child.text;
           relationships.push(this.createImportSymbolRel(ctx.filePath, symbol, importPath, node));
         } else if (child.type === 'aliased_import') {
-          const nameNode = this.findChildByType(child, 'identifier');
-          if (nameNode) {
-            relationships.push(this.createImportSymbolRel(ctx.filePath, nameNode.text, importPath, node));
+          // `from x import y as z` binds z locally — store the alias.
+          const ids = (child.children || []).filter((c: any) => c.type === 'identifier' || c.type === 'dotted_name');
+          const aliasNode = ids[ids.length - 1];
+          if (aliasNode) {
+            relationships.push(this.createImportSymbolRel(ctx.filePath, aliasNode.text, importPath, node));
           }
         }
       }

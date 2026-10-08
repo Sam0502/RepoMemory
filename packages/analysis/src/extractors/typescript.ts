@@ -45,6 +45,18 @@ export class TypeScriptExtractor extends BaseExtractor {
     }
 
     for (const child of node.children) {
+      // class_declaration already extracts its members via extractClass —
+      // skip them here to avoid duplicate METHOD/PROPERTY entities.
+      if (
+        nodeType === 'class_declaration' &&
+        (child.type === 'class_body' ||
+          child.type === 'method_definition' ||
+          child.type === 'property_definition' ||
+          child.type === 'public_field_definition' ||
+          child.type === 'constructor_definition')
+      ) {
+        continue;
+      }
       this.extractNodes(child, ctx, entities, relationships);
     }
   }

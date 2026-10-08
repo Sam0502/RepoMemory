@@ -4,7 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Repository Memory Explorer</title>
-  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script
+    src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"
+    integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i"
+    crossorigin="anonymous"></script>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -79,11 +82,11 @@
       <div id="jobsPanel" class="hidden">
         <div class="panel-header">
           <h2>Reconciliation Jobs</h2>
-          <span class="panel-note" title="Compare and re-sync PostgreSQL with Neo4j">&#9432;</span>
+          <span class="panel-note" title="Check PostgreSQL integrity: per-type counts, duplicate IDs, dangling edges, stale files, embedding nulls">&#9432;</span>
         </div>
         <div class="jobs-toolbar">
-          <button id="jobsVerifyBtn" class="job-btn" title="Compare PostgreSQL vs Neo4j: per-type counts, missing/orphan entities + relationships, duplicate graph nodes, embedding nulls">Verify</button>
-          <button id="jobsRepairBtn" class="job-btn repair" title="Re-sync Neo4j from PostgreSQL: upsert missing entities/relationships, delete orphan graph nodes/edges, re-embed entities with null embeddings">Repair</button>
+          <button id="jobsVerifyBtn" class="job-btn" title="Verify PostgreSQL integrity: per-type counts, duplicate stable IDs, dangling sources, stale files, embedding nulls">Verify</button>
+          <button id="jobsRepairBtn" class="job-btn repair" title="Repair: delete ghost rows for missing files, re-embed entities with null embeddings, then re-verify">Repair</button>
           <button id="jobsRefreshBtn" class="icon-btn" title="Refresh list">&#x21bb;</button>
         </div>
         <div id="jobsDetail" class="jobs-detail"></div>

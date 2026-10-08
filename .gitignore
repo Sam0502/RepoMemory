@@ -49,9 +49,6 @@ temp/
 
 # Local database and storage
 pgdata/
-neo4j/
-neo4j/data/
-neo4j/logs/
 
 # Embeddings / models
 models/

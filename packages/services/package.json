@@ -14,13 +14,12 @@
   "scripts": {
     "build": "tsup src/index.ts --format esm --dts",
     "typecheck": "tsc --noEmit",
-    "lint": "tsc --noEmit",
+    "lint": "eslint src test --max-warnings=0",
     "test": "vitest run"
   },
   "dependencies": {
     "@repo-memory/shared": "workspace:*",
     "@repo-memory/analysis": "workspace:*",
-    "@repo-memory/graph": "workspace:*",
     "@repo-memory/storage": "workspace:*",
     "pg": "^8.13.0"
   },

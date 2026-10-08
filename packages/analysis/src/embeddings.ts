@@ -81,6 +81,12 @@ export function getProviderName(): string {
   return currentProvider?.name || 'placeholder';
 }
 
+export function getProviderSignature(): { provider: string; model: string } {
+  const provider = currentProvider?.name || process.env.EMBEDDING_PROVIDER || 'placeholder';
+  const model = process.env.EMBEDDING_MODEL || (provider === 'onnx' ? 'all-MiniLM-L6-v2' : provider === 'gemini' ? 'text-embedding-004' : 'placeholder-sha256');
+  return { provider, model };
+}
+
 export async function initializeEmbeddings(): Promise<void> {
   if (currentProvider?.initialize) {
     await currentProvider.initialize();

@@ -135,6 +135,44 @@ describe('TypeScriptExtractor', () => {
     expect(user.startLine).toBeGreaterThan(0);
     expect(user.endLine).toBeGreaterThanOrEqual(user.startLine);
   });
+
+  it('fills signature, docstring, and purpose from JSDoc', async () => {
+    const sample = `/** Adds two numbers.
+ * @param a first
+ * @param b second
+ */
+export function add(a: number, b: number): number {
+  return a + b;
+}
+
+/** A tiny calculator. */
+export class Calculator {
+  /** Divides x by y. Returns the quotient. */
+  divide(x: number, y: number): number {
+    return x / y;
+  }
+}
+`;
+    const result = await tsParser.parse('src/math.ts', sample, '/repo');
+    const add = result.entities.find(e => e.name === 'add')!;
+    expect(add.signature).toContain('function add(a: number, b: number): number');
+    expect(add.docstring).toBe('Adds two numbers.');
+    expect(add.purpose).toBe('Adds two numbers.');
+    const calc = result.entities.find(e => e.name === 'Calculator')!;
+    expect(calc.docstring).toBe('A tiny calculator.');
+    const divide = result.entities.find(e => e.name === 'divide')!;
+    expect(divide.signature).toContain('divide(x: number, y: number): number');
+    expect(divide.docstring).toBe('Divides x by y. Returns the quotient.');
+    expect(divide.purpose).toBe('Divides x by y.');
+  });
+
+  it('leaves docstring and purpose empty without comments', async () => {
+    const result = await tsParser.parse('src/plain.ts', 'export function nodoc(): void {}\n', '/repo');
+    const fn = result.entities.find(e => e.name === 'nodoc')!;
+    expect(fn.signature).toContain('function nodoc()');
+    expect(fn.docstring).toBeUndefined();
+    expect(fn.purpose).toBeUndefined();
+  });
 });
 
 describe('PythonExtractor', () => {

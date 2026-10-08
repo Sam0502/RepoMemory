@@ -171,6 +171,30 @@ export class CommitRepository {
     return result.rows.map(this.mapRowToCommit);
   }
 
+  async getOwnership(repoPath: string, limit: number = 500): Promise<Array<{ filePath: string; owner: string; commits: number }>> {
+    const result = await this.pool.query(
+      `SELECT file_path,
+              (ARRAY_AGG(author ORDER BY cnt DESC))[1] AS owner,
+              MAX(cnt) AS commits
+       FROM (
+         SELECT f.file_path, c.author, COUNT(*) AS cnt
+         FROM file_changes f
+         JOIN commits c ON c.hash = f.commit_hash AND c.repo_path = f.repo_path
+         WHERE f.repo_path = $1
+         GROUP BY f.file_path, c.author
+       ) sub
+       GROUP BY file_path
+       ORDER BY file_path
+       LIMIT $2`,
+      [repoPath, limit]
+    );
+    return result.rows.map(row => ({
+      filePath: row.file_path,
+      owner: row.owner,
+      commits: parseInt(row.commits, 10),
+    }));
+  }
+
   async deleteByHash(hash: string): Promise<void> {
     const query = this.repoPath
       ? 'DELETE FROM commits WHERE hash = $1 AND repo_path = $2'

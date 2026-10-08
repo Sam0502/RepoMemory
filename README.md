@@ -24,8 +24,8 @@ RepoMemory parses your codebase, builds a knowledge graph of entities (classes, 
 - **Ownership & domain inference** - per-file authors, domain/architectural-role classification, boundary validation
 - **Change analytics** - churn, risk, and architectural drift scoring from commit history
 - **Workspace queries** - cross-repo search, QA, and reporting across all scanned repositories
-- **Structured logging & metrics** - pino JSON logs with `PINO_LOG_LEVEL`, per-phase scan telemetry, and a Prometheus `/metrics` endpoint
-- **Reconciliation & repair jobs** - `verify`/`repair` dual-store (PostgreSQL vs Neo4j) consistency jobs via CLI and API, persisted to the `jobs` table
+- **Structured logging & metrics** - dependency-free JSON logs with `PINO_LOG_LEVEL`, per-phase scan telemetry, and a Prometheus `/metrics` endpoint
+- **Integrity jobs** - `verify`/`repair` PostgreSQL integrity jobs via CLI and API (per-type counts, duplicate IDs, dangling edges, embedding backfill), persisted to the `jobs` table
 - **Streaming analysis** - dead-code, boundaries, risk, and drift run over bounded paged windows (`ANALYSIS_BATCH_SIZE`) instead of loading whole repos, with a `pnpm bench` harness
 - **Live file watching** - `repo-memory watch` re-scans changed files on every edit (debounced) via the incremental path, with a live status indicator in the frontend
 - **Versioned schema migrations** - numbered, idempotent, advisory-locked migrations (`repo-memory db migrate`), including repo-scoped commit identity
@@ -36,7 +36,7 @@ RepoMemory parses your codebase, builds a knowledge graph of entities (classes, 
 
 - Node.js 20+
 - pnpm (`npm install -g pnpm`)
-- Docker (for Neo4j and PostgreSQL)
+- Docker (for PostgreSQL)
 
 ## Quick Start
 
@@ -63,7 +63,7 @@ node app/dist/cli.js serve --repo /path/to/your/repo --port 3000
 
 ```
 RepoMemory/
-├── docker-compose.yml          # Neo4j + PostgreSQL
+├── docker-compose.yml          # PostgreSQL
 ├── package.json                # Root workspace
 ├── pnpm-workspace.yaml
 ├── tsconfig.json
@@ -84,8 +84,7 @@ RepoMemory/
 │   │   ├── change.ts           # ChangeAnalyzer (churn, risk, drift)
 │   │   ├── streaming.ts        # Bounded-window streaming analysis
 │   │   └── embedding/          # Embedding providers
-│   ├── graph/                  # Neo4j client
-│   ├── storage/                # PostgreSQL client
+│   ├── storage/                # PostgreSQL client + traversal (recursive-CTE graph queries)
 │   │   └── migrations/         # Versioned, idempotent schema migrations
 │   ├── services/               # Shared business logic (QA service, context packs) used by API + MCP
 │   ├── mcp/                    # Model Context Protocol server (stdio, read-only tools)
@@ -119,7 +118,7 @@ node app/dist/cli.js watch --repo /path/to/repo --port 3000
 node app/dist/cli.js mcp --repo /path/to/repo
 
 # Query entities
-node app/dist/cli.js query search "GraphClient"
+node app/dist/cli.js query search "createUser"
 
 # Look up an entity by stable ID
 node app/dist/cli.js query entity <stableId>
@@ -149,7 +148,7 @@ node app/dist/cli.js db migrate
 # Show repository stats
 node app/dist/cli.js stats --repo /path/to/repo
 
-# Reconciliation & repair jobs (PostgreSQL vs Neo4j; also accept --all-repos)
+# Integrity jobs (also accept --all-repos)
 node app/dist/cli.js jobs verify --repo /path/to/repo
 node app/dist/cli.js jobs repair --repo /path/to/repo
 ```
@@ -166,10 +165,12 @@ node app/dist/cli.js jobs repair --repo /path/to/repo
 | GET | `/api/entities/type/:type` | Get entities by type |
 | GET | `/api/entities/file/:filePath` | Get entities by file |
 | GET | `/api/entities/similar/:stableId` | Find similar entities |
+| GET | `/api/entities/:stableId/members` | Member entities (methods of a class, symbols of a file) |
+| GET | `/api/entities/:stableId/source` | Exact source lines for an entity (`?maxLines=`) |
 | GET | `/api/relationships` | List relationships |
 | GET | `/api/graph/traverse/:stableId` | Traverse graph |
-| GET | `/api/graph/dependencies/:stableId` | Get dependencies |
-| GET | `/api/graph/dependents/:stableId` | Get dependents |
+| GET | `/api/graph/dependencies/:stableId` | Get dependencies (`?limit=`, with `total`) |
+| GET | `/api/graph/dependents/:stableId` | Get dependents (`?limit=`, with `total`) |
 | GET | `/api/graph/transitive/:stableId` | Get transitive dependencies |
 | GET | `/api/graph/architecture` | Architecture graph (file-level) |
 | GET | `/api/commits` | List recent commits |
@@ -187,8 +188,8 @@ node app/dist/cli.js jobs repair --repo /path/to/repo
 | POST | `/api/qa/ask` | Natural-language QA (`{"question": "..."}`) |
 | GET | `/api/jobs` | List reconciliation/repair jobs (`?type=`, `?limit=`) |
 | GET | `/api/jobs/:id` | Get a job + its report |
-| POST | `/api/jobs/verify` | Verify PostgreSQL vs Neo4j (`{"repoPath": "..."}`) |
-| POST | `/api/jobs/repair` | Repair: re-sync Neo4j from PostgreSQL |
+| POST | `/api/jobs/verify` | Verify PostgreSQL integrity (`{"repoPath": "..."}`) |
+| POST | `/api/jobs/repair` | Repair: re-embed missing embeddings, then re-verify |
 | GET | `/api/workspace/repos` | List all scanned repositories + stats |
 | GET | `/api/workspace/entities` | Cross-repo entity list |
 | GET | `/api/workspace/entities/search/:query` | Cross-repo search |
@@ -204,12 +205,9 @@ All non-workspace endpoints are scoped to the repository passed to `serve --repo
 
 | Service | Port | URL |
 |---------|------|-----|
-| Neo4j Browser | 7474 | http://localhost:7474 |
-| Neo4j Bolt | 7687 | bolt://localhost:7687 |
 | PostgreSQL | 5433 | localhost:5433 |
 
 **Credentials:**
-- Neo4j: `neo4j` / `repo-memory-password`
 - PostgreSQL: `repo_memory` / `repo-memory-password` (database: `repo_memory`)
 
 ## Multi-Repository Support
@@ -223,11 +221,6 @@ All non-workspace endpoints are scoped to the repository passed to `serve --repo
 ## Environment Variables
 
 ```bash
-# Neo4j
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=repo-memory-password
-
 # PostgreSQL
 PG_HOST=localhost
 PG_PORT=5433
@@ -247,7 +240,7 @@ EMBEDDING_CACHE_DIR=./models
 # Analysis page size for streaming dead-code/boundaries/risk/drift (default 5000)
 ANALYSIS_BATCH_SIZE=5000
 
-# Structured logging level for the pino logger (fatal/error/warn/info/debug/trace)
+# Structured logging level (fatal/error/warn/info/debug/trace)
 PINO_LOG_LEVEL=info
 
 # Expose the /metrics Prometheus endpoint (set to 'false' to disable)
@@ -306,8 +299,7 @@ pnpm db:down
 - Multi-provider embeddings (ONNX local, Gemini API, placeholder fallback)
 
 ### Storage Layer
-- **PostgreSQL** (port 5433): entities, relationships, commits, job state, embeddings (pgvector)
-- **Neo4j** (port 7687): graph traversal, relationship queries
+- **PostgreSQL** (port 5433): entities, relationships, commits, job state, embeddings (pgvector); graph traversal (dependencies, dependents, transitive closure, shortest path) runs as recursive CTEs via `TraversalService` — no second database
 
 ### API Layer
 - Hono HTTP server
@@ -320,8 +312,21 @@ pnpm db:down
 
 ### MCP (Model Context Protocol) Layer
 - `packages/mcp` — read-only stdio server (`repo-memory mcp --repo <path>`)
-- 21 tools: entity lookup/search/similarity/dependencies/dependents/impact, context packs, task context packs, QA, analysis reports (dead code, boundaries, churn, risk, drift, ownership), commits, and cross-repo workspace queries
+- 23 tools: entity lookup/search/similarity/dependencies/dependents/impact/members/source, context packs, task context packs, QA, analysis reports (dead code, boundaries, churn, risk, drift, ownership), commits, and cross-repo workspace queries
 - Reuses the same `packages/services` business logic as the HTTP API (QA + context packs)
+
+To connect an MCP-aware agent, point it at the built CLI over stdio (build first with `pnpm build`, make sure PostgreSQL is up and the repo has been scanned):
+
+```json
+{
+  "mcpServers": {
+    "repo-memory": {
+      "command": "node",
+      "args": ["D:/RepoMemory/app/dist/cli.js", "mcp", "--repo", "D:/path/to/your/repo"]
+    }
+  }
+}
+```
 
 ### Frontend
 - Entity list with search, type filtering, and repo dropdown (multi-repo)
@@ -330,6 +335,9 @@ pnpm db:down
 - Commit history panel with file changes
 - Entity detail panel with:
   - Core info (type, language, file, lines, exported, confidence)
+  - Signature, purpose, and documentation (JSDoc/docstring)
+  - Source code viewer (exact entity lines, capped)
+  - Members (methods of a class, symbols of a file — click to navigate)
   - Similar entities (semantic search)
   - Impact analysis (risk score, affected files)
   - Context pack (token-budget context for AI)

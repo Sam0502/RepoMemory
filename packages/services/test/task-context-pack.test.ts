@@ -44,7 +44,7 @@ function makeTaskBuilder(mocks: TaskMocks = {}) {
   const commitRepo = {
     findCommitsForFile: async () => mocks.commits ?? [],
   };
-  const graphClient = {
+  const traversal = {
     findDependencies: async () =>
       (mocks.deps ?? []).map(e => ({
         entity: e,
@@ -80,7 +80,7 @@ function makeTaskBuilder(mocks: TaskMocks = {}) {
         }
       : undefined,
   };
-  return new ContextPackBuilder(entityRepo as never, commitRepo as never, graphClient as never, options as never);
+  return new ContextPackBuilder(entityRepo as never, commitRepo as never, traversal as never, options as never);
 }
 
 function commit(message: string, filePath: string, date = new Date()): Commit {

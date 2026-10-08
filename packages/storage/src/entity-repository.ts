@@ -37,7 +37,7 @@ export class EntityRepository {
         domain, architectural_role, is_exported, is_test, confidence,
         first_seen_commit, last_seen_commit
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-      ON CONFLICT (stable_id) DO UPDATE SET
+      ON CONFLICT (repo_path, stable_id) DO UPDATE SET
         name = EXCLUDED.name,
         type = EXCLUDED.type,
         language = EXCLUDED.language,
@@ -98,11 +98,11 @@ export class EntityRepository {
     return result.rows.map(this.mapRowToEntity);
   }
 
-  async findByType(type: EntityType): Promise<Entity[]> {
+  async findByType(type: EntityType, limit: number = 1000): Promise<Entity[]> {
     const query = this.repoPath
-      ? 'SELECT * FROM entities WHERE type = $1 AND repo_path = $2 ORDER BY name'
-      : 'SELECT * FROM entities WHERE type = $1 ORDER BY name';
-    const result = await this.pool.query(query, this.repoPath ? [type, this.repoPath] : [type]);
+      ? 'SELECT * FROM entities WHERE type = $1 AND repo_path = $2 ORDER BY name LIMIT $3'
+      : 'SELECT * FROM entities WHERE type = $1 ORDER BY name LIMIT $2';
+    const result = await this.pool.query(query, this.repoPath ? [type, this.repoPath, limit] : [type, limit]);
     return result.rows.map(this.mapRowToEntity);
   }
 
@@ -210,6 +210,14 @@ export class EntityRepository {
       : 'SELECT stable_id FROM entities';
     const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
     return result.rows.map((row) => row.stable_id);
+  }
+
+  async findAllFilePaths(): Promise<string[]> {
+    const query = this.repoPath
+      ? 'SELECT DISTINCT file_path FROM entities WHERE repo_path = $1'
+      : 'SELECT DISTINCT file_path FROM entities';
+    const result = await this.pool.query(query, this.repoPath ? [this.repoPath] : []);
+    return result.rows.map((row) => row.file_path);
   }
 
   async countWithoutEmbedding(): Promise<number> {

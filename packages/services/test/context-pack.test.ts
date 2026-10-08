@@ -43,11 +43,11 @@ function makeBuilder(options: {
         filesChanged: c.filesChanged,
       })),
   };
-  const graphClient = {
+  const traversal = {
     findDependencies: async () => (options.deps ?? []).map(e => ({ entity: e, relationship: { type: 'CALLS' } })),
     findDependents: async () => (options.dependents ?? []).map(e => ({ entity: e, relationship: { type: 'CALLS' } })),
   };
-  return new ContextPackBuilder(entityRepo as never, commitRepo as never, graphClient as never);
+  return new ContextPackBuilder(entityRepo as never, commitRepo as never, traversal as never);
 }
 
 describe('ContextPackBuilder', () => {

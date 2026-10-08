@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: repo_memory
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d repo_memory"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      PG_HOST: localhost
+      PG_PORT: 5433
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+      PG_DATABASE: repo_memory
+      EMBEDDING_PROVIDER: placeholder
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Quality gate
+        run: pnpm -r run typecheck && pnpm lint && pnpm -r run build && pnpm test
+
+      - name: Pack CLI bundle
+        run: |
+          mkdir -p release-artifacts
+          tar -czf release-artifacts/repo-memory-cli-dist.tar.gz app/dist packages/*/dist
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/repo-memory-cli-dist.tar.gz
+          generate_release_notes: true
+
+      # Opt-in: set the NPM_TOKEN repository secret to publish @repo-memory/app.
+      # Requires removing "private": true from app/package.json first.
+      - name: Publish to npm
+        if: ${{ secrets.NPM_TOKEN != '' }}
+        run: pnpm --filter @repo-memory/app publish --no-git-checks --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }},ghcr.io/${{ github.repository }}:latest

@@ -2,6 +2,15 @@
   "name": "@repo-memory/app",
   "version": "0.1.0",
   "private": true,
+  "description": "Repository Memory Engine — scan code into PostgreSQL, query it via CLI, HTTP API, or MCP",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sam0502/RepoMemory.git",
+    "directory": "app"
+  },
+  "keywords": ["code-search", "static-analysis", "mcp", "knowledge-graph", "tree-sitter"],
+  "files": ["dist"],
   "type": "module",
   "main": "./dist/index.js",
   "bin": {

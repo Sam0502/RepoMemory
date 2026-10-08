@@ -41,23 +41,32 @@ RepoMemory parses your codebase, builds a knowledge graph of entities (classes, 
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
-pnpm install
+# 1. One-command setup (checks prereqs, installs, starts PostgreSQL,
+#    builds, migrates, downloads the ONNX model)
+pnpm setup
 
-# 2. Start databases
-pnpm db:up
-
-# 3. Build all packages
-pnpm build
-
-# 4. Scan your repository
+# 2. Scan your repository
 node app/dist/cli.js scan --repo /path/to/your/repo --full
 
-# 5. Start the server
+# 3. Start the server
 node app/dist/cli.js serve --repo /path/to/your/repo --port 3000
 
-# 6. Open http://localhost:3000 in your browser
+# 4. Open http://localhost:3000 in your browser
 ```
+
+Prefer manual steps, need an external database, or want to skip the model
+download? See `CONTRIBUTING.md` (setup section) — `node scripts/setup.mjs
+--skip-db --skip-model` covers the common variants.
+
+No local Node.js? The full stack also runs in Docker (PostgreSQL +
+RepoMemory, only Docker required):
+
+```bash
+docker compose --profile serve up --build app
+```
+
+Changing code? That's the contributor path — start at `CONTRIBUTING.md`
+for the dev loop, quality gate, and PR process.
 
 ## Project Structure
 
@@ -209,6 +218,29 @@ All non-workspace endpoints are scoped to the repository passed to `serve --repo
 
 **Credentials:**
 - PostgreSQL: `repo_memory` / `repo-memory-password` (database: `repo_memory`)
+
+## Production notes
+
+Defaults are for local development. Before exposing a server to other
+people or machines:
+
+- **Database password**: change `POSTGRES_PASSWORD` (compose) / `PG_PASSWORD`
+  (env) from `repo-memory-password` to something generated. Existing data
+  stays valid — only new connections use it.
+- **API auth**: set `REPO_MEMORY_API_TOKEN` so every `/api/*` endpoint (and
+  `/metrics`) requires `Authorization: Bearer <token>`. The frontend picks
+  it up automatically via `/config.js`, which only serves the token on
+  loopback — set `ALLOW_TOKEN_BOOTSTRAP=false` to disable even that.
+- **Bind address**: `serve`/`watch` default to `--host 127.0.0.1`. Only bind
+  `0.0.0.0` behind a reverse proxy with TLS, and set `CORS_ORIGIN` to your
+  exact frontend origin.
+- **Backups**: the only state is PostgreSQL — `pg_dump repo_memory` on a
+  schedule, plus the `postgres-data` volume. The ONNX model in `./models`
+  is a re-downloadable cache, not backup-worthy.
+- **Resources**: full scans embed every entity (ONNX loads ~100MB+ model
+  into RAM); `ANALYSIS_BATCH_SIZE` bounds analysis memory. Serve is
+  single-process — scale reads with more replicas behind the proxy, not
+  bigger boxes, and keep all writers pointed at one Postgres.
 
 ## Multi-Repository Support
 

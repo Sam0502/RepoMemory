@@ -18,5 +18,30 @@ services:
       retries: 5
       start_period: 20s
 
+  # Full RepoMemory stack (CLI + API + MCP) without installing Node locally.
+  # Opt-in via profile so plain `docker compose up` still starts only Postgres:
+  #
+  #   docker compose --profile serve up --build app
+  #
+  # Point SCAN_REPO at the repository to serve (mounted read-only), then:
+  #   docker compose --profile serve exec app node app/dist/cli.js scan --repo /repo --full
+  app:
+    build: .
+    profiles: ["serve"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: repo_memory
+      PG_USER: repo_memory
+      PG_PASSWORD: repo-memory-password
+    ports:
+      - "3000:3000"
+    volumes:
+      - ${SCAN_REPO:-.}:/repo:ro
+    command: ["serve", "--repo", "/repo", "--port", "3000", "--host", "0.0.0.0"]
+
 volumes:
   postgres-data:

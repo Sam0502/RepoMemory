@@ -1,0 +1,15 @@
+# Keep the build context small and portable: dependencies are installed
+# inside the image, dist/ is rebuilt, and the model is downloaded there.
+# (Leading **/ so nested workspace dirs match too.)
+**/node_modules
+**/dist
+.git
+models
+**/coverage
+**/*.log
+.env
+.env.local
+tmp
+temp
+.vscode
+.idea
